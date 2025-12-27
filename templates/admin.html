@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Tracker Admin</title>
+    <style>
+        body { font-family: sans-serif; padding: 40px; background: #f4f7f6; }
+        table { width: 100%; border-collapse: collapse; background: white; }
+        th, td { padding: 10px; border: 1px solid #ddd; text-align: left; }
+        .edit-btn { background: #2980b9; color: white; border: none; padding: 5px 10px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h1>Administrative Flight Log Editor</h1>
+    <a href="/">← Back to Public Dashboard</a>
+    <hr>
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Current Callsign</th>
+                <th>Date</th>
+                <th>New Callsign</th>
+                <th>Save New Callsign</th>
+                <th>Delete Flight</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for flight in flights %}
+            <tr>
+                <td>{{ flight.id }}</td>
+                <td><strong>{{ flight.sar_id }}</strong></td>
+                <td>{{ flight.start_time.strftime('%d%b%y@%H:%M') }}</td>
+                <form action="/admin/edit/{{ flight.id }}" method="post">
+                    <td>
+                        <input type="text" name="new_sar_id" placeholder="Update callsign...">
+                    </td>
+                    <td>
+                        <button type="submit" class="edit-btn">Save Change</button>
+                    </td>
+                </form>
+		<td>
+		  <form action="/admin/delete/{{ flight.id }}" method="post" onsubmit="return confirm('Are you sure?');">
+		    <button type="submit" style="background:#c0392b; color:white; border:none; padding:5px; cursor:pointer; border-radius:3px;">
+                      Delete
+		    </button>
+		  </form>
+		</td>
+	    </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</body>
+</html>

@@ -1,0 +1,9 @@
+#!/bin/sh
+. .env
+for arg in "$@"; do
+    curl -X PUT "http://localhost:8080/upload" \
+	 -H "X-SAR-Token: $TRACKER_TOKEN" \
+	 -H "Content-Type: application/json" \
+	 -d @"$arg"
+done
+
