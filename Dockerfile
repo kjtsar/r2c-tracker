@@ -22,5 +22,6 @@ EXPOSE 8080
 
 # Run the web service on container startup
 # Cloud Run provides the PORT environment variable
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}
+
 

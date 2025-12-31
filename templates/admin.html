@@ -17,10 +17,10 @@
         <thead>
             <tr>
                 <th>ID</th>
-                <th>Current Callsign</th>
                 <th>Date</th>
-                <th>New Callsign</th>
-                <th>Save New Callsign</th>
+                <th>Callsign</th>
+                <th>UAS</th>
+                <th>Save</th>
                 <th>Delete Flight</th>
             </tr>
         </thead>
@@ -28,15 +28,17 @@
             {% for flight in flights %}
             <tr>
                 <td>{{ flight.id }}</td>
-                <td><strong>{{ flight.sar_id }}</strong></td>
-                <td>{{ flight.start_time.strftime('%d%b%y@%H:%M') }}</td>
+                <td>{{ flight.start_time.strftime('%d%b%y@%H:%M:%S') }}</td>
                 <form action="/admin/edit/{{ flight.id }}" method="post">
-                    <td>
-                        <input type="text" name="new_sar_id" placeholder="Update callsign...">
-                    </td>
-                    <td>
-                        <button type="submit" class="edit-btn">Save Change</button>
-                    </td>
+                  <td>
+                    <input type="text" name="new_sar_id" value="{{ flight.sar_id }}">
+		  </td>
+		  <td>
+		    <input type="text" name="new_uas" value="{{ flight.uas }}">
+		  </td>
+		  <td>
+                    <button type="submit" class="edit-btn">Save</button>
+                  </td>
                 </form>
 		<td>
 		  <form action="/admin/delete/{{ flight.id }}" method="post" onsubmit="return confirm('Are you sure?');">
@@ -49,5 +51,20 @@
             {% endfor %}
         </tbody>
     </table>
+
+
+    <footer style="margin-top: 50px; text-align: center; border-top: 1px solid #ddd; padding-top: 20px;">
+      <p><a href="/export" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Export as CSV</a></p>
+      <p><form action="/admin/import" method="post" enctype="multipart/form-data">
+	  <input type="file" name="file" accept=".csv">
+	  <button type="submit">Import from CSV</button>
+	</form>
+      <p style="margin-bottom: 50px;">
+	<form action="/admin/delete" method="post" onsubmit="return confirm('Remove All Flights?');">
+	  <button type="submit" style="background:#c0392b; color:white; border:#; padding:5px; cursor:pointer; border-radius:3px;">
+	    Delete Entire Database (do you have a recent export/archive to restore from?)
+	  </button>
+	</form>
+    </footer>
 </body>
 </html>

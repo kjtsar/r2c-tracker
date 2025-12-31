@@ -6,3 +6,7 @@ requests
 jinja2
 psycopg2-binary
 python-multipart
+cloud-sql-python-connector[pg8000]
+sqlalchemy
+pg8000
+websockets

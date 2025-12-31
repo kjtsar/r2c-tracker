@@ -4,3 +4,4 @@ test.db
 *.json
 .DS_Store
 .env
+test

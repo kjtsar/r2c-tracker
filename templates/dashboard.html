@@ -50,31 +50,30 @@
     </style>
 </head>
 <body>
-
-    
-<div style="background: #ecf0f1; padding: 20px; border-radius: 8px; margin-bottom: 30px;">
+  <div style="background: #ecf0f1; padding: 20px; border-radius: 8px; margin-bottom: 30px;">
     <form action="/" method="get" style="display: flex; gap: 20px; align-items: center;">
-        <div>
-            <label><strong>From:</strong></label>
-            <input type="date" name="start_date" value="{{ start_date }}">
-        </div>
-        <div>
-            <label><strong>To:</strong></label>
-            <input type="date" name="end_date" value="{{ end_date }}">
-        </div>
-        <button type="submit" style="background: #27ae60; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer;">
-            Update Report
-        </button>
-        <a href="/" style="text-decoration: none; color: #7f8c8d; font-size: 0.9em;">Clear Filters</a>
+      <div>
+        <label><strong>From:</strong></label>
+        <input type="date" name="start_date" value="{{ start_date }}">
+      </div>
+      <div>
+        <label><strong>To:</strong></label>
+        <input type="date" name="end_date" value="{{ end_date }}">
+      </div>
+      <button type="submit" style="background: #27ae60; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer;">
+        Update Report
+      </button>
+      <a href="/" style="text-decoration: none; color: #7f8c8d; font-size: 0.9em;">Clear Filters</a>
     </form>
 </div>
 
-<h3>
-  {% if start_date or end_date %}
+  <h3>
+    {% if start_date or end_date %}
       Results for {{ start_date or 'Beginning' }} to {{ end_date or 'Today' }}
-  {% else %}
+    {% else %}
       All-time Operational Stats
-  {% endif %}
+    {% endif %}
+
 </h3>
 
 <div class="dashboard-container">
@@ -112,7 +111,7 @@
             <th>UAS</th>
             <th>Duration (Hrs)</th>
             <th>Distance (mi)</th>
-            <th>Night</th>
+            <th>Time Of Day</th>
             <th>Temp (F)</th>
 	    <th>DewPt (F)</th>
 	    <th>Humidity (%)</th>
@@ -130,13 +129,7 @@
 	    <td>{{ flight.uas }}</td>
             <td>{{ flight.hours }}</td>
             <td>{{ flight.distance_mi }}</td>
-	    <td>
-                {% if flight.night_flag %}
-                   Night
-		{% else %}
-		   Day
-		{% endif %}
-	    </td>
+	    <td>{{ flight.timeofday }}</td>
             <td>{{ flight.temp_f }}</td>
             <td>{{ flight.dewpt_f }}</td>
             <td>{{ flight.rhum_pct }}</td>
@@ -150,10 +143,20 @@
       </table>
     </div>
 
-<footer style="margin-top: 50px; text-align: center; border-top: 1px solid #ddd; padding-top: 20px;">
-  <p><a href="/admin" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Admin Access</a></p>
-  <p><a href="/export" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Export as CSV</a></p>
-  <p><a href="/docs" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Docs</a></p>
-</footer>
+    <footer style="margin-top: 50px; text-align: center; border-top: 1px solid #ddd; padding-top: 20px;">
+      <p><a href="/admin" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Admin Access</a></p>
+      <p><a href="/export" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Export as CSV</a></p>
+      <p><a href="/docs" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Docs</a></p>
+    </footer>
 </body>
 </html>
+<script>
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const socket = new WebSocket(`${protocol}//${window.location.host}/ws`);
+      
+  socket.onmessage = function(event) {
+      if (event.data === "refresh") {
+          window.location.reload(); // Force the browser to refresh
+      }
+  };
+</script>
