@@ -6,17 +6,44 @@
         body { font-family: sans-serif; padding: 40px; background: #f4f7f6; }
         table { width: 100%; border-collapse: collapse; background: white; }
         th, td { padding: 10px; border: 1px solid #ddd; text-align: left; }
-        .edit-btn { background: #2980b9; color: white; border: none; padding: 5px 10px; cursor: pointer; }
+        .edit-btn { background: #0772de; color: white; border: none; padding: 5px 10px; cursor: pointer; }
+	.alert { color:white; border: black; padding:5px; border-radius:5px; }
+	.alert.alert-info    { background:#9747c9; }
+	.alert.alert-success { background:#07de27; }
+	.alert.alert-warning { background:#e30b8d; }
     </style>
 </head>
 <body>
-    <h1>Administrative Flight Log Editor</h1>
+  <h1>Administrative Flight Log Editor</h1>
     <a href="/">← Back to Public Dashboard</a>
     <hr>
+
+    <div style="background: #ecf0f1; padding: 20px; border-radius: 8px; margin-bottom: 30px;">
+      <form action="/admin" method="get" style="display: flex; gap: 20px; align-items: center;">
+	<div>
+          <label><strong>From:</strong></label>
+          <input type="date" name="start_date" value="{{ start_date }}">
+	</div>
+	<div>
+          <label><strong>To:</strong></label>
+          <input type="date" name="end_date" value="{{ end_date }}">
+	</div>
+	<button type="submit" style="background: #27ae60; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer;">
+          Update Report
+	</button>
+	<a href="/" style="text-decoration: none; color: #7f8c8d; font-size: 0.9em;">Clear Filters</a>
+      </form>
+    </div>
+    {% for msg in get_flashed_messages(request) %}
+    <div class="alert alert-{{ msg.category }}">
+      {{ msg.message }}
+    </div>
+    {% endfor %}
+  
     <table>
         <thead>
             <tr>
-                <th>ID</th>
+                <th>Flight</th>
                 <th>Date</th>
                 <th>Callsign</th>
                 <th>UAS</th>
@@ -28,7 +55,7 @@
             {% for flight in flights %}
             <tr>
                 <td>{{ flight.id }}</td>
-                <td>{{ flight.start_time.strftime('%d%b%y@%H:%M:%S') }}</td>
+                <td>{{ flight.start_time | localize_flight_time(flight.start_lat, flight.start_lng) | fmt_datetime }}</td>
                 <form action="/admin/edit/{{ flight.id }}" method="post">
                   <td>
                     <input type="text" name="new_sar_id" value="{{ flight.sar_id }}">
@@ -42,7 +69,7 @@
                 </form>
 		<td>
 		  <form action="/admin/delete/{{ flight.id }}" method="post" onsubmit="return confirm('Are you sure?');">
-		    <button type="submit" style="background:#c0392b; color:white; border:none; padding:5px; cursor:pointer; border-radius:3px;">
+		    <button type="submit" style="background:#c0392b; color:white; border:none; padding:5px; cursor:pointer; border-radius:5px;">
                       Delete
 		    </button>
 		  </form>
@@ -61,7 +88,7 @@
 	</form>
       <p style="margin-bottom: 50px;">
 	<form action="/admin/delete" method="post" onsubmit="return confirm('Remove All Flights?');">
-	  <button type="submit" style="background:#c0392b; color:white; border:#; padding:5px; cursor:pointer; border-radius:3px;">
+	  <button type="submit" style="background:#c0392b; color:white; border: black; padding:5px; cursor:pointer; border-radius:5px;">
 	    Delete Entire Database (do you have a recent export/archive to restore from?)
 	  </button>
 	</form>

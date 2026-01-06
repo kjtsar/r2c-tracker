@@ -1,3 +1,4 @@
+asyncpg
 fastapi
 uvicorn
 sqlalchemy
@@ -10,3 +11,5 @@ cloud-sql-python-connector[pg8000]
 sqlalchemy
 pg8000
 websockets
+timezonefinder
+itsdangerous

@@ -1,0 +1,10 @@
+services:
+  db:
+    image: postgress:16-alpine # or latest
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    environment:
+      - POSTGRES_USER=
+      - POSTGRES_PASSWORD=
+      - POSTGRES_DB=
+      
