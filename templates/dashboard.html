@@ -48,8 +48,8 @@
                 {% for pilot in leaderboard %}
                 <tr>
                     <td><strong>{{ pilot.sar_id }}</strong></td>
-                    <td>{{ pilot.total_hours | round(3) }} hrs</td>
-                    <td>{{ pilot.total_miles | round(3) }} mi</td>
+                    <td>{{ pilot.total_hours | round(2) }} hrs</td>
+                    <td>{{ pilot.total_miles | round(2) }} mi</td>
 		    <td>
 		         {{ pilot.last_active | localize_flight_time(pilot.start_lat, pilot.start_lng) | fmt_datetime }}
 		    </td>

@@ -17,6 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the application code
 COPY main.py .
 COPY templates/ ./templates/
+COPY static/ ./static/
 
 EXPOSE 8080
 

@@ -23,6 +23,7 @@ from fastapi import Security, Depends, FastAPI, Request, HTTPException, Query, F
 from fastapi import status, Response, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.security.api_key import APIKeyHeader
+from fastapi.staticfiles import StaticFiles
 from starlette.status import HTTP_403_FORBIDDEN
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -47,7 +48,6 @@ TRACKER_API_KEY = os.environ.get("TRACKER_API_KEY", "replace-with-token")
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 TRACKER_ADMIN_USER = os.environ.get("TRACKER_ADMIN_USER", "admin")
 TRACKER_ADMIN_PASS = os.environ.get("TRACKER_ADMIN_PASS", "replace-with-password")
-ALLOW_DUPLICATES = os.environ.get("TRACKER_ALLOW_DUPLICATES", False)
 SECRET_KEY = os.environ.get("SECRET_KEY", False)
 
 logging.basicConfig(level=logging.INFO)
@@ -117,6 +117,9 @@ app.add_middleware(
     SessionMiddleware,
     secret_key=SECRET_KEY
 )
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 
 class ConnectionManager:
     def __init__(self):
@@ -255,7 +258,7 @@ def parse_prop(prop):
             'distance_mi':distance_mi}
 
 def get_weather(ts_sec, lat, lon):
-    """Parse a LineString 'properties' dictionary.
+    """Get weather forecast or actual for the specified UTC timestamp at lat, lon
     Args:
         ts_sec (int):      UTC timestamp for given Coordinate.
         lat (float):       Coordinate lattitude
@@ -373,8 +376,8 @@ def compute_distance(coords):
             c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
             total_dist_km += radius * c
         
-    # Convert km to miles w/~5' resolution:
-    return round(total_dist_km * 0.621371, 3)
+    # Convert km to miles w/~50' resolution:
+    return round(total_dist_km * 0.621371, 2)
 
 async def get_api_key(header_value: str = Depends(api_key_header)):
     if header_value == TRACKER_API_KEY:
@@ -423,6 +426,22 @@ def localize_flight_time(dt, lat, lng):
         local_dt = dt_utc.astimezone(ZoneInfo(tz_name))
     return local_dt
 
+
+async def find_overlap(db, sar_id, start_time, end_time):
+    # Make sure flight doesn't overlap an existing flight (prevent duplicate submissions):
+    stmt = select(Flight).filter(Flight.sar_id == sar_id).filter(
+        or_(
+            # New start falls inside an existing flight
+            and_(Flight.start_time <= start_time, Flight.end_time > start_time),
+            # New end falls inside an existing flight
+            and_(Flight.start_time < end_time, Flight.end_time >= end_time),
+            # New flight completely swallows an existing flight
+            and_(Flight.start_time >= start_time, Flight.end_time <= end_time)
+        ) 
+    )
+    return await db.execute(stmt)
+    
+    
 
 templates.env.filters["localize_flight_time"] = localize_flight_time
 templates.env.filters["fmt_datetime"] = format_datetime
@@ -513,23 +532,13 @@ async def upload(
     if int(start_time.strftime("%Y")) == 1970:
         raise HTTPException(400,
                             "Coordinate timestamps are likely straight from a UAS Remote ID msg."
-                            "They need to be converted to current time by whatever tool is being "
-                            "used to extract them before capturing to a geo-json file.")
+                            "They need to be converted to current UTC timestamps by the tool "
+                            "that is being used to extract them before reporting to a geo-json file.")
     
     
     # Make sure flight doesn't overlap an existing flight (prevent duplicate submissions):
-    stmt = select(Flight).filter(Flight.sar_id == spec['sar_id']).filter(
-        or_(
-            # New start falls inside an existing flight
-            and_(Flight.start_time <= start_time, Flight.end_time > start_time),
-            # New end falls inside an existing flight
-            and_(Flight.start_time < end_time, Flight.end_time >= end_time),
-            # New flight completely swallows an existing flight
-            and_(Flight.start_time >= start_time, Flight.end_time <= end_time)
-        ) 
-    )
-    result = await db.execute(stmt)
-
+    result = await find_overlap(db, spec['sar_id'], start_time, end_time)
+    
     # While we're waiting for db fetch to complete do time consuming things:
     timeofday_str = get_time_of_day(start_ts_sec, start_lat, start_lng)
     w = get_weather(start_ts_sec, start_lat, start_lng)
@@ -613,7 +622,7 @@ async def public_dashboard(
     leaderboard_result = await db.execute(leaderboard_stmt)
     leaderboard = leaderboard_result.all()
 
-    flights_stmt = stmt.order_by(Flight.start_time.desc()).limit(50)
+    flights_stmt = stmt.order_by(Flight.start_time.desc()).limit(25)
     flights_result = await db.execute(flights_stmt)
     flights = flights_result.scalars().all()
 
@@ -656,15 +665,26 @@ async def edit_flight(
         new_uas: Annotated[str, Form()],
         db: AsyncSession = Depends(get_db),
         user: str = Depends(check_admin)):
-
+    
     result = await db.execute(select(Flight).filter(Flight.id == flight_id))
     flight = result.scalar_one_or_none()
     if not flight:
         return {"error": f"Flight {flight_id} undefined"}
-    flight.sar_id = new_sar_id.upper().strip()
-    flight.uas = new_uas.lower().strip()
-    await db.commit()
-    flash(request, f"Flight {flight_id} successfully edited", "success")
+
+    new_sar_id = new_sar_id.upper().strip()
+    new_uas = new_uas.lower().strip()
+    result = await find_overlap(db, new_sar_id, flight.start_time, flight.end_time)
+    overlap = result.scalars().first()
+
+    if overlap and {flight_id} != {overlap.id}:
+        flash(request, f"Flight {flight_id} edit rejected. Change would overlap w/flight record {overlap.id}", "warning")
+    elif overlap.sar_id == new_sar_id and overlap.uas == new_uas:
+        flash(request, f"No change detected for flight {overlap.id}", "info")
+    else:
+        flight.sar_id = new_sar_id
+        flight.uas = new_uas
+        await db.commit()
+        flash(request, f"Flight {flight_id} successfully edited", "success")
     return RedirectResponse(url="/admin", status_code=status.HTTP_303_SEE_OTHER)
 
 # delete a single flight:
