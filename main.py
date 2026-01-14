@@ -156,7 +156,7 @@ async def get_db():
     async with AsyncSessionLocal() as session:
         yield session
         
-security = HTTPBasic()
+security = HTTPBasic(auto_error=False)
 def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
     if (not secrets.compare_digest(credentials.username, TRACKER_ADMIN_USER)
         or not secrets.compare_digest(credentials.password, TRACKER_ADMIN_PASS)):
@@ -166,6 +166,15 @@ def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
             headers={"WWW-Authenticate": "Basic"}
         )
     return credentials.username
+
+def opt_check_admin(credentials: HTTPBasicCredentials = Depends(security)):
+    if credentials is None:
+        return False
+    is_admin = (
+        secrets.compare_digest(credentials.username, TRACKER_ADMIN_USER) and
+        secrets.compare_digest(credentials.password, TRACKER_ADMIN_PASS)
+    )
+    return is_admin
 
 def get_time_of_day(start_ts_sec, lat, lng):
     utc_time = datetime.fromtimestamp(start_ts_sec, tz=timezone.utc)
@@ -678,7 +687,7 @@ async def edit_flight(
 
     if overlap and {flight_id} != {overlap.id}:
         flash(request, f"Flight {flight_id} edit rejected. Change would overlap w/flight record {overlap.id}", "warning")
-    elif overlap.sar_id == new_sar_id and overlap.uas == new_uas:
+    elif overlap and overlap.sar_id == new_sar_id and overlap.uas == new_uas:
         flash(request, f"No change detected for flight {overlap.id}", "info")
     else:
         flight.sar_id = new_sar_id
@@ -728,6 +737,7 @@ async def reset_table(
 async def export(
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
+        admin_user: bool = Depends(opt_check_admin),
         db: AsyncSession = Depends(get_db)):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -749,24 +759,43 @@ async def export(
     output = io.StringIO()
     writer = csv.writer(output)
     # N.B. keys need to match those used in import:
-    writer.writerow(["Flight", "Sar Id", "UAS", "Incident", "Op Period", "Map Id", "Start Time", "End Time",
-                     "Start Lattitude", "Start Longitude", "Hours", "Distance (mi)",
-                     "Temp (F)", "Rel Humidity (%)", "Dew Pt (F)", "Precip (in)", "Wind (mph)", "Gusts (mph)",
-                     "Cloud Cover (%)", "Time Of Day"])
+    if admin_user:
+        writer.writerow(["Flight", "Sar Id", "UAS", "Incident", "Op Period", "Map Id", "Start Time", "End Time",
+                         "Start Lattitude", "Start Longitude", "Hours", "Distance (mi)",
+                         "Temp (F)", "Rel Humidity (%)", "Dew Pt (F)", "Precip (in)", "Wind (mph)", "Gusts (mph)",
+                         "Cloud Cover (%)", "Time Of Day"])
+    else:
+        writer.writerow(["Flight", "Sar Id", "UAS", "Start Time", "End Time", "Hours", "Distance (mi)",
+                         "Temp (F)", "Rel Humidity (%)", "Dew Pt (F)", "Precip (in)", "Wind (mph)", "Gusts (mph)",
+                         "Cloud Cover (%)", "Time Of Day"])
+        
     
     for f in flights:
-        writer.writerow([f.id, f.sar_id.upper(), f.uas.lower(), f.incident, f.op_period, f.map_id.upper(),
-                         format_datetime(f.start_time.replace(tzinfo=UTC)),
-                         format_datetime(f.end_time.replace(tzinfo=UTC)),
-                         f.start_lat, f.start_lng, f.hours, f.distance_mi, f.temp_f,
-                         f.rhum_pct, f.dewpt_f, f.precip_in, f.wind_mph, f.gusts_mph,
-                         f.cloudcvr_pct, f.timeofday])
+        if admin_user:
+            writer.writerow([f.id, f.sar_id.upper(), f.uas.lower(), f.incident, f.op_period, f.map_id.upper(),
+                             format_datetime(f.start_time.replace(tzinfo=UTC)),
+                             format_datetime(f.end_time.replace(tzinfo=UTC)),
+                             f.start_lat, f.start_lng, f.hours, f.distance_mi, f.temp_f,
+                             f.rhum_pct, f.dewpt_f, f.precip_in, f.wind_mph, f.gusts_mph,
+                             f.cloudcvr_pct, f.timeofday])
+        else:
+            writer.writerow([f.id, f.sar_id.upper(), f.uas.lower(), 
+                             format_datetime(f.start_time.replace(tzinfo=UTC)),
+                             format_datetime(f.end_time.replace(tzinfo=UTC)),
+                             f.hours, f.distance_mi, f.temp_f,
+                             f.rhum_pct, f.dewpt_f, f.precip_in, f.wind_mph, f.gusts_mph,
+                             f.cloudcvr_pct, f.timeofday])
+            
     
     csv_content = output.getvalue()
+    if admin_user:
+        filename = "r2c_audit_full"
+    else:
+        filename = "r2c_audit_part"        
     return Response(
         content=csv_content, 
         media_type="text/csv", 
-        headers={"Content-Disposition": f"attachment; filename=r2c_audit{timestamp}.csv"}
+        headers={"Content-Disposition": f"attachment; filename={filename}_{timestamp}.csv"}
     )
 
 # Append new flights to the database.
@@ -781,8 +810,18 @@ async def import_csv(
     input_file = io.StringIO(decoded)
     reader = csv.DictReader(input_file)
     retval = {"error": "unspecified"}
+    admin_archive = False
     try:
         for row in reader:
+            if not admin_archive:
+                if not row.get('Start Lattitude'):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Archive wasn't produced with admin privileges."
+                    )
+                else:
+                    admin_archive = True
+                
             # N.B. keys need to match those used in export.
             # Create a new Flight object for each row
             new_flight = Flight(
