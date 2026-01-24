@@ -5,6 +5,7 @@ import sys
 import math
 import csv
 import json
+import tarfile
 import requests
 import asyncio
 import warnings
@@ -21,13 +22,14 @@ from contextlib import asynccontextmanager
 
 from fastapi import Security, Depends, FastAPI, Request, HTTPException, Query, Form
 from fastapi import status, Response, UploadFile, File, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from starlette.status import HTTP_403_FORBIDDEN
 from starlette.middleware.sessions import SessionMiddleware
 
-from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, MetaData, Table, select, text
@@ -49,6 +51,8 @@ api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 TRACKER_ADMIN_USER = os.environ.get("TRACKER_ADMIN_USER", "admin")
 TRACKER_ADMIN_PASS = os.environ.get("TRACKER_ADMIN_PASS", "replace-with-password")
 SECRET_KEY = os.environ.get("SECRET_KEY", False)
+
+BASE_LOG_DIRECTORY = '/flightlogs-vol'
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -158,6 +162,8 @@ async def get_db():
         
 security = HTTPBasic(auto_error=False)
 def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
+    if credentials is None:
+        return False
     if (not secrets.compare_digest(credentials.username, TRACKER_ADMIN_USER)
         or not secrets.compare_digest(credentials.password, TRACKER_ADMIN_PASS)):
         raise HTTPException(
@@ -309,7 +315,7 @@ def get_weather(ts_sec, lat, lon):
     return {"temp":temp, "hum":hum, "precip":precip, "dew":dew,
             "wind":wind, "gusts":gusts, "cloud":cloud}
 
-def filter_outlier_coords(coords):
+def filter_outlier_coords(coords, edit_comments):
     """ Process a list of geojson coordinates to remove any outliers.
         Some remote id modules (ahem... Autel) do not care if they spit out 
         garbage coords, so try to filter the worst offenders out.  The returned
@@ -323,6 +329,7 @@ def filter_outlier_coords(coords):
             alt (float),
             ts  (int)
          ]]
+         edit_comments # list of any edits that are made.
     
     Returns:
         coords [[
@@ -356,7 +363,7 @@ def filter_outlier_coords(coords):
                 latpfx = "-" 
             if lon < 0:
                 lonpfx = "-"
-            print(f"XYZZY: ignoring: {i}:!{lower_lat}<={lat}<={upper_lat},{lower_lon}<={lon}<={upper_lon}")
+            edit_comments.append(f"filter_outliers(): ignoring: {i}:!{lower_lat}<={lat}<={upper_lat},{lower_lon}<={lon}<={upper_lon}")
     return results
 
 def compute_distance(coords):
@@ -396,6 +403,45 @@ async def get_api_key(header_value: str = Depends(api_key_header)):
             status_code=HTTP_403_FORBIDDEN, detail="Could not validate credentials"
             )
 
+async def flight_archive(title, flight_timestamp, geojson_data):
+    """
+    Archives geo-json flight data into year/month subdirectories
+    with a timestamped filename.
+
+    Args:
+        title: If produced by RID2Caltopo, this is the track title in the following format:
+              1SAR7Mtrc4Td_132301Jan22
+        flight_timestamp: A localized datetime object representing the first timestamp of the flight.
+        geojson_data: The geo-json data as a Python dictionary.
+    """
+    try:
+        # Extract year and month for directory structure
+        year = flight_timestamp.strftime("%Y")
+        month = flight_timestamp.strftime("%m") # Numeric month for directory sorting
+        if not title:
+            title = "no_title"
+        # Preferred timestamp format for filename: DDMonYYYY_HHMMSS_Zone
+        filename_timestamp = flight_timestamp.strftime("%d%b%Y_%H%M%S_%Z")
+        filename = f"flightlog_{filename_timestamp}-{title}.json"
+
+        # Construct the full path for the log file
+        target_directory = os.path.join(BASE_LOG_DIRECTORY, year, month)
+        os.makedirs(target_directory, exist_ok=True) # Create directories if they don't exist
+
+        filepath = os.path.join(target_directory, filename)
+
+        # Write the geo-json data to the file
+        with open(filepath, 'w') as f:
+            json.dump(geojson_data, f, indent=2)
+
+        print(f"Flight log saved to: {filepath}")
+        return filepath
+    except Exception as e:
+        print(f"Error saving flight log: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to archive flight log: {e}")
+
+
+    
 def format_datetime(value):
     if value is None:
         return ""
@@ -507,9 +553,10 @@ async def upload(
 
     spec = parse_prop(prop)
     distance = spec.get('distance_mi') # faster if we let RID2Caltopo calculate this on the fly.
-    title=prop.get('title', 'no_title_in_properties')
+    title=prop.get('title')
 
-    coords = filter_outlier_coords(coordinate_list)
+    processing_comments = []
+    coords = filter_outlier_coords(coordinate_list, processing_comments)
     if not coords:
         raise HTTPException(
             status_code=409,
@@ -517,18 +564,13 @@ async def upload(
         )
         
     start_lat, start_lng = coords[0][0], coords[0][1]
-    distance_me = compute_distance(coords)
     filter_count = len(coordinate_list) - len(coords)
     if filter_count > 0:
-        print(f"XYZZY: ignoring {filter_count} outlier coordinates from {title}.   Start:{start_lat},{start_lng}")
+        processing_comments.append(f"ignoring {filter_count} outlier coordinates from {title}.   Start:{start_lat},{start_lng}")
 
-    
-    # FIXME: If RID2Caltopo provided distance, compare the two - until we regularly get consensus
-    if not distance:
-        distance = distance_me
-    elif math.fabs(distance - distance_me) > 0.01:
-        print(f"XYZZY: Supplied distance:{distance} vs calculated:{distance_me}.  Using calculated for {title}")
-        distance = distance_me
+    # If distance not provided - or bad there were some obviously bad coords, compute overall distance from the filtered coords:
+    if not distance or filter_count > 0:
+        distance = compute_distance(coords)
 
     if distance < 0.1:
         return {"status": "Ignored",
@@ -537,6 +579,7 @@ async def upload(
             }
 
     start_time = datetime.fromtimestamp(start_ts_sec, tz=timezone.utc).replace(tzinfo=None)
+    localized_start_time = localize_flight_time(start_time, start_lat, start_lng)
     end_time = datetime.fromtimestamp(end_ts_sec, tz=timezone.utc).replace(tzinfo=None)
     if int(start_time.strftime("%Y")) == 1970:
         raise HTTPException(400,
@@ -560,6 +603,8 @@ async def upload(
             detail=f"Conflict: This log overlaps with existing entry {existing.id} for {spec['sar_id']}"
         )
 
+    data['r2c-tracker'] = processing_comments
+    archive_task = asyncio.create_task(flight_archive(title, localized_start_time, data))
     new_flight = Flight(sar_id=spec['sar_id'].upper(), start_time=start_time, end_time=end_time, hours=duration_hrs,
                         start_lat=start_lat, start_lng=start_lng,
                         incident=spec['incident'], op_period = spec['op_period'],
@@ -570,6 +615,10 @@ async def upload(
                         distance_mi = distance)
     db.add(new_flight)
     await db.commit()
+
+    archive_path = await archive_task
+    print(f"XYZZY: {new_flight} archived at:{archive_path}")
+
     await manager.broadcast("refresh") # Tell everyone to reload
     return {"status": "Logged",
             "hours": duration_hrs,
@@ -855,6 +904,185 @@ async def import_csv(
 
     return retval
 
+@app.get("/flightlogs/list", response_class=HTMLResponse)
+async def list_flight_logs(
+    request: Request,
+    year: Optional[str] = None,
+    month: Optional[str] = None,
+    user: str = Depends(check_admin)):
+    """
+    Lists all archived flight logs, optionally filtered by year and month,
+    organized by year and month.
+    """
+    all_logs = {}
+    if not os.path.exists(BASE_LOG_DIRECTORY):
+        return {"message": "No flight logs directory found.", "logs": {}}
+
+    # Determine the base path for listing based on provided filters
+    search_path = BASE_LOG_DIRECTORY
+    if year:
+        search_path = os.path.join(search_path, year)
+        if month:
+            search_path = os.path.join(search_path, month)
+    elif month:
+        search_path = os.path.join(search_path, datetime.now().strftime("%Y"))
+        search_path = os.path.join(search_path, month)
+
+    # Walk through the directories to find logs
+    for root, dirs, files in os.walk(search_path):
+        # Extract year and month from the path relative to BASE_LOG_DIRECTORY
+        relative_path = os.path.relpath(root, BASE_LOG_DIRECTORY)
+        path_parts = relative_path.split(os.sep)
+
+        current_year = None
+        current_month = None
+
+        if len(path_parts) >= 1 and path_parts[0].isdigit() and len(path_parts[0]) == 4:
+            current_year = path_parts[0]
+        if len(path_parts) >= 2 and path_parts[1].isdigit() and len(path_parts[1]) == 2:
+            current_month = path_parts[1]
+
+        if current_year and current_month:
+            if current_year not in all_logs:
+                all_logs[current_year] = {'total_flights': 0, 'months': {}}
+            if current_month not in all_logs[current_year]['months']:
+                all_logs[current_year]['months'][current_month] = {'total_flights': 0, 'flights': []}
+
+            for filename in files:
+                if filename.endswith(".json") and filename.startswith("flightlog_"):
+                    try:
+                        timestamp_and_title = filename[len("flightlog_"):-len(".json")]
+                        [timestamp_part, title_part] = timestamp_and_title.split("-")
+                        # Convert to datetime object for sorting
+                        flight_dt = datetime.strptime(timestamp_part, "%d%b%Y_%H%M%S_%Z")
+                        all_logs[current_year]['months'][current_month]['flights'].append({
+                            "filename": filename,
+                            "timestamp_str": timestamp_part, # String for display
+                            "timestamp_dt": flight_dt,       # Datetime for sorting
+                            "title": title_part,             # for display
+                            "download_url": f"/flightlogs/download/{current_year}/{current_month}/{filename}"
+                        })
+                        all_logs[current_year]['total_flights'] += 1
+                        all_logs[current_year]['months'][current_month]['total_flights'] += 1
+                    except ValueError:
+                        # Handle malformed filenames gracefully
+                        all_logs[current_year]['months'][current_month]['flights'].append({
+                            "filename": filename,
+                            "timestamp_str": "N/A",
+                            "timestamp_dt": datetime.min, # Use min datetime for sorting malformed to bottom
+                            "title": title_part,             # for display
+                            "download_url": f"/flightlogs/download/{current_year}/{current_month}/{filename}"
+                        })
+                        all_logs[current_year]['total_flights'] += 1
+                        all_logs[current_year]['months'][current_month]['total_flights'] += 1
+
+    # Sort the results: years (newest to oldest), months (newest to oldest), flights (newest to oldest)
+    sorted_logs = {}
+    for year_key in sorted(all_logs.keys(), reverse=True):
+        sorted_logs[year_key] = all_logs[year_key]
+        sorted_logs[year_key]['months'] = dict(sorted(
+            all_logs[year_key]['months'].items(), key=lambda item: item[0], reverse=True
+        ))
+        for month_key in sorted_logs[year_key]['months']:
+            sorted_logs[year_key]['months'][month_key]['flights'].sort(
+                key=lambda x: x['timestamp_dt'], reverse=True
+            )
+    return templates.TemplateResponse("flightlogs.html", {
+        "request": request,
+        "logs_data": sorted_logs,
+        "current_year" : datetime.now().strftime("%Y"),
+        "selected_year" : year,
+        "selected_month" : month
+    })
+
+
+@app.get("/flightlogs/download/{year}/{month}/{filename}", response_class=FileResponse, responses={
+    200: {
+        "content": {"application/geo+json": {}},
+        "description": "Return geo-json flight log.",
+    }
+})
+async def download_flight_log(
+        year: str,
+        month: str,
+        filename: str,
+        admin_user: bool = Depends(check_admin) ):
+    """
+    Downloads a specific geo-json flight log file.
+    """
+    filepath = os.path.join(BASE_LOG_DIRECTORY, year, month, filename)
+    if not os.path.exists(filepath) or not os.path.isfile(filepath):
+        raise HTTPException(status_code=404, detail="Flight log not found.")
+
+    return FileResponse(filepath, media_type="application/geo+json", filename=filename)
+
+@app.get("/flightlogs/archive", response_class=FileResponse, responses={
+    200: {
+        "content": {"application/gzip": {}},
+        "description": "Return compressed archive of flight logs.",
+    }
+})
+async def download_all_flight_logs_archive(
+        bg_tasks: BackgroundTasks,
+        admin_user: bool = Depends(check_admin) ):
+    """
+    Creates and downloads a timestamped .tgz archive of all flight logs.
+    """
+    if not os.path.exists(BASE_LOG_DIRECTORY) or not os.listdir(BASE_LOG_DIRECTORY):
+        raise HTTPException(status_code=404, detail="No flight logs to archive.")
+
+    archive_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_filename = f"r2c-tracker-flightlogs-archive_{archive_timestamp}.tgz"
+    tmp_dir = os.path.join(BASE_LOG_DIRECTORY, "tmp")
+
+    try:
+        os.makedirs(tmp_dir, exist_ok=True)
+        temp_archive_path = os.path.join(tmp_dir, archive_filename)
+        with tarfile.open(temp_archive_path, "w:gz") as tar:
+            tar.add(BASE_LOG_DIRECTORY, arcname=os.path.basename(BASE_LOG_DIRECTORY))
+        bg_tasks.add_task(os.unlink, temp_archive_path)
+        return FileResponse(temp_archive_path, media_type="application/gzip", filename=archive_filename)
+
+    except Exception as e:
+        print(f"Error creating archive: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create archive: {e}")
+
+@app.get("/flightlogs/archive/current-year", response_class=Response, responses={
+    200: {
+        "content": {"application/gzip": {}},
+        "description": "Return compressed archive of flight logs.",
+    }
+})
+async def download_current_year_flight_logs_archive(
+        bg_tasks: BackgroundTasks,
+        admin_user: bool = Depends(check_admin) ):
+    """
+    Creates and downloads a timestamped .tgz archive of current year's flight logs.
+    """
+    current_year = datetime.now().strftime("%Y")
+    year_log_path = os.path.join(BASE_LOG_DIRECTORY, current_year)
+
+    if not os.path.exists(year_log_path) or not os.listdir(year_log_path):
+        raise HTTPException(status_code=404, detail=f"No flight logs found for year {current_year}.")
+
+    archive_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_filename = f"r2c-tracker-flightlogs-{current_year}-archive_{archive_timestamp}.tgz"
+    tmp_dir = os.path.join(BASE_LOG_DIRECTORY, "tmp")
+
+    try:
+        os.makedirs(tmp_dir, exist_ok=True)
+        temp_archive_path = os.path.join(tmp_dir, archive_filename)
+        with tarfile.open(temp_archive_path, "w:gz") as tar:
+            tar.add(year_log_path, arcname=os.path.basename(year_log_path))
+        os.unlink(temp_archive_path)
+        bg_tasks.add_task(os.unlink, temp_archive_path)
+        return FileResponse(temp_archive_path, media_type="application/gzip", filename=archive_filename)
+
+    except Exception as e:
+        print(f"Error creating current year archive: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create current year archive: {e}")
+
+    
         
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):

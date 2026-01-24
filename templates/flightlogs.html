@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>R2C Tracker Flight Logs</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }
+        .container { max-width: 900px; margin: auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        h1, h2, h3 { color: #0056b3; }
+        .year-section { border-bottom: 2px solid #0056b3; padding-bottom: 10px; margin-bottom: 15px; }
+        .month-section { border-bottom: 1px dashed #ccc; padding-bottom: 5px; margin-bottom: 10px; margin-left: 20px; }
+        .flight-list { list-style-type: none; padding: 0; margin-left: 40px; }
+        .flight-list li { margin-bottom: 5px; }
+        .flight-list li a { text-decoration: none; color: #007bff; }
+        .flight-list li a:hover { text-decoration: underline; }
+        .filter-form { margin-bottom: 20px; padding: 15px; background-color: #e9ecef; border-radius: 5px; }
+        .filter-form label { margin-right: 10px; font-weight: bold; }
+        .filter-form select, .filter-form button { padding: 8px 12px; border-radius: 4px; border: 1px solid #ced4da; }
+        .filter-form button { background-color: #007bff; color: white; cursor: pointer; border: none; }
+        .filter-form button:hover { background-color: #0056b3; }
+        .archive-links { margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee; }
+        .archive-links a { display: inline-block; margin-right: 15px; padding: 10px 15px; background-color: #28a745; color: white; text-decoration: none; border-radius: 5px; }
+        .archive-links a:hover { background-color: #218838; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>R2C Tracker Flight Logs</h1>
+	<a href="/">← Back to Public Dashboard</a>
+	<hr>
+
+        <div class="filter-form">
+            <form action="/flightlogs/list" method="GET">
+                <label for="year">Filter by Year:</label>
+                <select name="year" id="year">
+                    <option value="">All Years</option>
+                    {% for year_option in logs_data.keys() %}
+                        <option value="{{ year_option }}" {% if year_option == selected_year %}selected{% endif %}>{{ year_option }}</option>
+                    {% endfor %}
+                </select>
+
+                <label for="month">Filter by Month:</label>
+                <select name="month" id="month">
+                    <option value="">All Months</option>
+                    {% set month_names = {
+                        "01": "January", "02": "February", "03": "March", "04": "April",
+                        "05": "May", "06": "June", "07": "July", "08": "August",
+                        "09": "September", "10": "October", "11": "November", "12": "December"
+                    } %}
+                    {% if selected_year and logs_data[selected_year] %}
+                        {% for month_num in logs_data[selected_year]['months'].keys() %}
+                            <option value="{{ month_num }}" {% if month_num == selected_month %}selected{% endif %}>{{ month_names[month_num] }}</option>
+                        {% endfor %}
+                    {% else %}
+                        {% for month_num, month_name in month_names.items() %}
+                            <option value="{{ month_num }}" {% if month_num == selected_month %}selected{% endif %}>{{ month_name }}</option>
+                        {% endfor %}
+                    {% endif %}
+                </select>
+
+                <button type="submit">Apply Filter</button>
+                {% if selected_year or selected_month %}
+                    <button type="button" onclick="window.location.href='/flightlogs/list'">Clear Filters</button>
+                {% endif %}
+            </form>
+        </div>
+
+        {% if logs_data %}
+            {% for year, year_data in logs_data.items() %}
+                <div class="year-section">
+                    <h2>{{ year }} ({{ year_data['total_flights'] }} flights)</h2>
+                    {% for month_num, month_data in year_data['months'].items() %}
+                        <div class="month-section">
+                            <h3>{{ month_names[month_num] }} ({{ month_data['total_flights'] }} flights)</h3>
+                            <ul class="flight-list">
+                                {% for flight in month_data['flights'] %}
+                                    <li>
+                                        <a href="{{ flight['download_url'] }}" download>
+                                            {{ flight['filename'] }}
+                                        </a>
+                                    </li>
+                                {% endfor %}
+                            </ul>
+                        </div>
+                    {% endfor %}
+                </div>
+            {% endfor %}
+        {% else %}
+            <p>No flight logs found.</p>
+        {% endif %}
+
+
+    <div class="archive-links">
+      <h2>Archive Options</h2>
+      <a href="/flightlogs/archive" target="_blank">Download All Logs (.tgz)</a>
+      <a href="/flightlogs/archive/current-year" target="_blank">Download {{ current_year }} Logs (.tgz)</a>
+    </div>
+</body>
+</html>

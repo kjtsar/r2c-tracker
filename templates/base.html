@@ -1,6 +1,8 @@
 <!DOCTYPE html>
 <html>
   <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}R2C Flight Tracker{% endblock %}</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <style>
@@ -107,6 +109,7 @@
 
 
     <footer style="margin-top: 50px; text-align: center; border-top: 1px solid #ddd; padding-top: 20px;">
+      <p><a href="/flightlogs/list" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Admin Flight Logs</a></p>
       <p><a href="/admin" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Admin Access</a></p>
       <p><a href="/export" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Export as CSV</a></p>
       <p><a href="/docs" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Docs</a></p>
