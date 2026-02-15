@@ -160,7 +160,7 @@ async def get_db():
     async with AsyncSessionLocal() as session:
         yield session
         
-security = HTTPBasic(auto_error=False)
+security = HTTPBasic()
 def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
     if credentials is None:
         return False
@@ -176,10 +176,9 @@ def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
 def opt_check_admin(credentials: HTTPBasicCredentials = Depends(security)):
     if credentials is None:
         return False
-    is_admin = (
-        secrets.compare_digest(credentials.username, TRACKER_ADMIN_USER) and
-        secrets.compare_digest(credentials.password, TRACKER_ADMIN_PASS)
-    )
+    admin_user = secrets.compare_digest(credentials.username, TRACKER_ADMIN_USER)
+    admin_pass = secrets.compare_digest(credentials.password, TRACKER_ADMIN_PASS)
+    is_admin = (admin_user and admin_pass)
     return is_admin
 
 def get_time_of_day(start_ts_sec, lat, lng):
@@ -617,7 +616,6 @@ async def upload(
     await db.commit()
 
     archive_path = await archive_task
-    print(f"XYZZY: {new_flight} archived at:{archive_path}")
 
     await manager.broadcast("refresh") # Tell everyone to reload
     return {"status": "Logged",
@@ -809,11 +807,13 @@ async def export(
     writer = csv.writer(output)
     # N.B. keys need to match those used in import:
     if admin_user:
+        filename = "r2c_audit_full"
         writer.writerow(["Flight", "Sar Id", "UAS", "Incident", "Op Period", "Map Id", "Start Time", "End Time",
                          "Start Lattitude", "Start Longitude", "Hours", "Distance (mi)",
                          "Temp (F)", "Rel Humidity (%)", "Dew Pt (F)", "Precip (in)", "Wind (mph)", "Gusts (mph)",
                          "Cloud Cover (%)", "Time Of Day"])
     else:
+        filename = "r2c_audit_part"
         writer.writerow(["Flight", "Sar Id", "UAS", "Start Time", "End Time", "Hours", "Distance (mi)",
                          "Temp (F)", "Rel Humidity (%)", "Dew Pt (F)", "Precip (in)", "Wind (mph)", "Gusts (mph)",
                          "Cloud Cover (%)", "Time Of Day"])
@@ -835,12 +835,8 @@ async def export(
                              f.rhum_pct, f.dewpt_f, f.precip_in, f.wind_mph, f.gusts_mph,
                              f.cloudcvr_pct, f.timeofday])
             
-    
     csv_content = output.getvalue()
-    if admin_user:
-        filename = "r2c_audit_full"
-    else:
-        filename = "r2c_audit_part"        
+
     return Response(
         content=csv_content, 
         media_type="text/csv", 
