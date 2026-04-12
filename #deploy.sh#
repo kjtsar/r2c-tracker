@@ -1,0 +1,3 @@
+#!/bin/sh -v
+export TRACKER_VERSION=`git describe --tags --always`
+gcloud run deploy r2c-tracker --source . --region us-west1 --set-env-vars DATABASE_URL="$DATABASE_URL",TRACKER_VERSION="$TRACKER_VERSION",TRACKER_ADMIN_PASS="$TRACKER_ADMIN_PASS",TRACKER_API_KEY="$TRACKER_API_KEY",SECRET_KEY=`python3 -c "import os; print(os.urandom(32).hex())"`

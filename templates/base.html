@@ -55,6 +55,7 @@
       .alert.alert-success { background:#07de27; color: black; }
       .alert.alert-warning { background:#e30b8d; color: white; }
     </style>
+    {% block extra_head %}{% endblock %}
     <link rel="icon" type="image/png" href="/static/favicon-96x96.png" sizes="96x96" />
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
     <link rel="shortcut icon" href="/static/favicon.ico" />
@@ -113,4 +114,5 @@
       <p><a href="/admin" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Admin Access</a></p>
       <p><a href="/export" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Export as CSV</a></p>
       <p><a href="/docs" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Docs</a></p>
+      <p style="color: #7f8c8d; font-size: 0.8em;">Tracker Version {{ tracker_version }}</p>
     </footer>

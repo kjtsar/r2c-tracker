@@ -6,6 +6,7 @@ import math
 import csv
 import json
 import tarfile
+import subprocess
 import requests
 import asyncio
 import warnings
@@ -52,6 +53,27 @@ api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 TRACKER_ADMIN_USER = os.environ.get("TRACKER_ADMIN_USER", "admin")
 TRACKER_ADMIN_PASS = os.environ.get("TRACKER_ADMIN_PASS", "replace-with-password")
 SECRET_KEY = os.environ.get("SECRET_KEY", False)
+
+def resolve_tracker_version() -> str:
+    override = os.environ.get("TRACKER_VERSION")
+    if override:
+        return override
+    try:
+        result = subprocess.run(
+            ["git", "describe", "--tags", "--always"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=os.path.dirname(__file__),
+        )
+        version = result.stdout.strip()
+        if version:
+            return version
+    except Exception:
+        pass
+    return "unknown"
+
+TRACKER_VERSION = resolve_tracker_version()
 
 BASE_LOG_DIRECTORY = '/flightlogs-vol'
 
@@ -459,6 +481,7 @@ def get_flashed_messages(request: Request):
     return request.session.pop("_messages") if "_messages" in request.session else []
 
 templates.env.globals.update(get_flashed_messages=get_flashed_messages)
+templates.env.globals["tracker_version"] = TRACKER_VERSION
 
 def flash(request: Request, message: str, category: str = "info"):
     if "_messages" not in request.session:
