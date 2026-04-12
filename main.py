@@ -13,6 +13,7 @@ import traceback
 import logging
 import secrets
 import numpy as np
+from urllib.parse import urlencode
 from pprint import pprint
 from datetime import datetime, date, timedelta, timezone, UTC
 from zoneinfo import ZoneInfo
@@ -464,6 +465,44 @@ def flash(request: Request, message: str, category: str = "info"):
         request.session["_messages"] = []
     request.session["_messages"].append({"message": message, "category": category})
 
+def admin_url(start_date: Optional[date] = None, end_date: Optional[date] = None, **extra_params) -> str:
+    params = {}
+    if start_date:
+        params["start_date"] = start_date.isoformat()
+    if end_date:
+        params["end_date"] = end_date.isoformat()
+    params.update({key: value for key, value in extra_params.items() if value is not None})
+    return f"/admin?{urlencode(params)}" if params else "/admin"
+
+def export_url(start_date: Optional[date] = None, end_date: Optional[date] = None) -> str:
+    params = {}
+    if start_date:
+        params["start_date"] = start_date.isoformat()
+    if end_date:
+        params["end_date"] = end_date.isoformat()
+    return f"/export?{urlencode(params)}" if params else "/export"
+
+FILTER_TIMEZONE = ZoneInfo("America/Los_Angeles")
+
+def local_date_bounds_to_utc(start_date: Optional[date] = None, end_date: Optional[date] = None):
+    start_dt = None
+    end_dt = None
+    if start_date:
+        start_dt = datetime.combine(start_date, datetime.min.time(), tzinfo=FILTER_TIMEZONE)
+        start_dt = start_dt.astimezone(UTC).replace(tzinfo=None)
+    if end_date:
+        end_dt = datetime.combine(end_date, datetime.max.time(), tzinfo=FILTER_TIMEZONE)
+        end_dt = end_dt.astimezone(UTC).replace(tzinfo=None)
+    return start_dt, end_dt
+
+def apply_date_filter(stmt, start_date: Optional[date] = None, end_date: Optional[date] = None):
+    start_dt, end_dt = local_date_bounds_to_utc(start_date, end_date)
+    if start_dt:
+        stmt = stmt.where(Flight.start_time >= start_dt)
+    if end_dt:
+        stmt = stmt.where(Flight.start_time <= end_dt)
+    return stmt
+
 
 TF = TimezoneFinder()
 def localize_flight_time(dt, lat, lng):
@@ -636,13 +675,7 @@ async def public_dashboard(
     response.headers["X-Robots-Tag"] = "noindex, nofollow"
 
     # Base query:
-    stmt = select(Flight)
-    if start_date:
-        start_dt = datetime.combine(start_date, datetime.min.time())
-        stmt = stmt.where(Flight.start_time >= start_dt)
-    if end_date:
-        end_dt = datetime.combine(end_date, datetime.max.time())
-        stmt = stmt.where(Flight.start_time <= end_dt)
+    stmt = apply_date_filter(select(Flight), start_date, end_date)
 
     # Group by pilot, sum hours
     subq_totals = stmt.with_only_columns(
@@ -678,18 +711,24 @@ async def public_dashboard(
     leaderboard_result = await db.execute(leaderboard_stmt)
     leaderboard = leaderboard_result.all()
 
-    flights_stmt = stmt.order_by(Flight.start_time.desc()).limit(25)
+    flights_stmt = stmt.order_by(Flight.start_time.desc())
+    if not start_date and not end_date:
+        flights_stmt = flights_stmt.limit(25)
     flights_result = await db.execute(flights_stmt)
     flights = flights_result.scalars().all()
 
-    return templates.TemplateResponse("dashboard.html", {
-        "request": request,
-        "flights": flights,
-        "timezone" : ZoneInfo("America/Los_Angeles"),
-        "leaderboard": leaderboard,
-        "start_date" : start_date,
-        "end_date" : end_date
-    })
+    return templates.TemplateResponse(
+        request=request,
+        name="dashboard.html",
+        context={
+            "request": request,
+            "flights": flights,
+            "timezone" : ZoneInfo("America/Los_Angeles"),
+            "leaderboard": leaderboard,
+            "start_date" : start_date,
+            "end_date" : end_date
+        },
+    )
 
 # List the admin page
 @app.get("/admin", response_class=HTMLResponse)
@@ -701,17 +740,23 @@ async def admin_dashboard(
         end_date: Optional[date] = None):
 
     # Base query:
-    stmt = select(Flight)
-    if start_date:
-        start_dt = datetime.combine(start_date, datetime.min.time())
-        stmt = stmt.where(Flight.start_time >= start_dt)
-    if end_date:
-        end_dt = datetime.combine(end_date, datetime.max.time())
-        stmt = stmt.where(Flight.start_time <= end_dt)
-    stmt = stmt.order_by(Flight.start_time.desc()).limit(50)
+    stmt = apply_date_filter(select(Flight), start_date, end_date)
+    stmt = stmt.order_by(Flight.start_time.desc())
+    if not start_date and not end_date:
+        stmt = stmt.limit(50)
     result = await db.execute(stmt)
     flights = result.scalars().all()
-    return templates.TemplateResponse("admin.html", {"request": request, "flights": flights})
+    return templates.TemplateResponse(
+        request=request,
+        name="admin.html",
+        context={
+            "request": request,
+            "flights": flights,
+            "start_date": start_date.isoformat() if start_date else "",
+            "end_date": end_date.isoformat() if end_date else "",
+            "export_url": export_url(start_date, end_date),
+        },
+    )
 
 @app.post("/admin/edit/{flight_id}")
 async def edit_flight(
@@ -719,6 +764,8 @@ async def edit_flight(
         flight_id: int,
         new_sar_id: Annotated[str, Form()],
         new_uas: Annotated[str, Form()],
+        start_date: Annotated[Optional[date], Form()] = None,
+        end_date: Annotated[Optional[date], Form()] = None,
         db: AsyncSession = Depends(get_db),
         user: str = Depends(check_admin)):
     
@@ -741,13 +788,15 @@ async def edit_flight(
         flight.uas = new_uas
         await db.commit()
         flash(request, f"Flight {flight_id} successfully edited", "success")
-    return RedirectResponse(url="/admin", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse(url=admin_url(start_date, end_date), status_code=status.HTTP_303_SEE_OTHER)
 
 # delete a single flight:
 @app.post("/admin/delete/{flight_id}")  # Must be .post
 async def delete_flight(
         request: Request,
         flight_id: int,
+        start_date: Annotated[Optional[date], Form()] = None,
+        end_date: Annotated[Optional[date], Form()] = None,
         db: AsyncSession = Depends(get_db),
         user: str = Depends(check_admin)):
 
@@ -755,24 +804,26 @@ async def delete_flight(
     flight = result.scalar_one_or_none()
     if not flight:
         flash(request, f"Flight {flight_id} not found", "warning")
-        return RedirectResponse(url="/admin?error=not_found", status_code=status.HTTP_303_SEE_OTHER)
+        return RedirectResponse(url=admin_url(start_date, end_date, error="not_found"), status_code=status.HTTP_303_SEE_OTHER)
     
     await db.delete(flight)
     await db.commit()
     flash(request, f"Flight {flight_id} deleted successfully", "success")
-    return RedirectResponse(url="/admin", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse(url=admin_url(start_date, end_date), status_code=status.HTTP_303_SEE_OTHER)
 
 # delete entire database:
 @app.post("/admin/delete")  # Must be .post
 async def reset_table(
         request: Request,
+        start_date: Annotated[Optional[date], Form()] = None,
+        end_date: Annotated[Optional[date], Form()] = None,
         user: str = Depends(check_admin),
         db: AsyncSession = Depends(get_db)):
     
     await db.execute(text("TRUNCATE TABLE flights RESTART IDENTITY CASCADE;"))
     await db.commit()
     flash(request, f"flights table successfully cleaned.", "success")
-    return RedirectResponse(url="/admin", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse(url=admin_url(start_date, end_date), status_code=status.HTTP_303_SEE_OTHER)
 
 # export timestamped .csv representation of the database:
 @app.get("/export", response_class=Response, responses={
@@ -789,13 +840,7 @@ async def export(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # Base query:
-    stmt = select(Flight)
-    if start_date:
-        start_dt = datetime.combine(start_date, datetime.min.time())
-        stmt = stmt.where(Flight.start_time >= start_dt)
-    if end_date:
-        end_dt = datetime.combine(end_date, datetime.max.time())
-        stmt = stmt.where(Flight.start_time <= end_dt)
+    stmt = apply_date_filter(select(Flight), start_date, end_date)
 
     stmt = stmt.order_by(Flight.start_time)
 
@@ -848,6 +893,8 @@ async def export(
 @app.post("/admin/import")
 async def import_csv(
         file: UploadFile = File(...),
+        start_date: Annotated[Optional[date], Form()] = None,
+        end_date: Annotated[Optional[date], Form()] = None,
         db: AsyncSession = Depends(get_db),
         user: str = Depends(check_admin)):
     content = await file.read()
@@ -893,7 +940,7 @@ async def import_csv(
             db.add(new_flight)
         
         await db.commit()
-        return RedirectResponse(url="/admin", status_code=status.HTTP_303_SEE_OTHER)
+        return RedirectResponse(url=admin_url(start_date, end_date), status_code=status.HTTP_303_SEE_OTHER)
     except Exception as e:
         db.rollback()
         retval = {"error": f"Import failed: {str(e)}"}
@@ -983,13 +1030,17 @@ async def list_flight_logs(
             sorted_logs[year_key]['months'][month_key]['flights'].sort(
                 key=lambda x: x['timestamp_dt'], reverse=True
             )
-    return templates.TemplateResponse("flightlogs.html", {
-        "request": request,
-        "logs_data": sorted_logs,
-        "current_year" : datetime.now().strftime("%Y"),
-        "selected_year" : year,
-        "selected_month" : month
-    })
+    return templates.TemplateResponse(
+        request=request,
+        name="flightlogs.html",
+        context={
+            "request": request,
+            "logs_data": sorted_logs,
+            "current_year" : datetime.now().strftime("%Y"),
+            "selected_year" : year,
+            "selected_month" : month
+        },
+    )
 
 
 @app.get("/flightlogs/download/{year}/{month}/{filename}", response_class=FileResponse, responses={

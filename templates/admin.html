@@ -31,7 +31,7 @@
 	<button type="submit" style="background: #27ae60; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer;">
           Update Report
 	</button>
-	<a href="/" style="text-decoration: none; color: #7f8c8d; font-size: 0.9em;">Clear Filters</a>
+	<a href="/admin" style="text-decoration: none; color: #7f8c8d; font-size: 0.9em;">Clear Filters</a>
       </form>
     </div>
     {% for msg in get_flashed_messages(request) %}
@@ -57,6 +57,8 @@
                 <td>{{ flight.id }}</td>
                 <td>{{ flight.start_time | localize_flight_time(flight.start_lat, flight.start_lng) | fmt_datetime }}</td>
                 <form action="/admin/edit/{{ flight.id }}" method="post">
+                  <input type="hidden" name="start_date" value="{{ start_date }}">
+                  <input type="hidden" name="end_date" value="{{ end_date }}">
                   <td>
                     <input type="text" name="new_sar_id" value="{{ flight.sar_id }}">
 		  </td>
@@ -69,6 +71,8 @@
                 </form>
 		<td>
 		  <form action="/admin/delete/{{ flight.id }}" method="post" onsubmit="return confirm('Are you sure?');">
+                    <input type="hidden" name="start_date" value="{{ start_date }}">
+                    <input type="hidden" name="end_date" value="{{ end_date }}">
 		    <button type="submit" style="background:#c0392b; color:white; border:none; padding:5px; cursor:pointer; border-radius:5px;">
                       Delete
 		    </button>
@@ -81,13 +85,17 @@
 
 
     <footer style="margin-top: 50px; text-align: center; border-top: 1px solid #ddd; padding-top: 20px;">
-      <p><a href="/export" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Export as CSV</a></p>
+      <p><a href="{{ export_url }}" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Export as CSV</a></p>
       <p><form action="/admin/import" method="post" enctype="multipart/form-data">
+          <input type="hidden" name="start_date" value="{{ start_date }}">
+          <input type="hidden" name="end_date" value="{{ end_date }}">
 	  <input type="file" name="file" accept=".csv">
 	  <button type="submit">Import from CSV</button>
 	</form>
       <p style="margin-bottom: 50px;">
 	<form action="/admin/delete" method="post" onsubmit="return confirm('Remove All Flights?');">
+          <input type="hidden" name="start_date" value="{{ start_date }}">
+          <input type="hidden" name="end_date" value="{{ end_date }}">
 	  <button type="submit" style="background:#c0392b; color:white; border: black; padding:5px; cursor:pointer; border-radius:5px;">
 	    Delete Entire Database (do you have a recent export/archive to restore from?)
 	  </button>
