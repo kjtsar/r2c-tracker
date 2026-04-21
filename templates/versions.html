@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+
+{% block title %}Tracker Versions{% endblock %}
+
+{% block extra_head %}
+<style>
+  .versions-page {
+      max-width: 900px;
+      margin: 0 auto;
+  }
+  .version-list {
+      display: grid;
+      gap: 16px;
+      margin-top: 24px;
+  }
+  .version-card {
+      background: white;
+      border-radius: 8px;
+      padding: 18px 20px;
+      box-shadow: 0 2px 5px rgba(0,0,0,0.08);
+  }
+  .version-meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+      color: #5f6b76;
+      font-size: 0.95em;
+  }
+  .version-tag {
+      color: #2c3e50;
+      font-weight: 700;
+  }
+  .version-summary {
+      margin: 0;
+      color: #22303c;
+      line-height: 1.45;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+  <div class="versions-page">
+    <h1>Tracker Version History</h1>
+    <p>Current deployed version: <strong>{{ current_version }}</strong></p>
+    <p><a href="/">← Back to Dashboard</a></p>
+
+    {% if versions %}
+      <div class="version-list">
+        {% for version in versions %}
+          <div class="version-card">
+            <div class="version-meta">
+              <span class="version-tag">{{ version.tag }}</span>
+              <span>{{ version.date }}</span>
+            </div>
+            <p class="version-summary">{{ version.summary }}</p>
+          </div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <p>No version history is available in this deployment.</p>
+    {% endif %}
+  </div>
+{% endblock %}

@@ -115,6 +115,43 @@ filepath = __file__
 filedate = datetime.fromtimestamp(os.path.getmtime(filepath))
 print(f"{filepath} version is {filedate}")
 
+
+def load_recent_versions(limit: int = 10):
+    repo_dir = os.path.dirname(__file__)
+    try:
+        tags_result = subprocess.run(
+            ["git", "tag", "--sort=-creatordate"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=repo_dir,
+        )
+        tags = [tag.strip() for tag in tags_result.stdout.splitlines() if tag.strip()][:limit]
+        versions = []
+        for tag in tags:
+            subject_result = subprocess.run(
+                ["git", "log", "-1", "--format=%s", tag],
+                check=True,
+                capture_output=True,
+                text=True,
+                cwd=repo_dir,
+            )
+            date_result = subprocess.run(
+                ["git", "log", "-1", "--date=short", "--format=%ad", tag],
+                check=True,
+                capture_output=True,
+                text=True,
+                cwd=repo_dir,
+            )
+            versions.append({
+                "tag": tag,
+                "date": date_result.stdout.strip(),
+                "summary": subject_result.stdout.strip(),
+            })
+        return versions
+    except Exception:
+        return []
+
 # connector no longer needed when running locally in same VM.
 def getconn():
     connector = Connector()
@@ -1523,6 +1560,19 @@ async def public_dashboard(
             "leaderboard": leaderboard,
             "start_date" : start_date,
             "end_date" : end_date
+        },
+    )
+
+
+@app.get("/versions", response_class=HTMLResponse)
+async def version_history(request: Request):
+    return templates.TemplateResponse(
+        request=request,
+        name="versions.html",
+        context={
+            "request": request,
+            "current_version": TRACKER_VERSION,
+            "versions": load_recent_versions(),
         },
     )
 
