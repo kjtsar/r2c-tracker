@@ -50,10 +50,32 @@ REGION="${REGION:-us-west1}"
 SERVICE_NAME="${SERVICE_NAME:-r2c-tracker}"
 SECRET_KEY_SECRET_NAME="${SECRET_KEY_SECRET_NAME:-r2c-tracker-secret-key}"
 TRACKER_VERSION="${TRACKER_VERSION:-$(git describe --tags --always 2>/dev/null || echo unknown)}"
+TRACKER_RECENT_VERSIONS="${TRACKER_RECENT_VERSIONS:-$(python3 - <<'PY'
+import json
+import subprocess
+
+def run(cmd):
+    return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout.strip()
+
+try:
+    tags = run(["git", "tag", "--sort=-creatordate"]).splitlines()
+    versions = []
+    for tag in [tag.strip() for tag in tags if tag.strip()][:10]:
+        versions.append({
+            "tag": tag,
+            "date": run(["git", "log", "-1", "--date=short", "--format=%ad", tag]),
+            "summary": run(["git", "log", "-1", "--format=%s", tag]),
+        })
+    print(json.dumps(versions))
+except Exception:
+    print("[]")
+PY
+)}"
 GCLOUD_PROJECT="${GCLOUD_PROJECT:-$(gcloud config get-value project 2>/dev/null || true)}"
 GCLOUD_ACCOUNT="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | head -n 1 || true)"
 
 export TRACKER_VERSION
+export TRACKER_RECENT_VERSIONS
 
 : "${GCLOUD_PROJECT:?No active gcloud project found. Run 'gcloud config set project YOUR_PROJECT_ID' or export GCLOUD_PROJECT.}"
 : "${GCLOUD_ACCOUNT:?No active gcloud account found. Run 'gcloud auth login' first.}"
@@ -100,6 +122,7 @@ print(json.dumps({
     "TRACKER_ADMIN_PASS": os.environ["TRACKER_ADMIN_PASS"],
     "TRACKER_API_KEY": os.environ["TRACKER_API_KEY"],
     "TRACKER_VERSION": os.environ["TRACKER_VERSION"],
+    "TRACKER_RECENT_VERSIONS": os.environ["TRACKER_RECENT_VERSIONS"],
 }))
 PY
 

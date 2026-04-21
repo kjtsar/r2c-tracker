@@ -117,6 +117,15 @@ print(f"{filepath} version is {filedate}")
 
 
 def load_recent_versions(limit: int = 10):
+    env_versions = os.environ.get("TRACKER_RECENT_VERSIONS")
+    if env_versions:
+        try:
+            parsed = json.loads(env_versions)
+            if isinstance(parsed, list):
+                return parsed[:limit]
+        except Exception:
+            pass
+
     repo_dir = os.path.dirname(__file__)
     try:
         tags_result = subprocess.run(
