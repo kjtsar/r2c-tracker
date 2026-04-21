@@ -10,20 +10,149 @@
   }
   .admin-page table {
       width: 100%;
+      min-width: 980px;
       border-collapse: collapse;
       background: white;
+  }
+  .admin-page .table-scroll-shell {
+      position: relative;
+  }
+  .admin-page .table-scroll-hint {
+      display: flex;
+      justify-content: flex-end;
+      margin: 0 0 8px;
+      color: #5f6b76;
+      font-size: 0.9em;
+  }
+  .admin-page .table-scroll {
+      overflow-x: auto;
+      padding-bottom: 8px;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-gutter: stable both-edges;
+      border-radius: 6px;
+  }
+  .admin-page .table-scroll-shell::after {
+      content: "Scroll right for more";
+      position: absolute;
+      top: 36px;
+      right: 0;
+      bottom: 8px;
+      width: 110px;
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      padding-right: 14px;
+      color: #5f6b76;
+      font-size: 0.86em;
+      background: linear-gradient(90deg, rgba(255, 255, 255, 0), rgba(255, 255, 255, 0.94) 45%, rgba(255, 255, 255, 0.98));
+      pointer-events: none;
+      transition: opacity 0.15s ease;
+  }
+  .admin-page .table-scroll-shell.scrolled-right::after {
+      opacity: 0;
   }
   .admin-page th, .admin-page td {
       padding: 10px;
       border: 1px solid #ddd;
       text-align: left;
   }
-  .admin-page .edit-btn {
+  .admin-page th.sticky-col,
+  .admin-page td.sticky-col {
+      position: sticky;
+      z-index: 3;
+      background: inherit;
+  }
+  .admin-page thead th.sticky-col {
+      z-index: 5;
+      background: #34495e;
+  }
+  .admin-page .sticky-delete {
+      left: 0;
+  }
+  .admin-page .sticky-flight {
+      left: 70px;
+  }
+  .admin-page tbody td.sticky-col {
+      background: #fff;
+  }
+  .admin-page tbody tr.marked-for-delete td.sticky-col {
+      background: #fdf0ed;
+  }
+  .admin-page .sticky-divider {
+      box-shadow: 2px 0 0 rgba(207, 214, 222, 0.9);
+  }
+  .admin-page .compact-col {
+      width: 120px;
+  }
+  .admin-page .checkbox-col {
+      width: 70px;
+      text-align: center;
+  }
+  .admin-page .meta-col {
+      white-space: nowrap;
+  }
+  .admin-page input[type="text"] {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid #cfd6de;
+      border-radius: 4px;
+      box-sizing: border-box;
+      transition: background-color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+  .admin-page input[type="text"].dirty {
+      background: #f1f3f5;
+      border-color: #7f8c8d;
+      box-shadow: inset 0 0 0 1px rgba(127, 140, 141, 0.15);
+  }
+  .admin-page tr.marked-for-delete {
+      background: #fdf0ed;
+  }
+  .admin-page .bulk-editor {
+      position: sticky;
+      bottom: 16px;
+      z-index: 20;
+      margin-top: 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+      padding: 16px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      background: rgba(250, 251, 252, 0.96);
+      box-shadow: 0 8px 24px rgba(34, 48, 60, 0.12);
+      backdrop-filter: blur(6px);
+  }
+  .admin-page .bulk-editor-summary {
+      color: #5f6b76;
+      font-size: 0.95em;
+  }
+  .admin-page .bulk-editor-actions {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+  }
+  .admin-page button {
+      border: none;
+      padding: 10px 16px;
+      border-radius: 4px;
+      cursor: pointer;
+  }
+  .admin-page .save-btn {
       background: #0772de;
       color: white;
-      border: none;
-      padding: 5px 10px;
-      cursor: pointer;
+  }
+  .admin-page .reset-btn {
+      background: #dfe6eb;
+      color: #22303c;
+  }
+  .admin-page .delete-btn {
+      background: #c0392b;
+      color: white;
+  }
+  .admin-page .delete-cell {
+      text-align: center;
   }
 </style>
 {% endblock %}
@@ -51,48 +180,71 @@
       </form>
     </div>
 
-    <table>
-      <thead>
-        <tr>
-          <th>Flight</th>
-          <th>Date</th>
-          <th>Callsign</th>
-          <th>UAS</th>
-          <th>Save</th>
-          <th>Delete Flight</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for flight in flights %}
-        <tr>
-          <td>{{ flight.id }}</td>
-          <td>{{ flight.start_time | localize_flight_time(flight.start_lat, flight.start_lng) | fmt_datetime }}</td>
-          <form action="/admin/edit/{{ flight.id }}" method="post">
-            <input type="hidden" name="start_date" value="{{ start_date }}">
-            <input type="hidden" name="end_date" value="{{ end_date }}">
-            <td>
-              <input type="text" name="new_sar_id" value="{{ flight.sar_id }}">
-            </td>
-            <td>
-              <input type="text" name="new_uas" value="{{ flight.uas }}">
-            </td>
-            <td>
-              <button type="submit" class="edit-btn">Save</button>
-            </td>
-          </form>
-          <td>
-            <form action="/admin/delete/{{ flight.id }}" method="post" onsubmit="return confirm('Are you sure?');">
-              <input type="hidden" name="start_date" value="{{ start_date }}">
-              <input type="hidden" name="end_date" value="{{ end_date }}">
-              <button type="submit" style="background:#c0392b; color:white; border:none; padding:5px; cursor:pointer; border-radius:5px;">
-                Delete
-              </button>
-            </form>
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    <form id="admin-batch-form" action="/admin/batch" method="post">
+      <input type="hidden" name="start_date" value="{{ start_date }}">
+      <input type="hidden" name="end_date" value="{{ end_date }}">
+      <div class="table-scroll-shell" id="table-scroll-shell">
+        <div class="table-scroll-hint">Swipe or shift-scroll to see more columns.</div>
+        <div class="table-scroll" id="table-scroll-region" tabindex="0">
+        <table>
+          <thead>
+            <tr>
+              <th class="checkbox-col sticky-col sticky-delete">Delete</th>
+              <th class="sticky-col sticky-flight sticky-divider">Flight</th>
+              <th class="compact-col">Callsign</th>
+              <th class="compact-col">UAS</th>
+              <th class="meta-col">Date</th>
+              <th class="meta-col">Duration</th>
+              <th class="meta-col">Distance</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for flight in flights %}
+            <tr data-flight-row>
+              <td class="delete-cell checkbox-col sticky-col sticky-delete">
+                <input type="checkbox" name="delete_ids" value="{{ flight.id }}" data-delete-checkbox>
+              </td>
+              <td class="sticky-col sticky-flight sticky-divider">
+                {{ flight.id }}
+                <input type="hidden" name="flight_ids" value="{{ flight.id }}">
+              </td>
+              <td class="compact-col">
+                <input
+                  type="text"
+                  name="sar_id_{{ flight.id }}"
+                  value="{{ flight.sar_id }}"
+                  data-original="{{ flight.sar_id }}"
+                  data-dirty-input>
+              </td>
+              <td class="compact-col">
+                <input
+                  type="text"
+                  name="uas_{{ flight.id }}"
+                  value="{{ flight.uas }}"
+                  data-original="{{ flight.uas }}"
+                  data-dirty-input>
+              </td>
+              <td class="meta-col">{{ flight.start_time | localize_flight_time(flight.start_lat, flight.start_lng) | fmt_datetime }}</td>
+              <td class="meta-col">{{ "%.2f"|format(flight.hours or 0) }} hr</td>
+              <td class="meta-col">{{ "%.2f"|format(flight.distance_mi or 0) }} mi</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        </div>
+      </div>
+
+      <div class="bulk-editor">
+        <div class="bulk-editor-summary" id="bulk-editor-summary">
+          No unsaved edits. No rows selected for deletion.
+        </div>
+        <div class="bulk-editor-actions">
+          <button type="reset" class="reset-btn">Reset Changes</button>
+          <button type="submit" class="save-btn" name="action" value="save">Save Changes</button>
+          <button type="submit" class="delete-btn" name="action" value="delete_selected">Delete Selected Rows</button>
+        </div>
+      </div>
+    </form>
 
     <div style="margin-top: 50px; text-align: center; border-top: 1px solid #ddd; padding-top: 20px;">
       <p><a href="{{ export_url }}" style="color: #7f8c8d; text-decoration: none; font-size: 0.9em;">Export as CSV</a></p>
@@ -102,6 +254,22 @@
           <input type="hidden" name="end_date" value="{{ end_date }}">
           <input type="file" name="file" accept=".csv">
           <button type="submit">Import from CSV</button>
+        </form>
+      </p>
+      <p>
+        <form action="/admin/import-archive" method="post" enctype="multipart/form-data">
+          <input type="hidden" name="start_date" value="{{ start_date }}">
+          <input type="hidden" name="end_date" value="{{ end_date }}">
+          <input type="file" name="file" accept=".tgz,.tar.gz,.tar">
+          <button type="submit">Import from Flight Log Archive</button>
+        </form>
+      </p>
+      <p>
+        <form action="/admin/backfill-csv" method="post" enctype="multipart/form-data">
+          <input type="hidden" name="start_date" value="{{ start_date }}">
+          <input type="hidden" name="end_date" value="{{ end_date }}">
+          <input type="file" name="file" accept=".csv">
+          <button type="submit">Backfill Weather and Metadata from CSV</button>
         </form>
       </p>
       <p style="margin-bottom: 50px;">
@@ -115,4 +283,102 @@
       </p>
     </div>
   </div>
+
+  <script>
+    (() => {
+      const form = document.getElementById("admin-batch-form");
+      if (!form) {
+        return;
+      }
+
+      const dirtyInputs = Array.from(form.querySelectorAll("[data-dirty-input]"));
+      const deleteCheckboxes = Array.from(form.querySelectorAll("[data-delete-checkbox]"));
+      const summary = document.getElementById("bulk-editor-summary");
+      const scrollRegion = document.getElementById("table-scroll-region");
+      const scrollShell = document.getElementById("table-scroll-shell");
+
+      function updateDirtyState(input) {
+        const isDirty = input.value !== input.dataset.original;
+        input.classList.toggle("dirty", isDirty);
+      }
+
+      function updateRowDeleteState(checkbox) {
+        const row = checkbox.closest("[data-flight-row]");
+        if (!row) {
+          return;
+        }
+        row.classList.toggle("marked-for-delete", checkbox.checked);
+      }
+
+      function updateSummary() {
+        const dirtyCount = dirtyInputs.filter((input) => input.classList.contains("dirty")).length;
+        const deleteCount = deleteCheckboxes.filter((checkbox) => checkbox.checked).length;
+        const dirtyText = dirtyCount === 1 ? "1 unsaved edit" : `${dirtyCount} unsaved edits`;
+        const deleteText = deleteCount === 1 ? "1 row selected for deletion" : `${deleteCount} rows selected for deletion`;
+        summary.textContent = `${dirtyText}. ${deleteText}.`;
+      }
+
+      dirtyInputs.forEach((input) => {
+        updateDirtyState(input);
+        input.addEventListener("input", () => {
+          updateDirtyState(input);
+          updateSummary();
+        });
+      });
+
+      deleteCheckboxes.forEach((checkbox) => {
+        updateRowDeleteState(checkbox);
+        checkbox.addEventListener("change", () => {
+          updateRowDeleteState(checkbox);
+          updateSummary();
+        });
+      });
+
+      form.addEventListener("reset", () => {
+        window.setTimeout(() => {
+          dirtyInputs.forEach(updateDirtyState);
+          deleteCheckboxes.forEach(updateRowDeleteState);
+          updateSummary();
+        }, 0);
+      });
+
+      form.addEventListener("submit", (event) => {
+        const submitter = event.submitter;
+        if (!submitter || submitter.value !== "delete_selected") {
+          return;
+        }
+
+        const deleteCount = deleteCheckboxes.filter((checkbox) => checkbox.checked).length;
+        if (!deleteCount) {
+          event.preventDefault();
+          window.alert("Select at least one row to delete.");
+          return;
+        }
+
+        const message = deleteCount === 1
+          ? "Confirm delete 1 row? Unsaved field edits will not be saved."
+          : `Confirm delete ${deleteCount} rows? Unsaved field edits will not be saved.`;
+        if (!window.confirm(message)) {
+          event.preventDefault();
+        }
+      });
+
+      function updateScrollHint() {
+        if (!scrollRegion || !scrollShell) {
+          return;
+        }
+        const hasOverflow = scrollRegion.scrollWidth > scrollRegion.clientWidth + 4;
+        const atRightEdge = scrollRegion.scrollLeft + scrollRegion.clientWidth >= scrollRegion.scrollWidth - 4;
+        scrollShell.classList.toggle("scrolled-right", !hasOverflow || atRightEdge);
+      }
+
+      if (scrollRegion) {
+        scrollRegion.addEventListener("scroll", updateScrollHint);
+        window.addEventListener("resize", updateScrollHint);
+        updateScrollHint();
+      }
+
+      updateSummary();
+    })();
+  </script>
 {% endblock %}

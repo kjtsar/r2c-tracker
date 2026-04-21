@@ -35,7 +35,7 @@ from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, Red
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, MetaData, Table, select, text
-from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, desc, func, or_, and_
+from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, DateTime, desc, func, or_, and_
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import sessionmaker, Session
@@ -76,6 +76,38 @@ def resolve_tracker_version() -> str:
 TRACKER_VERSION = resolve_tracker_version()
 
 BASE_LOG_DIRECTORY = '/flightlogs-vol'
+R2C_HEARTBEAT_SEC = int(os.environ.get("R2C_HEARTBEAT_SEC", "15"))
+R2C_LEASE_SEC = int(os.environ.get("R2C_LEASE_SEC", "45"))
+
+
+def _mask_token(token: Optional[str]) -> str:
+    if token is None:
+        return "<missing>"
+    if token == "":
+        return "<empty>"
+    trimmed = token.strip()
+    whitespace_changed = trimmed != token
+    if trimmed == "":
+        return f"len={len(token)} suffix=<blank> whitespace_changed={whitespace_changed}"
+    suffix = trimmed[-4:] if len(trimmed) > 4 else trimmed
+    return f"len={len(trimmed)} suffix={suffix} whitespace_changed={whitespace_changed}"
+
+
+def _describe_tracker_token_mismatch(received: Optional[str], expected: str) -> str:
+    trimmed_received = received.strip() if received is not None else None
+    trimmed_expected = expected.strip()
+    return (
+        f"received={_mask_token(received)} "
+        f"expected={_mask_token(expected)} "
+        f"trimmed_match={trimmed_received == trimmed_expected}"
+    )
+
+
+def _normalize_tracker_token(token: Optional[str]) -> str:
+    return token.strip() if token is not None else ""
+
+
+R2C_SWEEP_SEC = int(os.environ.get("R2C_SWEEP_SEC", "15"))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -115,12 +147,120 @@ class Flight(Base):
     gusts_mph = Column(Float, default=0.0)
     cloudcvr_pct = Column(Float, default=0.0)
     timeofday = Column(String, default="day")
+    archive_relpath = Column(String, default="")
+
+
+class R2CZoneState(Base):
+    __tablename__ = "r2c_zone_state"
+    id = Column(Integer, primary_key=True)
+    map_id = Column(String, index=True, nullable=False)
+    zone_id = Column(String, index=True, nullable=False)
+    guid = Column(String, index=True, nullable=False)
+    name = Column(String, default="")
+    lat = Column(Float, default=0.0)
+    lng = Column(Float, default=0.0)
+    caltopo_rtt_ms = Column(Integer, default=2000)
+    online = Column(Boolean, default=True)
+    last_seen_ms = Column(BigInteger, default=0)
+
+
+class R2CDroneOwnerState(Base):
+    __tablename__ = "r2c_drone_owner_state"
+    id = Column(Integer, primary_key=True)
+    map_id = Column(String, index=True, nullable=False)
+    remote_id = Column(String, index=True, nullable=False)
+    owner_guid = Column(String, default="")
+    owner_zone_id = Column(String, default="")
+    first_drone_ts = Column(BigInteger, default=0)
+    first_distance_m = Column(Float, default=0.0)
+    mapped_id = Column(String, default="")
+    lease_seq = Column(Integer, default=0)
+    lease_expire_ms = Column(BigInteger, default=0)
+    updated_ms = Column(BigInteger, default=0)
+
+
+class R2CRecentSighting(Base):
+    __tablename__ = "r2c_recent_sighting"
+    id = Column(Integer, primary_key=True)
+    map_id = Column(String, index=True, nullable=False)
+    remote_id = Column(String, index=True, nullable=False)
+    zone_id = Column(String, default="")
+    guid = Column(String, default="")
+    drone_ts = Column(BigInteger, default=0)
+    lat = Column(Float, default=0.0)
+    lng = Column(Float, default=0.0)
+    alt_m = Column(Float, default=0.0)
+    received_ms = Column(BigInteger, default=0)
 
 engine = create_async_engine(DB_URL, echo=True)
+
+
+async def migrate_r2c_coordination_schema():
+    # Existing production tables may have been created with 32-bit INTEGER timestamp columns.
+    # Coordination state now stores epoch milliseconds, which require BIGINT.
+    timestamp_columns = [
+        ("r2c_zone_state", "last_seen_ms"),
+        ("r2c_drone_owner_state", "first_drone_ts"),
+        ("r2c_drone_owner_state", "lease_expire_ms"),
+        ("r2c_drone_owner_state", "updated_ms"),
+        ("r2c_recent_sighting", "drone_ts"),
+        ("r2c_recent_sighting", "received_ms"),
+    ]
+    async with engine.begin() as conn:
+        dialect = conn.dialect.name
+        if dialect == "postgresql":
+            for table_name, column_name in timestamp_columns:
+                result = await conn.execute(text("""
+                    SELECT data_type
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = :table_name
+                      AND column_name = :column_name
+                """), {
+                    "table_name": table_name,
+                    "column_name": column_name,
+                })
+                data_type = result.scalar_one_or_none()
+                if data_type and data_type != "bigint":
+                    logger.warning(
+                        "Migrating %s.%s from %s to BIGINT for coordination timestamps",
+                        table_name,
+                        column_name,
+                        data_type,
+                    )
+                    await conn.execute(text(
+                        f"ALTER TABLE {table_name} ALTER COLUMN {column_name} TYPE BIGINT"
+                    ))
+        elif dialect == "sqlite":
+            # SQLite INTEGER is already 64-bit and does not need migration here.
+            return
+
+
+async def migrate_flight_archive_schema():
+    async with engine.begin() as conn:
+        dialect = conn.dialect.name
+        if dialect == "postgresql":
+            result = await conn.execute(text("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'flights'
+                  AND column_name = 'archive_relpath'
+            """))
+            if result.scalar_one_or_none() is None:
+                await conn.execute(text("ALTER TABLE flights ADD COLUMN archive_relpath VARCHAR DEFAULT ''"))
+        elif dialect == "sqlite":
+            result = await conn.execute(text("PRAGMA table_info(flights)"))
+            columns = {row[1] for row in result.fetchall()}
+            if "archive_relpath" not in columns:
+                await conn.execute(text("ALTER TABLE flights ADD COLUMN archive_relpath TEXT DEFAULT ''"))
+
 
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    await migrate_r2c_coordination_schema()
+    await migrate_flight_archive_schema()
 
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,
@@ -135,8 +275,10 @@ if __name__ == "__main__":
 async def lifespan(app: FastAPI):
     # startup Create tables
     await init_db()
+    await r2c_hub.start()
     yield
     # Shutdown Clean up resources (if needed)
+    await r2c_hub.stop()
     await engine.dispose()
 
 app = FastAPI(lifespan=lifespan)
@@ -164,6 +306,491 @@ class ConnectionManager:
             await connection.send_text(message)
         
 manager = ConnectionManager()
+
+
+class R2CZoneConnection:
+    def __init__(self, websocket: Optional[WebSocket]):
+        self.websocket = websocket
+        self.map_id: Optional[str] = None
+        self.zone_id: Optional[str] = None
+        self.guid: Optional[str] = None
+        self.name: str = ""
+        self.lat: float = 0.0
+        self.lng: float = 0.0
+        self.caltopo_rtt_ms: int = 2000
+        self.last_seen_ms: int = 0
+
+
+class R2CCoordinationHub:
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._connections: dict[WebSocket, R2CZoneConnection] = {}
+        self._zones_by_map: dict[str, dict[str, R2CZoneConnection]] = {}
+        self._owners: dict[tuple[str, str], dict] = {}
+        self._sweep_task: Optional[asyncio.Task] = None
+        self._load_task: Optional[asyncio.Task] = None
+
+    async def start(self):
+        if self._sweep_task is None:
+            self._sweep_task = asyncio.create_task(self._expiry_loop())
+        if self._load_task is None:
+            self._load_task = asyncio.create_task(self._load_state_safe())
+
+    async def stop(self):
+        if self._sweep_task is not None:
+            self._sweep_task.cancel()
+            try:
+                await self._sweep_task
+            except asyncio.CancelledError:
+                pass
+            self._sweep_task = None
+        if self._load_task is not None:
+            self._load_task.cancel()
+            try:
+                await self._load_task
+            except asyncio.CancelledError:
+                pass
+            self._load_task = None
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        async with self._lock:
+            self._connections[websocket] = R2CZoneConnection(websocket)
+
+    async def disconnect(self, websocket: WebSocket):
+        async with self._lock:
+            conn = self._connections.pop(websocket, None)
+            if conn is None:
+                return
+            expired: list[tuple[str, str]] = []
+            if conn.map_id and conn.zone_id:
+                zones = self._zones_by_map.get(conn.map_id, {})
+                zones.pop(conn.zone_id, None)
+                if not zones:
+                    self._zones_by_map.pop(conn.map_id, None)
+                for key, owner in list(self._owners.items()):
+                    if owner.get("owner_guid") == conn.guid:
+                        expired.append(key)
+                        self._owners.pop(key, None)
+            map_id = conn.map_id
+            zone_guid = conn.guid or ""
+            zone_id = conn.zone_id or ""
+        if map_id and zone_id:
+            await self._delete_zone_state(map_id, zone_id)
+            for owner_map_id, remote_id in expired:
+                await self._delete_owner_state(owner_map_id, remote_id)
+        if map_id:
+            await self.broadcast_zone_update(map_id)
+            for owner_map_id, remote_id in expired:
+                await self.broadcast(
+                    owner_map_id,
+                    {
+                        "type": "owner_expired",
+                        "remoteId": remote_id,
+                        "prevOwnerGuid": zone_guid
+                    }
+                )
+
+    async def handle_message(self, websocket: WebSocket, payload: dict):
+        mtype = payload.get("type", "")
+        if mtype == "hello":
+            await self._handle_hello(websocket, payload)
+        elif mtype == "heartbeat":
+            await self._handle_heartbeat(websocket, payload)
+        elif mtype == "first_sighting":
+            await self._handle_first_sighting(websocket, payload)
+        elif mtype == "sighting":
+            await self._handle_sighting(websocket, payload)
+        elif mtype == "drone_lost":
+            await self._handle_drone_lost(payload)
+
+    async def _handle_hello(self, websocket: WebSocket, payload: dict):
+        map_id = payload.get("mapId", "")
+        zone_id = payload.get("zoneId", "") or payload.get("guid", "")
+        now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
+        async with self._lock:
+            conn = self._connections[websocket]
+            conn.map_id = map_id
+            conn.zone_id = zone_id
+            conn.guid = payload.get("guid", zone_id)
+            conn.name = payload.get("name", zone_id)
+            conn.lat = float(payload.get("lat", 0.0) or 0.0)
+            conn.lng = float(payload.get("lng", 0.0) or 0.0)
+            conn.caltopo_rtt_ms = int(payload.get("caltopoRttMs", 2000) or 2000)
+            conn.last_seen_ms = now_ms
+            zones = self._zones_by_map.setdefault(map_id, {})
+            zones[zone_id] = conn
+        await self._upsert_zone_state(map_id, zone_id, conn.guid or zone_id, conn.name, conn.lat, conn.lng, conn.caltopo_rtt_ms, True, now_ms)
+        await websocket.send_text(json.dumps({
+            "type": "hello_ack",
+            "serverTime": now_ms,
+            "heartbeatSec": R2C_HEARTBEAT_SEC,
+            "leaseSec": R2C_LEASE_SEC
+        }))
+        await self.broadcast_zone_update(map_id)
+
+    async def _handle_heartbeat(self, websocket: WebSocket, payload: dict):
+        now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
+        owner_updates: list[tuple[str, str, dict]] = []
+        async with self._lock:
+            conn = self._connections.get(websocket)
+            if conn is None:
+                return
+            conn.lat = float(payload.get("lat", conn.lat) or 0.0)
+            conn.lng = float(payload.get("lng", conn.lng) or 0.0)
+            conn.caltopo_rtt_ms = int(payload.get("caltopoRttMs", conn.caltopo_rtt_ms) or conn.caltopo_rtt_ms)
+            conn.last_seen_ms = now_ms
+            map_id = conn.map_id
+            zone_id = conn.zone_id
+            guid = conn.guid
+            name = conn.name
+            lat = conn.lat
+            lng = conn.lng
+            caltopo_rtt_ms = conn.caltopo_rtt_ms
+            if guid:
+                for (owner_map_id, remote_id), owner in self._owners.items():
+                    if owner.get("owner_guid") == guid:
+                        owner["lease_expire_ms"] = now_ms + (R2C_LEASE_SEC * 1000)
+                        owner_updates.append((owner_map_id, remote_id, dict(owner)))
+        if map_id and zone_id:
+            await self._upsert_zone_state(map_id, zone_id, guid or zone_id, name, lat, lng, caltopo_rtt_ms, True, now_ms)
+        for owner_map_id, remote_id, owner in owner_updates:
+            await self._upsert_owner_state(owner_map_id, remote_id, owner)
+        if map_id:
+            await self.broadcast_zone_update(map_id)
+
+    async def _handle_first_sighting(self, websocket: WebSocket, payload: dict):
+        map_id = payload.get("mapId", "")
+        remote_id = payload.get("remoteId", "")
+        zone_id = payload.get("zoneId", "") or payload.get("guid", "")
+        if not map_id or not remote_id or not zone_id:
+            return
+        async with self._lock:
+            existing = self._owners.get((map_id, remote_id))
+            candidate = {
+                "owner_guid": payload.get("guid", zone_id),
+                "owner_zone_id": zone_id,
+                "drone_ts": int(payload.get("droneTs", 0) or 0),
+                "distance_m": float(payload.get("distanceFromZoneM", 0.0) or 0.0),
+                "mapped_id": payload.get("mappedId", "") or "",
+                "lease_seq": 1
+            }
+            if existing is None:
+                owner = candidate
+            else:
+                owner = self._pick_owner(existing, candidate)
+                if owner is candidate:
+                    candidate["lease_seq"] = int(existing.get("lease_seq", 0)) + 1
+            owner["lease_expire_ms"] = int(datetime.now(tz=UTC).timestamp() * 1000) + (R2C_LEASE_SEC * 1000)
+            self._owners[(map_id, remote_id)] = owner
+        await self._upsert_owner_state(map_id, remote_id, owner)
+        await self.broadcast(
+            map_id,
+            {
+                "type": "owner_assigned",
+                "remoteId": remote_id,
+                "ownerGuid": owner["owner_guid"],
+                "ownerZoneId": owner["owner_zone_id"],
+                "leaseSeq": owner["lease_seq"],
+                "leaseExpireTs": owner["lease_expire_ms"]
+            }
+        )
+
+    async def _handle_sighting(self, websocket: WebSocket, payload: dict):
+        map_id = payload.get("mapId", "")
+        remote_id = payload.get("remoteId", "")
+        if not map_id or not remote_id:
+            return
+        from_zone_id = payload.get("zoneId", "") or payload.get("guid", "")
+        async with self._lock:
+            owner = self._owners.get((map_id, remote_id))
+            if owner is None:
+                return
+            owner_zone_id = owner.get("owner_zone_id", "")
+            if from_zone_id and owner_zone_id == from_zone_id:
+                return
+            zones = self._zones_by_map.get(map_id, {})
+            target = zones.get(owner_zone_id)
+        if target is None:
+            return
+        relay = dict(payload)
+        relay["type"] = "relay_sighting"
+        relay["fromZoneId"] = from_zone_id
+        await self._record_sighting(
+            map_id,
+            remote_id,
+            relay.get("fromZoneId", ""),
+            payload.get("guid", ""),
+            int(payload.get("droneTs", 0) or 0),
+            float(payload.get("lat", 0.0) or 0.0),
+            float(payload.get("lng", 0.0) or 0.0),
+            float(payload.get("altM", 0.0) or 0.0)
+        )
+        try:
+            await target.websocket.send_text(json.dumps(relay))
+        except Exception as e:
+            logger.warning("relay_sighting failed for %s/%s: %s", map_id, remote_id, e)
+
+    async def _handle_drone_lost(self, payload: dict):
+        map_id = payload.get("mapId", "")
+        remote_id = payload.get("remoteId", "")
+        zone_id = payload.get("zoneId", "")
+        if not map_id or not remote_id:
+            return
+        expired = False
+        async with self._lock:
+            owner = self._owners.get((map_id, remote_id))
+            if owner and owner.get("owner_zone_id") == zone_id:
+                self._owners.pop((map_id, remote_id), None)
+                expired = True
+        if expired:
+            await self._delete_owner_state(map_id, remote_id)
+            await self.broadcast(
+                map_id,
+                {
+                    "type": "owner_expired",
+                    "remoteId": remote_id,
+                    "prevOwnerGuid": payload.get("guid", zone_id)
+                }
+            )
+
+    async def broadcast_zone_update(self, map_id: str):
+        async with self._lock:
+            zones = list(self._zones_by_map.get(map_id, {}).values())
+        await self.broadcast(
+            map_id,
+            {
+                "type": "zone_update",
+                "zones": [
+                    {
+                        "zoneId": zone.zone_id,
+                        "guid": zone.guid,
+                        "name": zone.name,
+                        "lat": zone.lat,
+                        "lng": zone.lng,
+                        "caltopoRttMs": zone.caltopo_rtt_ms,
+                        "lastSeenMs": zone.last_seen_ms,
+                        "online": zone.websocket is not None
+                    }
+                    for zone in zones if zone.zone_id
+                ]
+            }
+        )
+
+    async def broadcast(self, map_id: str, payload: dict):
+        text = json.dumps(payload)
+        async with self._lock:
+            recipients = [zone for zone in self._zones_by_map.get(map_id, {}).values() if zone.websocket is not None]
+        for zone in recipients:
+            try:
+                await zone.websocket.send_text(text)
+            except Exception as e:
+                logger.warning("broadcast failed for %s/%s: %s", map_id, zone.zone_id, e)
+
+    async def _load_state(self):
+        now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
+        async with AsyncSessionLocal() as session:
+            zone_result = await session.execute(select(R2CZoneState).where(R2CZoneState.last_seen_ms >= now_ms - (R2C_LEASE_SEC * 1000)))
+            owner_result = await session.execute(select(R2CDroneOwnerState).where(R2CDroneOwnerState.lease_expire_ms >= now_ms))
+            zones = zone_result.scalars().all()
+            owners = owner_result.scalars().all()
+        async with self._lock:
+            self._zones_by_map.clear()
+            for zone in zones:
+                conn = R2CZoneConnection(None)
+                conn.map_id = zone.map_id
+                conn.zone_id = zone.zone_id
+                conn.guid = zone.guid
+                conn.name = zone.name
+                conn.lat = zone.lat
+                conn.lng = zone.lng
+                conn.caltopo_rtt_ms = zone.caltopo_rtt_ms
+                conn.last_seen_ms = zone.last_seen_ms
+                self._zones_by_map.setdefault(zone.map_id, {})[zone.zone_id] = conn
+            self._owners = {
+                (owner.map_id, owner.remote_id): {
+                    "owner_guid": owner.owner_guid,
+                    "owner_zone_id": owner.owner_zone_id,
+                    "drone_ts": owner.first_drone_ts,
+                    "distance_m": owner.first_distance_m,
+                    "mapped_id": owner.mapped_id,
+                    "lease_seq": owner.lease_seq,
+                    "lease_expire_ms": owner.lease_expire_ms
+                }
+                for owner in owners
+            }
+
+    async def _load_state_safe(self):
+        try:
+            await asyncio.wait_for(self._load_state(), timeout=8)
+        except asyncio.TimeoutError:
+            logger.warning("R2C coordination state load timed out; starting with empty in-memory state")
+        except Exception as e:
+            logger.warning("R2C coordination state load failed: %s", e)
+
+    async def _expiry_loop(self):
+        try:
+            while True:
+                await asyncio.sleep(R2C_SWEEP_SEC)
+                await self.expire_stale_entries()
+        except asyncio.CancelledError:
+            raise
+
+    async def expire_stale_entries(self):
+        now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
+        stale_cutoff_ms = now_ms - (R2C_LEASE_SEC * 1000)
+        expired_maps: set[str] = set()
+        expired_owners: list[tuple[str, str, str]] = []
+        async with self._lock:
+            for map_id, zones in list(self._zones_by_map.items()):
+                for zone_id, zone in list(zones.items()):
+                    if zone.websocket is not None:
+                        continue
+                    if zone.last_seen_ms < stale_cutoff_ms:
+                        zones.pop(zone_id, None)
+                        expired_maps.add(map_id)
+                if not zones:
+                    self._zones_by_map.pop(map_id, None)
+            for (map_id, remote_id), owner in list(self._owners.items()):
+                if int(owner.get("lease_expire_ms", 0) or 0) < now_ms:
+                    expired_owners.append((map_id, remote_id, owner.get("owner_guid", "")))
+                    self._owners.pop((map_id, remote_id), None)
+        for map_id in expired_maps:
+            await self._delete_stale_zones(map_id, stale_cutoff_ms)
+            await self.broadcast_zone_update(map_id)
+        for map_id, remote_id, owner_guid in expired_owners:
+            await self._delete_owner_state(map_id, remote_id)
+            await self.broadcast(
+                map_id,
+                {
+                    "type": "owner_expired",
+                    "remoteId": remote_id,
+                    "prevOwnerGuid": owner_guid
+                }
+            )
+
+    async def _upsert_zone_state(self, map_id: str, zone_id: str, guid: str, name: str,
+                                 lat: float, lng: float, caltopo_rtt_ms: int,
+                                 online: bool, last_seen_ms: int):
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(R2CZoneState).where(
+                    R2CZoneState.map_id == map_id,
+                    R2CZoneState.zone_id == zone_id
+                )
+            )
+            state = result.scalar_one_or_none()
+            if state is None:
+                state = R2CZoneState(map_id=map_id, zone_id=zone_id)
+                session.add(state)
+            state.guid = guid
+            state.name = name
+            state.lat = lat
+            state.lng = lng
+            state.caltopo_rtt_ms = caltopo_rtt_ms
+            state.online = online
+            state.last_seen_ms = last_seen_ms
+            await session.commit()
+
+    async def _delete_zone_state(self, map_id: str, zone_id: str):
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(R2CZoneState).where(
+                    R2CZoneState.map_id == map_id,
+                    R2CZoneState.zone_id == zone_id
+                )
+            )
+            state = result.scalar_one_or_none()
+            if state is not None:
+                await session.delete(state)
+                await session.commit()
+
+    async def _delete_stale_zones(self, map_id: str, cutoff_ms: int):
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(R2CZoneState).where(
+                    R2CZoneState.map_id == map_id,
+                    R2CZoneState.last_seen_ms < cutoff_ms
+                )
+            )
+            for state in result.scalars().all():
+                await session.delete(state)
+            await session.commit()
+
+    async def _upsert_owner_state(self, map_id: str, remote_id: str, owner: dict):
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(R2CDroneOwnerState).where(
+                    R2CDroneOwnerState.map_id == map_id,
+                    R2CDroneOwnerState.remote_id == remote_id
+                )
+            )
+            state = result.scalar_one_or_none()
+            if state is None:
+                state = R2CDroneOwnerState(map_id=map_id, remote_id=remote_id)
+                session.add(state)
+            state.owner_guid = owner.get("owner_guid", "")
+            state.owner_zone_id = owner.get("owner_zone_id", "")
+            state.first_drone_ts = int(owner.get("drone_ts", 0) or 0)
+            state.first_distance_m = float(owner.get("distance_m", 0.0) or 0.0)
+            state.mapped_id = owner.get("mapped_id", "") or ""
+            state.lease_seq = int(owner.get("lease_seq", 0) or 0)
+            state.lease_expire_ms = int(owner.get("lease_expire_ms", 0) or 0)
+            state.updated_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
+            await session.commit()
+
+    async def _delete_owner_state(self, map_id: str, remote_id: str):
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(R2CDroneOwnerState).where(
+                    R2CDroneOwnerState.map_id == map_id,
+                    R2CDroneOwnerState.remote_id == remote_id
+                )
+            )
+            state = result.scalar_one_or_none()
+            if state is not None:
+                await session.delete(state)
+                await session.commit()
+
+    async def _record_sighting(self, map_id: str, remote_id: str, zone_id: str, guid: str,
+                               drone_ts: int, lat: float, lng: float, alt_m: float):
+        now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
+        async with AsyncSessionLocal() as session:
+            session.add(R2CRecentSighting(
+                map_id=map_id,
+                remote_id=remote_id,
+                zone_id=zone_id,
+                guid=guid,
+                drone_ts=drone_ts,
+                lat=lat,
+                lng=lng,
+                alt_m=alt_m,
+                received_ms=now_ms
+            ))
+            cutoff_ms = now_ms - (R2C_LEASE_SEC * 1000 * 4)
+            result = await session.execute(select(R2CRecentSighting).where(R2CRecentSighting.received_ms < cutoff_ms))
+            for sighting in result.scalars().all():
+                await session.delete(sighting)
+            await session.commit()
+
+    @staticmethod
+    def _pick_owner(existing: dict, candidate: dict) -> dict:
+        existing_key = (
+            int(existing.get("drone_ts", 0) or 0),
+            float(existing.get("distance_m", 0.0) or 0.0),
+            0 if existing.get("mapped_id") else 1,
+            str(existing.get("owner_guid", ""))
+        )
+        candidate_key = (
+            int(candidate.get("drone_ts", 0) or 0),
+            float(candidate.get("distance_m", 0.0) or 0.0),
+            0 if candidate.get("mapped_id") else 1,
+            str(candidate.get("owner_guid", ""))
+        )
+        return candidate if candidate_key < existing_key else existing
+
+
+r2c_hub = R2CCoordinationHub()
 
 
 
@@ -418,49 +1045,195 @@ def compute_distance(coords):
     return round(total_dist_km * 0.621371, 2)
 
 async def get_api_key(header_value: str = Depends(api_key_header)):
-    if header_value == TRACKER_API_KEY:
+    if _normalize_tracker_token(header_value) == _normalize_tracker_token(TRACKER_API_KEY):
         return header_value
     else:
         raise HTTPException(
             status_code=HTTP_403_FORBIDDEN, detail="Could not validate credentials"
             )
 
-async def flight_archive(title, flight_timestamp, geojson_data):
-    """
-    Archives geo-json flight data into year/month subdirectories
-    with a timestamped filename.
+async def archive_flight_log(title, flight_timestamp, geojson_data, flight_id: int):
+    relpath = archive_relpath_for_flight(flight_id, title, flight_timestamp)
+    target_directory = os.path.join(BASE_LOG_DIRECTORY, os.path.dirname(relpath))
+    os.makedirs(target_directory, exist_ok=True)
 
-    Args:
-        title: If produced by RID2Caltopo, this is the track title in the following format:
-              1SAR7Mtrc4Td_132301Jan22
-        flight_timestamp: A localized datetime object representing the first timestamp of the flight.
-        geojson_data: The geo-json data as a Python dictionary.
-    """
-    try:
-        # Extract year and month for directory structure
-        year = flight_timestamp.strftime("%Y")
-        month = flight_timestamp.strftime("%m") # Numeric month for directory sorting
-        if not title:
-            title = "no_title"
-        # Preferred timestamp format for filename: DDMonYYYY_HHMMSS_Zone
-        filename_timestamp = flight_timestamp.strftime("%d%b%Y_%H%M%S_%Z")
-        filename = f"flightlog_{filename_timestamp}-{title}.json"
+    filepath = os.path.join(BASE_LOG_DIRECTORY, relpath)
+    with open(filepath, 'w') as f:
+        json.dump(geojson_data, f, indent=2)
 
-        # Construct the full path for the log file
-        target_directory = os.path.join(BASE_LOG_DIRECTORY, year, month)
-        os.makedirs(target_directory, exist_ok=True) # Create directories if they don't exist
+    print(f"Flight log saved to: {filepath}")
+    return relpath, filepath
 
-        filepath = os.path.join(target_directory, filename)
 
-        # Write the geo-json data to the file
-        with open(filepath, 'w') as f:
-            json.dump(geojson_data, f, indent=2)
+async def extract_flight_inputs_from_geojson(data: dict):
+    start_ts, end_ts = None, None
+    prop = None
+    coordinate_list = None
 
-        print(f"Flight log saved to: {filepath}")
-        return filepath
-    except Exception as e:
-        print(f"Error saving flight log: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to archive flight log: {e}")
+    for feature in data.get("features", []):
+        if start_ts:
+            raise HTTPException(400, "Only one track supported per log file.")
+        prop = feature.get("properties")
+        geometry = feature.get("geometry")
+        if not geometry or geometry.get("type") != "LineString" or not geometry.get("coordinates"):
+            continue
+        coordinate_list = geometry["coordinates"]
+        for coord in coordinate_list:
+            if len(coord) >= 4:
+                if not start_ts:
+                    start_ts = int(coord[3])
+                end_ts = int(coord[3])
+
+    if not start_ts:
+        raise HTTPException(400, "No LineString coordinate timestamps found.")
+    if not prop:
+        raise HTTPException(400, "No properties found.")
+
+    start_ts_sec = round(start_ts / 1000.0, 2)
+    end_ts_sec = round(end_ts / 1000.0, 2)
+    duration_sec = end_ts_sec - start_ts_sec
+    if duration_sec < 60:
+        raise HTTPException(400, f"{duration_sec} second flight is too brief.")
+
+    spec = parse_prop(prop)
+    distance = spec.get('distance_mi')
+    title = prop.get('title')
+
+    processing_comments = []
+    coords = filter_outlier_coords(coordinate_list, processing_comments)
+    if not coords:
+        raise HTTPException(status_code=409, detail=f"No valid coordinates in {title}")
+
+    start_lat, start_lng = coords[0][0], coords[0][1]
+    filter_count = len(coordinate_list) - len(coords)
+    if filter_count > 0:
+        processing_comments.append(f"ignoring {filter_count} outlier coordinates from {title}.   Start:{start_lat},{start_lng}")
+
+    if not distance or filter_count > 0:
+        distance = compute_distance(coords)
+    if distance < 0.1:
+        raise HTTPException(400, f"{distance} mi flight is too brief.")
+
+    start_time = datetime.fromtimestamp(start_ts_sec, tz=timezone.utc).replace(tzinfo=None)
+    localized_start_time = localize_flight_time(start_time, start_lat, start_lng)
+    end_time = datetime.fromtimestamp(end_ts_sec, tz=timezone.utc).replace(tzinfo=None)
+
+    if int(start_time.strftime("%Y")) == 1970:
+        raise HTTPException(
+            400,
+            "Coordinate timestamps are likely straight from a UAS Remote ID msg."
+            "They need to be converted to current UTC timestamps by the tool "
+            "that is being used to extract them before reporting to a geo-json file."
+        )
+
+    return {
+        "title": title,
+        "spec": spec,
+        "distance": distance,
+        "start_time": start_time,
+        "end_time": end_time,
+        "localized_start_time": localized_start_time,
+        "start_lat": start_lat,
+        "start_lng": start_lng,
+        "start_ts_sec": start_ts_sec,
+        "duration_hrs": round((end_ts_sec - start_ts_sec) / 3600.0, 3),
+        "processing_comments": processing_comments,
+    }
+
+
+async def create_flight_and_archive(db: AsyncSession, data: dict, flight_inputs: dict):
+    spec = flight_inputs["spec"]
+    title = flight_inputs["title"]
+    start_time = flight_inputs["start_time"]
+    end_time = flight_inputs["end_time"]
+
+    result = await find_overlap(db, spec['sar_id'], start_time, end_time)
+    existing = result.scalars().first()
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Conflict: This log overlaps with existing entry {existing.id} for {spec['sar_id']}"
+        )
+
+    timeofday_str = get_time_of_day(flight_inputs["start_ts_sec"], flight_inputs["start_lat"], flight_inputs["start_lng"])
+    weather = get_weather(flight_inputs["start_ts_sec"], flight_inputs["start_lat"], flight_inputs["start_lng"])
+
+    data['r2c-tracker'] = flight_inputs["processing_comments"]
+    new_flight = Flight(
+        sar_id=spec['sar_id'].upper(),
+        start_time=start_time,
+        end_time=end_time,
+        hours=flight_inputs["duration_hrs"],
+        start_lat=flight_inputs["start_lat"],
+        start_lng=flight_inputs["start_lng"],
+        incident=spec['incident'],
+        op_period=spec['op_period'],
+        uas=spec['uas'].lower(),
+        map_id=spec['map_id'].upper(),
+        temp_f=weather['temp'],
+        rhum_pct=weather['hum'],
+        dewpt_f=weather['dew'],
+        precip_in=weather['precip'],
+        wind_mph=weather['wind'],
+        gusts_mph=weather['gusts'],
+        cloudcvr_pct=weather['cloud'],
+        timeofday=timeofday_str,
+        distance_mi=flight_inputs["distance"],
+    )
+    db.add(new_flight)
+    await db.flush()
+
+    archive_relpath, archive_path = await archive_flight_log(
+        title,
+        flight_inputs["localized_start_time"],
+        data,
+        new_flight.id,
+    )
+    new_flight.archive_relpath = archive_relpath
+    return new_flight, archive_path
+
+
+async def create_imported_flight_and_archive(db: AsyncSession, data: dict, flight_inputs: dict):
+    spec = flight_inputs["spec"]
+    timeofday_str = get_time_of_day(
+        flight_inputs["start_ts_sec"],
+        flight_inputs["start_lat"],
+        flight_inputs["start_lng"],
+    )
+
+    data['r2c-tracker'] = flight_inputs["processing_comments"]
+    new_flight = Flight(
+        sar_id=spec['sar_id'].upper(),
+        start_time=flight_inputs["start_time"],
+        end_time=flight_inputs["end_time"],
+        hours=flight_inputs["duration_hrs"],
+        start_lat=flight_inputs["start_lat"],
+        start_lng=flight_inputs["start_lng"],
+        incident=spec['incident'],
+        op_period=spec['op_period'],
+        uas=spec['uas'].lower(),
+        map_id=spec['map_id'].upper(),
+        temp_f=0.0,
+        rhum_pct=0.0,
+        dewpt_f=0.0,
+        precip_in=0.0,
+        wind_mph=0.0,
+        gusts_mph=0.0,
+        cloudcvr_pct=0.0,
+        timeofday=timeofday_str,
+        distance_mi=flight_inputs["distance"],
+    )
+    db.add(new_flight)
+    await db.flush()
+
+    archive_relpath, archive_path = await archive_flight_log(
+        flight_inputs["title"],
+        flight_inputs["localized_start_time"],
+        data,
+        new_flight.id,
+    )
+    new_flight.archive_relpath = archive_relpath
+    return new_flight, archive_path
 
 
     
@@ -527,6 +1300,90 @@ def apply_date_filter(stmt, start_date: Optional[date] = None, end_date: Optiona
     return stmt
 
 
+def parse_admin_batch_form(form_data):
+    action = str(form_data.get("action", "save")).strip() or "save"
+
+    flight_ids = []
+    seen_flight_ids = set()
+    for raw_flight_id in form_data.getlist("flight_ids"):
+        try:
+            flight_id = int(raw_flight_id)
+        except (TypeError, ValueError):
+            continue
+        if flight_id in seen_flight_ids:
+            continue
+        seen_flight_ids.add(flight_id)
+        flight_ids.append(flight_id)
+
+    delete_ids = set()
+    for raw_delete_id in form_data.getlist("delete_ids"):
+        try:
+            delete_id = int(raw_delete_id)
+        except (TypeError, ValueError):
+            continue
+        if delete_id in seen_flight_ids:
+            delete_ids.add(delete_id)
+
+    updates = {}
+    for flight_id in flight_ids:
+        updates[flight_id] = {
+            "sar_id": str(form_data.get(f"sar_id_{flight_id}", "")).upper().strip(),
+            "uas": str(form_data.get(f"uas_{flight_id}", "")).lower().strip(),
+        }
+
+    return action, flight_ids, delete_ids, updates
+
+
+def normalize_csv_value(value, default=""):
+    if value is None:
+        return default
+    value = str(value).strip()
+    return value if value else default
+
+
+def parse_csv_float(value, default=0.0):
+    try:
+        return float(normalize_csv_value(value, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_match_datetime(dt):
+    if dt is None:
+        return None
+    return dt.replace(microsecond=0)
+
+
+def datetime_match_within_seconds(dt_a, dt_b, tolerance_seconds=2):
+    if dt_a is None or dt_b is None:
+        return False
+    return abs((normalize_match_datetime(dt_a) - normalize_match_datetime(dt_b)).total_seconds()) <= tolerance_seconds
+
+
+def coordinates_match(lat_a, lng_a, lat_b, lng_b, tolerance=0.0005):
+    return abs(lat_a - lat_b) <= tolerance and abs(lng_a - lng_b) <= tolerance
+
+
+def archive_filename_for_flight(flight_id: int, title: str, flight_timestamp: datetime) -> str:
+    safe_title = title or "no_title"
+    filename_timestamp = flight_timestamp.strftime("%d%b%Y_%H%M%S_%Z")
+    return f"flightlog_{flight_id}_{filename_timestamp}-{safe_title}.json"
+
+
+def archive_relpath_for_flight(flight_id: int, title: str, flight_timestamp: datetime) -> str:
+    year = flight_timestamp.strftime("%Y")
+    month = flight_timestamp.strftime("%m")
+    filename = archive_filename_for_flight(flight_id, title, flight_timestamp)
+    return os.path.join(year, month, filename)
+
+
+def parse_flight_id_from_archive_filename(filename: str) -> Optional[int]:
+    match = re.match(r"flightlog_(\d+)_", filename or "")
+    if not match:
+        return None
+    return int(match.group(1))
+
+
 TF = TimezoneFinder()
 def localize_flight_time(dt, lat, lng):
     if not dt or lat is None or lng is None:
@@ -540,7 +1397,8 @@ def localize_flight_time(dt, lat, lng):
     # Convert to the local timezone
     if tz_name:
         local_dt = dt_utc.astimezone(ZoneInfo(tz_name))
-    return local_dt
+        return local_dt
+    return dt_utc
 
 
 async def find_overlap(db, sar_id, start_time, end_time):
@@ -582,110 +1440,25 @@ async def upload(
         error_details = traceback.format_exc()
         logger.error(f"Exception in /upload:\n{error_details}")
         raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
-        
-    # Extract start time, and coordinates from GeoJSON:
-    start_ts, end_ts = None, None
-    for f in data.get("features", []):
-        if start_ts: raise HTTPException(400, "Only one track supported per log file.")
-        prop = f["properties"]
-        geometry = f["geometry"]
-        if not geometry or not (geometry["type"] == "LineString") or not geometry["coordinates"]: continue
-        coordinate_list = geometry["coordinates"]
-
-        for c in coordinate_list:
-            if len(c) >= 4:
-                if not start_ts:
-                    start_ts = int(c[3])    # timestamp
-                end_ts = int(c[3])
- 
-    if not start_ts: raise HTTPException(400, "No LineString coordinate timestamps found.")
-    if not prop: raise HTTPException(400, "No properties found.")
-    
-    # N.B. timestamps are always UTC since epoch
-    start_ts_sec = round(start_ts / 1000.0, 2)
-    end_ts_sec = round(end_ts / 1000.0, 2)
-    duration_sec = end_ts_sec - start_ts_sec
-    if duration_sec < 60:
-        return {"status": "Ignored",
-                "reason": f"{duration_sec} second flight is too brief.\n"
-                "Flights must be at least one minute long to record."
-            }
-    duration_hrs = round((end_ts_sec - start_ts_sec) / 3600.0, 3) # ~3.6 seconds resolution
-
-    spec = parse_prop(prop)
-    distance = spec.get('distance_mi') # faster if we let RID2Caltopo calculate this on the fly.
-    title=prop.get('title')
-
-    processing_comments = []
-    coords = filter_outlier_coords(coordinate_list, processing_comments)
-    if not coords:
-        raise HTTPException(
-            status_code=409,
-            detail=f"No valid coordinates in {title}"
-        )
-        
-    start_lat, start_lng = coords[0][0], coords[0][1]
-    filter_count = len(coordinate_list) - len(coords)
-    if filter_count > 0:
-        processing_comments.append(f"ignoring {filter_count} outlier coordinates from {title}.   Start:{start_lat},{start_lng}")
-
-    # If distance not provided - or bad there were some obviously bad coords, compute overall distance from the filtered coords:
-    if not distance or filter_count > 0:
-        distance = compute_distance(coords)
-
-    if distance < 0.1:
-        return {"status": "Ignored",
-                "reason": f"{distance} mi flight is too brief.\n"
-                "Flights must be at least 0.1 mile to register."
-            }
-
-    start_time = datetime.fromtimestamp(start_ts_sec, tz=timezone.utc).replace(tzinfo=None)
-    localized_start_time = localize_flight_time(start_time, start_lat, start_lng)
-    end_time = datetime.fromtimestamp(end_ts_sec, tz=timezone.utc).replace(tzinfo=None)
-    if int(start_time.strftime("%Y")) == 1970:
-        raise HTTPException(400,
-                            "Coordinate timestamps are likely straight from a UAS Remote ID msg."
-                            "They need to be converted to current UTC timestamps by the tool "
-                            "that is being used to extract them before reporting to a geo-json file.")
-    
-    
-    # Make sure flight doesn't overlap an existing flight (prevent duplicate submissions):
-    result = await find_overlap(db, spec['sar_id'], start_time, end_time)
-    
-    # While we're waiting for db fetch to complete do time consuming things:
-    timeofday_str = get_time_of_day(start_ts_sec, start_lat, start_lng)
-    w = get_weather(start_ts_sec, start_lat, start_lng)
-
-    # Now catch completed fetch:
-    existing = result.scalars().first()
-    if existing:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Conflict: This log overlaps with existing entry {existing.id} for {spec['sar_id']}"
-        )
-
-    data['r2c-tracker'] = processing_comments
-    archive_task = asyncio.create_task(flight_archive(title, localized_start_time, data))
-    new_flight = Flight(sar_id=spec['sar_id'].upper(), start_time=start_time, end_time=end_time, hours=duration_hrs,
-                        start_lat=start_lat, start_lng=start_lng,
-                        incident=spec['incident'], op_period = spec['op_period'],
-                        uas = spec['uas'].lower(), map_id = spec['map_id'].upper(), temp_f = w['temp'],
-                        rhum_pct = w['hum'], dewpt_f = w['dew'], precip_in = w['precip'],
-                        wind_mph = w['wind'], gusts_mph = w['gusts'],
-                        cloudcvr_pct = w['cloud'], timeofday = timeofday_str,
-                        distance_mi = distance)
-    db.add(new_flight)
+    flight_inputs = await extract_flight_inputs_from_geojson(data)
+    new_flight, archive_path = await create_flight_and_archive(db, data, flight_inputs)
     await db.commit()
-
-    archive_path = await archive_task
 
     await manager.broadcast("refresh") # Tell everyone to reload
     return {"status": "Logged",
-            "hours": duration_hrs,
-            "timeofday": timeofday_str,
-            "distance_mi": distance,
-            "spec": spec,
-            "weather": w
+            "hours": flight_inputs["duration_hrs"],
+            "timeofday": new_flight.timeofday,
+            "distance_mi": flight_inputs["distance"],
+            "spec": flight_inputs["spec"],
+            "weather": {
+                "temp": new_flight.temp_f,
+                "hum": new_flight.rhum_pct,
+                "dew": new_flight.dewpt_f,
+                "precip": new_flight.precip_in,
+                "wind": new_flight.wind_mph,
+                "gusts": new_flight.gusts_mph,
+                "cloud": new_flight.cloudcvr_pct,
+            }
             }
 
 @app.get("/", response_class=HTMLResponse)
@@ -834,6 +1607,92 @@ async def delete_flight(
     flash(request, f"Flight {flight_id} deleted successfully", "success")
     return RedirectResponse(url=admin_url(start_date, end_date), status_code=status.HTTP_303_SEE_OTHER)
 
+
+@app.post("/admin/batch")
+async def batch_update_flights(
+        request: Request,
+        start_date: Annotated[Optional[date], Form()] = None,
+        end_date: Annotated[Optional[date], Form()] = None,
+        db: AsyncSession = Depends(get_db),
+        user: str = Depends(check_admin)):
+
+    form_data = await request.form()
+    action, flight_ids, delete_ids, updates = parse_admin_batch_form(form_data)
+
+    if not flight_ids:
+        flash(request, "No flights were submitted.", "info")
+        return RedirectResponse(url=admin_url(start_date, end_date), status_code=status.HTTP_303_SEE_OTHER)
+
+    result = await db.execute(select(Flight).where(Flight.id.in_(flight_ids)))
+    flights = {flight.id: flight for flight in result.scalars().all()}
+    missing_ids = [flight_id for flight_id in flight_ids if flight_id not in flights]
+
+    if action == "delete_selected":
+        if not delete_ids:
+            flash(request, "No flights were selected for deletion.", "info")
+            return RedirectResponse(url=admin_url(start_date, end_date), status_code=status.HTTP_303_SEE_OTHER)
+
+        deleted_ids = []
+        for flight_id in flight_ids:
+            if flight_id not in delete_ids:
+                continue
+            flight = flights.get(flight_id)
+            if not flight:
+                continue
+            await db.delete(flight)
+            deleted_ids.append(flight_id)
+
+        if deleted_ids:
+            await db.commit()
+            flash(request, f"Deleted {len(deleted_ids)} flight(s): {', '.join(str(flight_id) for flight_id in deleted_ids)}", "success")
+        else:
+            flash(request, "Selected flights were not found.", "warning")
+
+        if missing_ids:
+            flash(request, f"Skipped missing flight(s): {', '.join(str(flight_id) for flight_id in missing_ids)}", "warning")
+
+        return RedirectResponse(url=admin_url(start_date, end_date), status_code=status.HTTP_303_SEE_OTHER)
+
+    changed_ids = []
+    rejected_changes = []
+
+    for flight_id in flight_ids:
+        flight = flights.get(flight_id)
+        if not flight:
+            continue
+
+        submitted = updates[flight_id]
+        new_sar_id = submitted["sar_id"]
+        new_uas = submitted["uas"]
+
+        if flight.sar_id == new_sar_id and flight.uas == new_uas:
+            continue
+
+        result = await find_overlap(db, new_sar_id, flight.start_time, flight.end_time)
+        overlap = result.scalars().first()
+
+        if overlap and overlap.id != flight.id:
+            rejected_changes.append((flight_id, overlap.id))
+            continue
+
+        flight.sar_id = new_sar_id
+        flight.uas = new_uas
+        changed_ids.append(flight_id)
+
+    if changed_ids:
+        await db.commit()
+        flash(request, f"Saved changes for {len(changed_ids)} flight(s): {', '.join(str(flight_id) for flight_id in changed_ids)}", "success")
+    else:
+        flash(request, "No field changes were detected.", "info")
+
+    for flight_id, overlap_id in rejected_changes:
+        flash(request, f"Flight {flight_id} edit rejected. Change would overlap w/flight record {overlap_id}", "warning")
+
+    if missing_ids:
+        flash(request, f"Skipped missing flight(s): {', '.join(str(flight_id) for flight_id in missing_ids)}", "warning")
+
+    return RedirectResponse(url=admin_url(start_date, end_date), status_code=status.HTTP_303_SEE_OTHER)
+
 # delete entire database:
 @app.post("/admin/delete")  # Must be .post
 async def reset_table(
@@ -879,7 +1738,7 @@ async def export(
         writer.writerow(["Flight", "Sar Id", "UAS", "Incident", "Op Period", "Map Id", "Start Time", "End Time",
                          "Start Lattitude", "Start Longitude", "Hours", "Distance (mi)",
                          "Temp (F)", "Rel Humidity (%)", "Dew Pt (F)", "Precip (in)", "Wind (mph)", "Gusts (mph)",
-                         "Cloud Cover (%)", "Time Of Day"])
+                         "Cloud Cover (%)", "Time Of Day", "Archive Path"])
     else:
         filename = "r2c_audit_part"
         writer.writerow(["Flight", "Sar Id", "UAS", "Start Time", "End Time", "Hours", "Distance (mi)",
@@ -894,7 +1753,7 @@ async def export(
                              format_datetime(f.end_time.replace(tzinfo=UTC)),
                              f.start_lat, f.start_lng, f.hours, f.distance_mi, f.temp_f,
                              f.rhum_pct, f.dewpt_f, f.precip_in, f.wind_mph, f.gusts_mph,
-                             f.cloudcvr_pct, f.timeofday])
+                             f.cloudcvr_pct, f.timeofday, f.archive_relpath or ""])
         else:
             writer.writerow([f.id, f.sar_id.upper(), f.uas.lower(), 
                              format_datetime(f.start_time.replace(tzinfo=UTC)),
@@ -958,7 +1817,8 @@ async def import_csv(
                 wind_mph=float(row.get('Wind (mph)', 0.0)),
                 gusts_mph=float(row.get('Gusts (mph)', 0.0)),
                 cloudcvr_pct=float(row.get('Cloud Cover (%)', 0.0)),
-                timeofday=row.get('Time Of Day', "")
+                timeofday=row.get('Time Of Day', ""),
+                archive_relpath=row.get('Archive Path', ""),
             )
             db.add(new_flight)
         
@@ -970,11 +1830,193 @@ async def import_csv(
 
     return retval
 
+
+@app.post("/admin/backfill-csv")
+async def backfill_csv(
+        request: Request,
+        file: UploadFile = File(...),
+        start_date: Annotated[Optional[date], Form()] = None,
+        end_date: Annotated[Optional[date], Form()] = None,
+        db: AsyncSession = Depends(get_db),
+        user: str = Depends(check_admin)):
+    content = await file.read()
+    decoded = content.decode('utf-8')
+    input_file = io.StringIO(decoded)
+    reader = csv.DictReader(input_file)
+
+    rows = list(reader)
+    if not rows:
+        flash(request, "CSV backfill file was empty.", "warning")
+        return RedirectResponse(url=admin_url(start_date, end_date), status_code=status.HTTP_303_SEE_OTHER)
+
+    if not rows[0].get('Start Lattitude'):
+        flash(request, "Backfill requires the full admin CSV export.", "warning")
+        return RedirectResponse(url=admin_url(start_date, end_date), status_code=status.HTTP_303_SEE_OTHER)
+
+    result = await db.execute(select(Flight))
+    flights = result.scalars().all()
+
+    unmatched_flights = []
+    used_flight_ids = set()
+    flight_lookup = {}
+    for flight in flights:
+        key = (
+            normalize_csv_value(flight.sar_id).upper(),
+            normalize_csv_value(flight.uas).lower(),
+            normalize_match_datetime(flight.start_time),
+            normalize_match_datetime(flight.end_time),
+        )
+        flight_lookup.setdefault(key, []).append(flight)
+        unmatched_flights.append(flight)
+
+    updated_count = 0
+    missing_count = 0
+
+    for row in rows:
+        start_time = datetime_from_format(row.get('Start Time', None))
+        end_time = datetime_from_format(row.get('End Time', None))
+        key = (
+            normalize_csv_value(row.get('Sar Id', '')).upper(),
+            normalize_csv_value(row.get('UAS', '')).lower(),
+            normalize_match_datetime(start_time),
+            normalize_match_datetime(end_time),
+        )
+        matches = flight_lookup.get(key, [])
+        while matches and matches[0].id in used_flight_ids:
+            matches.pop(0)
+        flight = matches.pop(0) if matches else None
+
+        if flight is None:
+            csv_start_lat = parse_csv_float(row.get('Start Lattitude', 0.0))
+            csv_start_lng = parse_csv_float(row.get('Start Longitude', 0.0))
+            fallback_candidates = [
+                candidate for candidate in unmatched_flights
+                if datetime_match_within_seconds(candidate.start_time, start_time)
+                and datetime_match_within_seconds(candidate.end_time, end_time)
+                and coordinates_match(candidate.start_lat, candidate.start_lng, csv_start_lat, csv_start_lng)
+            ]
+            if len(fallback_candidates) == 1:
+                flight = fallback_candidates[0]
+            else:
+                missing_count += 1
+                continue
+
+        used_flight_ids.add(flight.id)
+        if flight in unmatched_flights:
+            unmatched_flights.remove(flight)
+
+        flight.incident = normalize_csv_value(row.get('Incident', ''))
+        flight.op_period = normalize_csv_value(row.get('Op Period', ''))
+        flight.map_id = normalize_csv_value(row.get('Map Id', '')).upper()
+        flight.start_lat = parse_csv_float(row.get('Start Lattitude', 0.0))
+        flight.start_lng = parse_csv_float(row.get('Start Longitude', 0.0))
+        flight.hours = parse_csv_float(row.get('Hours', 0.0))
+        flight.distance_mi = parse_csv_float(row.get('Distance (mi)', 0.0))
+        flight.temp_f = parse_csv_float(row.get('Temp (F)', 0.0))
+        flight.rhum_pct = parse_csv_float(row.get('Rel Humidity (%)', 0.0))
+        flight.dewpt_f = parse_csv_float(row.get('Dew Pt (F)', 0.0))
+        flight.precip_in = parse_csv_float(row.get('Precip (in)', 0.0))
+        flight.wind_mph = parse_csv_float(row.get('Wind (mph)', 0.0))
+        flight.gusts_mph = parse_csv_float(row.get('Gusts (mph)', 0.0))
+        flight.cloudcvr_pct = parse_csv_float(row.get('Cloud Cover (%)', 0.0))
+        flight.timeofday = normalize_csv_value(row.get('Time Of Day', ''), "day")
+        archive_path = normalize_csv_value(row.get('Archive Path', ''))
+        if archive_path and not flight.archive_relpath:
+            flight.archive_relpath = archive_path
+        updated_count += 1
+
+    await db.commit()
+
+    flash(request, f"Backfilled {updated_count} flight(s) from CSV.", "success")
+    if missing_count:
+        flash(request, f"Could not match {missing_count} CSV row(s) to rebuilt flights.", "warning")
+
+    return RedirectResponse(url=admin_url(start_date, end_date), status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/import-archive")
+async def import_flight_archive(
+        request: Request,
+        file: UploadFile = File(...),
+        start_date: Annotated[Optional[date], Form()] = None,
+        end_date: Annotated[Optional[date], Form()] = None,
+        db: AsyncSession = Depends(get_db),
+        user: str = Depends(check_admin)):
+    imported_count = 0
+    skipped_files = []
+    batch_written_paths = []
+
+    try:
+        existing_count = await db.scalar(select(func.count()).select_from(Flight))
+        if existing_count:
+            flash(request, "Archive import requires an empty flights table to avoid duplicates.", "warning")
+            return RedirectResponse(url=admin_url(start_date, end_date), status_code=status.HTTP_303_SEE_OTHER)
+
+        content = await file.read()
+        archive_bytes = io.BytesIO(content)
+        with tarfile.open(fileobj=archive_bytes, mode="r:*") as tar:
+            members = [
+                member for member in tar.getmembers()
+                if member.isfile() and member.name.endswith(".json") and "flightlog_" in os.path.basename(member.name)
+            ]
+            members.sort(key=lambda member: member.name)
+
+            for member in members:
+                extracted = tar.extractfile(member)
+                if extracted is None:
+                    skipped_files.append(f"{member.name}: unreadable")
+                    continue
+
+                try:
+                    data = json.load(extracted)
+                    flight_inputs = await extract_flight_inputs_from_geojson(data)
+                    _, archive_path = await create_imported_flight_and_archive(db, data, flight_inputs)
+                    batch_written_paths.append(archive_path)
+                    imported_count += 1
+                    if imported_count % 50 == 0:
+                        await db.commit()
+                        batch_written_paths.clear()
+                except Exception as exc:
+                    await db.rollback()
+                    for archive_path in batch_written_paths:
+                        try:
+                            if os.path.exists(archive_path):
+                                os.unlink(archive_path)
+                        except OSError:
+                            pass
+                    batch_written_paths.clear()
+                    skipped_files.append(f"{member.name}: {exc}")
+
+            if imported_count % 50 != 0:
+                await db.commit()
+                batch_written_paths.clear()
+
+        if imported_count:
+            flash(request, f"Imported {imported_count} flight log(s) from archive.", "success")
+        else:
+            flash(request, "No flight logs were imported from the archive.", "warning")
+
+        if skipped_files:
+            flash(request, f"Skipped {len(skipped_files)} file(s). First issue: {skipped_files[0]}", "warning")
+
+        return RedirectResponse(url=admin_url(start_date, end_date), status_code=status.HTTP_303_SEE_OTHER)
+    except Exception as exc:
+        await db.rollback()
+        for archive_path in batch_written_paths:
+            try:
+                if os.path.exists(archive_path):
+                    os.unlink(archive_path)
+            except OSError:
+                pass
+        flash(request, f"Archive import failed: {exc}", "warning")
+        return RedirectResponse(url=admin_url(start_date, end_date), status_code=status.HTTP_303_SEE_OTHER)
+
 @app.get("/flightlogs/list", response_class=HTMLResponse)
 async def list_flight_logs(
     request: Request,
     year: Optional[str] = None,
     month: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
     user: str = Depends(check_admin)):
     """
     Lists all archived flight logs, optionally filtered by year and month,
@@ -993,6 +2035,13 @@ async def list_flight_logs(
     elif month:
         search_path = os.path.join(search_path, datetime.now().strftime("%Y"))
         search_path = os.path.join(search_path, month)
+
+    flight_result = await db.execute(select(Flight.id, Flight.archive_relpath))
+    archive_lookup = {
+        (archive_relpath or ""): flight_id
+        for flight_id, archive_relpath in flight_result.all()
+        if archive_relpath
+    }
 
     # Walk through the directories to find logs
     for root, dirs, files in os.walk(search_path):
@@ -1016,31 +2065,36 @@ async def list_flight_logs(
 
             for filename in files:
                 if filename.endswith(".json") and filename.startswith("flightlog_"):
+                    timestamp_and_title = filename[len("flightlog_"):-len(".json")]
+                    timestamp_part, title_part = (timestamp_and_title.split("-", 1) + [""])[:2]
+                    relpath = os.path.join(current_year, current_month, filename)
+                    flight_id = archive_lookup.get(relpath)
+                    display_filename = filename
+                    if flight_id:
+                        display_filename = re.sub(rf"^flightlog_{flight_id}_", "flightlog_", filename, count=1)
+                    flight_dt = datetime.min
                     try:
-                        timestamp_and_title = filename[len("flightlog_"):-len(".json")]
-                        [timestamp_part, title_part] = timestamp_and_title.split("-")
-                        # Convert to datetime object for sorting
+                        # Parse the full timestamp when it is present and well-formed.
                         flight_dt = datetime.strptime(timestamp_part, "%d%b%Y_%H%M%S_%Z")
-                        all_logs[current_year]['months'][current_month]['flights'].append({
-                            "filename": filename,
-                            "timestamp_str": timestamp_part, # String for display
-                            "timestamp_dt": flight_dt,       # Datetime for sorting
-                            "title": title_part,             # for display
-                            "download_url": f"/flightlogs/download/{current_year}/{current_month}/{filename}"
-                        })
-                        all_logs[current_year]['total_flights'] += 1
-                        all_logs[current_year]['months'][current_month]['total_flights'] += 1
                     except ValueError:
-                        # Handle malformed filenames gracefully
-                        all_logs[current_year]['months'][current_month]['flights'].append({
-                            "filename": filename,
-                            "timestamp_str": "N/A",
-                            "timestamp_dt": datetime.min, # Use min datetime for sorting malformed to bottom
-                            "title": title_part,             # for display
-                            "download_url": f"/flightlogs/download/{current_year}/{current_month}/{filename}"
-                        })
-                        all_logs[current_year]['total_flights'] += 1
-                        all_logs[current_year]['months'][current_month]['total_flights'] += 1
+                        try:
+                            # Fall back to the date/time portion if the timezone suffix is irregular.
+                            timestamp_without_tz = timestamp_part.rsplit("_", 1)[0]
+                            flight_dt = datetime.strptime(timestamp_without_tz, "%d%b%Y_%H%M%S")
+                        except ValueError:
+                            pass
+
+                    all_logs[current_year]['months'][current_month]['flights'].append({
+                        "flight_id": flight_id,
+                        "filename": filename,
+                        "display_filename": display_filename,
+                        "timestamp_str": timestamp_part if flight_dt != datetime.min else "N/A",
+                        "timestamp_dt": flight_dt,
+                        "title": title_part,
+                        "download_url": f"/flightlogs/download/{current_year}/{current_month}/{filename}"
+                    })
+                    all_logs[current_year]['total_flights'] += 1
+                    all_logs[current_year]['months'][current_month]['total_flights'] += 1
 
     # Sort the results: years (newest to oldest), months (newest to oldest), flights (newest to oldest)
     sorted_logs = {}
@@ -1051,7 +2105,7 @@ async def list_flight_logs(
         ))
         for month_key in sorted_logs[year_key]['months']:
             sorted_logs[year_key]['months'][month_key]['flights'].sort(
-                key=lambda x: x['timestamp_dt'], reverse=True
+                key=lambda x: (x['timestamp_dt'], x['filename']), reverse=True
             )
     return templates.TemplateResponse(
         request=request,
@@ -1162,3 +2216,26 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.receive_text() # Keep connection alive
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+
+
+@app.websocket("/ws/r2c")
+async def r2c_websocket_endpoint(websocket: WebSocket):
+    token = websocket.headers.get(API_KEY_NAME)
+    if _normalize_tracker_token(token) != _normalize_tracker_token(TRACKER_API_KEY):
+        client_host = websocket.client.host if websocket.client else "unknown"
+        logger.warning(
+            "r2c websocket auth rejected: client=%s user_agent=%s %s",
+            client_host,
+            websocket.headers.get("user-agent", ""),
+            _describe_tracker_token_mismatch(token, TRACKER_API_KEY),
+        )
+        await websocket.close(code=1008, reason="Invalid tracker token")
+        return
+    await r2c_hub.connect(websocket)
+    try:
+        while True:
+            payload = json.loads(await websocket.receive_text())
+            if isinstance(payload, dict):
+                await r2c_hub.handle_message(websocket, payload)
+    except WebSocketDisconnect:
+        await r2c_hub.disconnect(websocket)

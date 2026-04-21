@@ -138,7 +138,10 @@
                 {% for flight in month_data['flights'] %}
                   <li>
                     <a href="{{ flight['download_url'] }}" download>
-                      {{ flight['filename'] }}
+                      {% if flight['flight_id'] %}
+                        Flight {{ flight['flight_id'] }}: 
+                      {% endif %}
+                      {{ flight['display_filename'] }}
                     </a>
                   </li>
                 {% endfor %}

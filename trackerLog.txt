@@ -1,0 +1,671 @@
+---
+insertId: 69e2a3cc0008a1483de32373
+labels:
+  instanceId: 008c15ff08805fbbdd09ba9fb47a0bd21fe0ce2e026ab2cc7530ffa5013f0d4b4d9652d9218fd2e3134cea3fbf6c24627dbc4b95da4be1fcf15d5d1c240d43c46284bd62ccc47e9f5078c76cdb3b28ca5eaa4a8955241d22f02c76
+logName: projects/shaped-splicer-482602-v1/logs/run.googleapis.com%2Fstderr
+receiveTimestamp: '2026-04-17T21:19:08.902284860Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+textPayload: 'INFO:     connection closed'
+timestamp: '2026-04-17T21:19:08.565576Z'
+---
+insertId: 69e2a3cc0008a022ae7b08a0
+labels:
+  instanceId: 008c15ff08805fbbdd09ba9fb47a0bd21fe0ce2e026ab2cc7530ffa5013f0d4b4d9652d9218fd2e3134cea3fbf6c24627dbc4b95da4be1fcf15d5d1c240d43c46284bd62ccc47e9f5078c76cdb3b28ca5eaa4a8955241d22f02c76
+logName: projects/shaped-splicer-482602-v1/logs/run.googleapis.com%2Fstderr
+receiveTimestamp: '2026-04-17T21:19:08.902284860Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+textPayload: 'INFO:     connection rejected (403 Forbidden)'
+timestamp: '2026-04-17T21:19:08.565282Z'
+---
+insertId: 69e2a3cc00089f549ad38b0c
+labels:
+  instanceId: 008c15ff08805fbbdd09ba9fb47a0bd21fe0ce2e026ab2cc7530ffa5013f0d4b4d9652d9218fd2e3134cea3fbf6c24627dbc4b95da4be1fcf15d5d1c240d43c46284bd62ccc47e9f5078c76cdb3b28ca5eaa4a8955241d22f02c76
+logName: projects/shaped-splicer-482602-v1/logs/run.googleapis.com%2Fstderr
+receiveTimestamp: '2026-04-17T21:19:08.567555016Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+textPayload: 'INFO:     169.254.169.126:49470 - "WebSocket /ws/r2c" 403'
+timestamp: '2026-04-17T21:19:08.565076Z'
+---
+insertId: 69e2a3cc00089f42e2b987d4
+labels:
+  instanceId: 008c15ff08805fbbdd09ba9fb47a0bd21fe0ce2e026ab2cc7530ffa5013f0d4b4d9652d9218fd2e3134cea3fbf6c24627dbc4b95da4be1fcf15d5d1c240d43c46284bd62ccc47e9f5078c76cdb3b28ca5eaa4a8955241d22f02c76
+logName: projects/shaped-splicer-482602-v1/logs/run.googleapis.com%2Fstderr
+receiveTimestamp: '2026-04-17T21:19:08.567555016Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+textPayload: 'WARNING:main:r2c websocket auth rejected: client=169.254.169.126 user_agent=RID2Caltopo/coordination
+  received=len=18 suffix=2Fly whitespace_changed=False expected=len=19 suffix=oFly
+  whitespace_changed=False trimmed_match=False'
+timestamp: '2026-04-17T21:19:08.565058Z'
+---
+httpRequest:
+  latency: 0.002205s
+  protocol: HTTP/1.1
+  remoteIp: 198.204.214.45
+  requestMethod: GET
+  requestSize: '440'
+  requestUrl: https://tracker.kjt.us/ws/r2c
+  responseSize: '95'
+  serverIp: 142.250.141.121
+  status: 403
+  userAgent: RID2Caltopo/coordination
+insertId: 69e2a3cc0008a161dd73f2db
+labels:
+  instanceId: 008c15ff08805fbbdd09ba9fb47a0bd21fe0ce2e026ab2cc7530ffa5013f0d4b4d9652d9218fd2e3134cea3fbf6c24627dbc4b95da4be1fcf15d5d1c240d43c46284bd62ccc47e9f5078c76cdb3b28ca5eaa4a8955241d22f02c76
+logName: projects/shaped-splicer-482602-v1/logs/run.googleapis.com%2Frequests
+receiveTimestamp: '2026-04-17T21:19:08.570093149Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+severity: WARNING
+spanId: 9606f6a0d1f62ce6
+timestamp: '2026-04-17T21:19:08.560920Z'
+trace: projects/shaped-splicer-482602-v1/traces/48702a31d9de88c72d8888b524271c42
+traceSampled: true
+---
+insertId: 69e2a3bc0007408014c10ccb
+labels:
+  instanceId: 008c15ff08805fbbdd09ba9fb47a0bd21fe0ce2e026ab2cc7530ffa5013f0d4b4d9652d9218fd2e3134cea3fbf6c24627dbc4b95da4be1fcf15d5d1c240d43c46284bd62ccc47e9f5078c76cdb3b28ca5eaa4a8955241d22f02c76
+logName: projects/shaped-splicer-482602-v1/logs/run.googleapis.com%2Fstderr
+receiveTimestamp: '2026-04-17T21:18:52.811065680Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+textPayload: 'INFO:     connection closed'
+timestamp: '2026-04-17T21:18:52.475264Z'
+---
+insertId: 69e2a3bc00073ccd37f53850
+labels:
+  instanceId: 008c15ff08805fbbdd09ba9fb47a0bd21fe0ce2e026ab2cc7530ffa5013f0d4b4d9652d9218fd2e3134cea3fbf6c24627dbc4b95da4be1fcf15d5d1c240d43c46284bd62ccc47e9f5078c76cdb3b28ca5eaa4a8955241d22f02c76
+logName: projects/shaped-splicer-482602-v1/logs/run.googleapis.com%2Fstderr
+receiveTimestamp: '2026-04-17T21:18:52.811065680Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+textPayload: 'INFO:     connection rejected (403 Forbidden)'
+timestamp: '2026-04-17T21:18:52.474317Z'
+---
+insertId: 69e2a3bc00073a2ede2d2dbf
+labels:
+  instanceId: 008c15ff08805fbbdd09ba9fb47a0bd21fe0ce2e026ab2cc7530ffa5013f0d4b4d9652d9218fd2e3134cea3fbf6c24627dbc4b95da4be1fcf15d5d1c240d43c46284bd62ccc47e9f5078c76cdb3b28ca5eaa4a8955241d22f02c76
+logName: projects/shaped-splicer-482602-v1/logs/run.googleapis.com%2Fstderr
+receiveTimestamp: '2026-04-17T21:18:52.478663793Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+textPayload: 'INFO:     169.254.169.126:24712 - "WebSocket /ws/r2c" 403'
+timestamp: '2026-04-17T21:18:52.473646Z'
+---
+insertId: 69e2a3bc000739e9dc5dca05
+labels:
+  instanceId: 008c15ff08805fbbdd09ba9fb47a0bd21fe0ce2e026ab2cc7530ffa5013f0d4b4d9652d9218fd2e3134cea3fbf6c24627dbc4b95da4be1fcf15d5d1c240d43c46284bd62ccc47e9f5078c76cdb3b28ca5eaa4a8955241d22f02c76
+logName: projects/shaped-splicer-482602-v1/logs/run.googleapis.com%2Fstderr
+receiveTimestamp: '2026-04-17T21:18:52.478663793Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+textPayload: 'WARNING:main:r2c websocket auth rejected: client=169.254.169.126 user_agent=RID2Caltopo/coordination
+  received=len=18 suffix=2Fly whitespace_changed=False expected=len=19 suffix=oFly
+  whitespace_changed=False trimmed_match=False'
+timestamp: '2026-04-17T21:18:52.473577Z'
+---
+httpRequest:
+  latency: 0.007461s
+  protocol: HTTP/1.1
+  remoteIp: 198.204.214.45
+  requestMethod: GET
+  requestSize: '438'
+  requestUrl: https://tracker.kjt.us/ws/r2c
+  responseSize: '95'
+  serverIp: 142.250.141.121
+  status: 403
+  userAgent: RID2Caltopo/coordination
+insertId: 69e2a3bc00073e01351aec5f
+labels:
+  instanceId: 008c15ff08805fbbdd09ba9fb47a0bd21fe0ce2e026ab2cc7530ffa5013f0d4b4d9652d9218fd2e3134cea3fbf6c24627dbc4b95da4be1fcf15d5d1c240d43c46284bd62ccc47e9f5078c76cdb3b28ca5eaa4a8955241d22f02c76
+logName: projects/shaped-splicer-482602-v1/logs/run.googleapis.com%2Frequests
+receiveTimestamp: '2026-04-17T21:18:52.478964857Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+severity: WARNING
+spanId: bca83619aca8256b
+timestamp: '2026-04-17T21:18:52.464884Z'
+trace: projects/shaped-splicer-482602-v1/traces/ba8460eeb8dae55f15482b0113bf8d57
+traceSampled: true
+---
+insertId: smrkpwe1g40s
+logName: projects/shaped-splicer-482602-v1/logs/cloudaudit.googleapis.com%2Fsystem_event
+protoPayload:
+  '@type': type.googleapis.com/google.cloud.audit.AuditLog
+  methodName: /Services.ReplaceService
+  resourceName: namespaces/shaped-splicer-482602-v1/services/r2c-tracker
+  response:
+    '@type': type.googleapis.com/google.cloud.run.v1.Service
+    apiVersion: serving.knative.dev/v1
+    kind: Service
+    metadata:
+      annotations:
+        run.googleapis.com/build-enable-automatic-updates: 'false'
+        run.googleapis.com/build-id: 772e807b-dc65-4194-9865-9a1fdb7b3a91
+        run.googleapis.com/build-image-uri: us-west1-docker.pkg.dev/shaped-splicer-482602-v1/cloud-run-source-deploy/r2c-tracker
+        run.googleapis.com/build-name: projects/556828755130/locations/us-west1/builds/772e807b-dc65-4194-9865-9a1fdb7b3a91
+        run.googleapis.com/build-source-location: gs://run-sources-shaped-splicer-482602-v1-us-west1/services/r2c-tracker/1776460603.368529-0ea2c2216e5f48dcb6dcff82afdd1379.zip#1776460604419809
+        run.googleapis.com/client-name: gcloud
+        run.googleapis.com/client-version: 564.0.0
+        run.googleapis.com/ingress: all
+        run.googleapis.com/ingress-status: all
+        run.googleapis.com/invoker-iam-disabled: 'true'
+        run.googleapis.com/maxScale: '3'
+        run.googleapis.com/operation-id: ab620b0c-cad7-417e-87d6-4ec5475e2dfb
+        run.googleapis.com/urls: '["https://r2c-tracker-556828755130.us-west1.run.app","https://r2c-tracker-l44q7y36xq-uw.a.run.app"]'
+        serving.knative.dev/creator: kjtsar@kjt.us
+        serving.knative.dev/lastModifier: kjtsar@kjt.us
+      creationTimestamp: '2026-01-04T18:42:05.556072Z'
+      generation: 104
+      labels:
+        cloud.googleapis.com/location: us-west1
+      name: r2c-tracker
+      namespace: '556828755130'
+      resourceVersion: AAZPrn2gkII
+      selfLink: /apis/serving.knative.dev/v1/namespaces/556828755130/services/r2c-tracker
+      uid: f24f7779-fa2e-43c7-984b-9c09ff468ed5
+    spec:
+      template:
+        metadata:
+          annotations:
+            autoscaling.knative.dev/maxScale: '3'
+            run.googleapis.com/client-name: gcloud
+            run.googleapis.com/client-version: 564.0.0
+            run.googleapis.com/network-interfaces: '[{"network":"default","subnetwork":"default"}]'
+            run.googleapis.com/startup-cpu-boost: 'true'
+            run.googleapis.com/vpc-access-egress: private-ranges-only
+          labels:
+            client.knative.dev/nonce: qthuyzjime
+            run.googleapis.com/startupProbeType: Default
+        spec:
+          containerConcurrency: 80
+          containers:
+          - env:
+            - name: DATABASE_URL
+              value: postgresql+asyncpg://sar_admin:%5BpPYvY6q%2Br%26d%5BbTY@10.138.0.2:5432/flightdata
+            - name: TRACKER_ADMIN_PASS
+              value: Knead2FliMor
+            - name: TRACKER_API_KEY
+              value: InsatiableUrgeToFly
+            - name: TRACKER_VERSION
+              value: v1.0.8
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: latest
+                  name: r2c-tracker-secret-key
+            image: us-west1-docker.pkg.dev/shaped-splicer-482602-v1/cloud-run-source-deploy/r2c-tracker@sha256:a43a94e831f2aa33c12fbadc608ee96fd92ecdafbb2aaae943f71be508766c2d
+            name: r2c-tracker-1
+            ports:
+            - containerPort: 8080
+              name: http1
+            resources:
+              limits:
+                cpu: 1000m
+                memory: 512Mi
+            startupProbe:
+              failureThreshold: 1
+              periodSeconds: 240
+              tcpSocket:
+                port: 8080
+              timeoutSeconds: 240
+            volumeMounts:
+            - mountPath: /flightlogs-vol
+              name: gcs-1
+          serviceAccountName: 556828755130-compute@developer.gserviceaccount.com
+          timeoutSeconds: 300
+          volumes:
+          - csi:
+              driver: gcsfuse.run.googleapis.com
+              volumeAttributes:
+                bucketName: flightlogs-vol
+            name: gcs-1
+      traffic:
+      - latestRevision: true
+        percent: 100
+    status:
+      address:
+        url: https://r2c-tracker-l44q7y36xq-uw.a.run.app
+      conditions:
+      - lastTransitionTime: '2026-04-17T21:18:30.842498Z'
+        status: 'True'
+        type: Ready
+      - lastTransitionTime: '2026-04-17T21:18:20.082743Z'
+        status: 'True'
+        type: ConfigurationsReady
+      - lastTransitionTime: '2026-04-17T21:18:30.807328Z'
+        status: 'True'
+        type: RoutesReady
+      latestCreatedRevisionName: r2c-tracker-00104-fhl
+      latestReadyRevisionName: r2c-tracker-00104-fhl
+      observedGeneration: 104
+      traffic:
+      - latestRevision: true
+        percent: 100
+        revisionName: r2c-tracker-00104-fhl
+      url: https://r2c-tracker-l44q7y36xq-uw.a.run.app
+  serviceName: run.googleapis.com
+  status:
+    message: Ready condition status changed to True for Service r2c-tracker.
+receiveTimestamp: '2026-04-17T21:18:31.882921189Z'
+resource:
+  labels:
+    configuration_name: ''
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: ''
+    service_name: r2c-tracker
+  type: cloud_run_revision
+severity: INFO
+timestamp: '2026-04-17T21:18:30.857050Z'
+---
+insertId: 9gyi3od57i2
+logName: projects/shaped-splicer-482602-v1/logs/cloudaudit.googleapis.com%2Fsystem_event
+protoPayload:
+  '@type': type.googleapis.com/google.cloud.audit.AuditLog
+  methodName: /Services.ReplaceService
+  resourceName: namespaces/shaped-splicer-482602-v1/revisions/r2c-tracker-00104-fhl
+  response:
+    '@type': type.googleapis.com/google.cloud.run.v1.Revision
+    apiVersion: serving.knative.dev/v1
+    kind: Revision
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: '3'
+        run.googleapis.com/build-source-location: '{"r2c-tracker-1":"gs://run-sources-shaped-splicer-482602-v1-us-west1/services/r2c-tracker/1776460603.368529-0ea2c2216e5f48dcb6dcff82afdd1379.zip#1776460604419809"}'
+        run.googleapis.com/client-name: gcloud
+        run.googleapis.com/client-version: 564.0.0
+        run.googleapis.com/execution-environment: gen2
+        run.googleapis.com/network-interfaces: '[{"network":"default","subnetwork":"default"}]'
+        run.googleapis.com/operation-id: ab620b0c-cad7-417e-87d6-4ec5475e2dfb
+        run.googleapis.com/startup-cpu-boost: 'true'
+        run.googleapis.com/vpc-access-egress: private-ranges-only
+        serving.knative.dev/creator: kjtsar@kjt.us
+      creationTimestamp: '2026-04-17T21:18:13.604308Z'
+      generation: 1
+      labels:
+        client.knative.dev/nonce: qthuyzjime
+        cloud.googleapis.com/location: us-west1
+        run.googleapis.com/startupProbeType: Default
+        serving.knative.dev/configuration: r2c-tracker
+        serving.knative.dev/configurationGeneration: '104'
+        serving.knative.dev/route: r2c-tracker
+        serving.knative.dev/service: r2c-tracker
+        serving.knative.dev/serviceUid: f24f7779-fa2e-43c7-984b-9c09ff468ed5
+      name: r2c-tracker-00104-fhl
+      namespace: '556828755130'
+      ownerReferences:
+      - apiVersion: serving.knative.dev/v1
+        blockOwnerDeletion: true
+        controller: true
+        kind: Configuration
+        name: r2c-tracker
+        uid: 4489e9f4-71ca-44cc-91c1-aee78f11ae36
+      resourceVersion: AAZPrn2NIsQ
+      selfLink: /apis/serving.knative.dev/v1/namespaces/556828755130/revisions/r2c-tracker-00104-fhl
+      uid: 09bcce32-39c2-414f-a807-29e5130f9edd
+    spec:
+      containerConcurrency: 80
+      containers:
+      - env:
+        - name: DATABASE_URL
+          value: postgresql+asyncpg://sar_admin:%5BpPYvY6q%2Br%26d%5BbTY@10.138.0.2:5432/flightdata
+        - name: TRACKER_ADMIN_PASS
+          value: Knead2FliMor
+        - name: TRACKER_API_KEY
+          value: InsatiableUrgeToFly
+        - name: TRACKER_VERSION
+          value: v1.0.8
+        - name: SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: r2c-tracker-secret-key
+        image: us-west1-docker.pkg.dev/shaped-splicer-482602-v1/cloud-run-source-deploy/r2c-tracker@sha256:a43a94e831f2aa33c12fbadc608ee96fd92ecdafbb2aaae943f71be508766c2d
+        name: r2c-tracker-1
+        ports:
+        - containerPort: 8080
+          name: http1
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 512Mi
+        startupProbe:
+          failureThreshold: 1
+          periodSeconds: 240
+          tcpSocket:
+            port: 8080
+          timeoutSeconds: 240
+        volumeMounts:
+        - mountPath: /flightlogs-vol
+          name: gcs-1
+      serviceAccountName: 556828755130-compute@developer.gserviceaccount.com
+      timeoutSeconds: 300
+      volumes:
+      - csi:
+          driver: gcsfuse.run.googleapis.com
+          volumeAttributes:
+            bucketName: flightlogs-vol
+        name: gcs-1
+    status:
+      conditions:
+      - lastTransitionTime: '2026-04-17T21:18:29.569220Z'
+        message: Deploying revision succeeded in 15.96s.
+        status: 'True'
+        type: Ready
+      - lastTransitionTime: '2026-04-17T21:18:29.533898Z'
+        message: Containers became healthy in 7.43s.
+        status: 'True'
+        type: ContainerHealthy
+      - lastTransitionTime: '2026-04-17T21:18:19.995984Z'
+        message: Container image import completed in 5.81s.
+        status: 'True'
+        type: ContainerReady
+      - lastTransitionTime: '2026-04-17T21:18:21.620456Z'
+        message: Provisioning imported containers completed in 1.62s. Checking container
+          health. This will wait for up to 4m for the configured startup probe, including
+          an initial delay of 0s.
+        status: 'True'
+        type: ResourcesAvailable
+      containerStatuses:
+      - imageDigest: us-west1-docker.pkg.dev/shaped-splicer-482602-v1/cloud-run-source-deploy/r2c-tracker@sha256:a43a94e831f2aa33c12fbadc608ee96fd92ecdafbb2aaae943f71be508766c2d
+        name: r2c-tracker-1
+      imageDigest: us-west1-docker.pkg.dev/shaped-splicer-482602-v1/cloud-run-source-deploy/r2c-tracker@sha256:a43a94e831f2aa33c12fbadc608ee96fd92ecdafbb2aaae943f71be508766c2d
+      logUrl: https://console.cloud.google.com/logs/viewer?project=shaped-splicer-482602-v1&resource=cloud_run_revision/service_name/r2c-tracker/revision_name/r2c-tracker-00104-fhl&advancedFilter=resource.type%3D%22cloud_run_revision%22%0Aresource.labels.service_name%3D%22r2c-tracker%22%0Aresource.labels.revision_name%3D%22r2c-tracker-00104-fhl%22
+      observedGeneration: 1
+  serviceName: run.googleapis.com
+  status:
+    message: 'Ready condition status changed to True for Revision r2c-tracker-00104-fhl
+      with message: Deploying revision succeeded in 15.96s.'
+receiveTimestamp: '2026-04-17T21:18:30.394097206Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+severity: INFO
+timestamp: '2026-04-17T21:18:29.577440Z'
+---
+insertId: 69e2a3a50008180b64901a62
+labels:
+  instanceId: 008c15ff08805fbbdd09ba9fb47a0bd21fe0ce2e026ab2cc7530ffa5013f0d4b4d9652d9218fd2e3134cea3fbf6c24627dbc4b95da4be1fcf15d5d1c240d43c46284bd62ccc47e9f5078c76cdb3b28ca5eaa4a8955241d22f02c76
+logName: projects/shaped-splicer-482602-v1/logs/run.googleapis.com%2Fstderr
+receiveTimestamp: '2026-04-17T21:18:29.742220227Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+textPayload: INFO:sqlalchemy.engine.Engine:ROLLBACK
+timestamp: '2026-04-17T21:18:29.530443Z'
+---
+insertId: 69e2a3a5000817fac1cb2845
+labels:
+  instanceId: 008c15ff08805fbbdd09ba9fb47a0bd21fe0ce2e026ab2cc7530ffa5013f0d4b4d9652d9218fd2e3134cea3fbf6c24627dbc4b95da4be1fcf15d5d1c240d43c46284bd62ccc47e9f5078c76cdb3b28ca5eaa4a8955241d22f02c76
+logName: projects/shaped-splicer-482602-v1/logs/run.googleapis.com%2Fstdout
+receiveTimestamp: '2026-04-17T21:18:29.806721939Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+textPayload: 2026-04-17 21:18:29,529 INFO sqlalchemy.engine.Engine ROLLBACK
+timestamp: '2026-04-17T21:18:29.530426Z'
+---
+insertId: 69e2a3a500080cc41c6423eb
+labels:
+  instanceId: 008c15ff08805fbbdd09ba9fb47a0bd21fe0ce2e026ab2cc7530ffa5013f0d4b4d9652d9218fd2e3134cea3fbf6c24627dbc4b95da4be1fcf15d5d1c240d43c46284bd62ccc47e9f5078c76cdb3b28ca5eaa4a8955241d22f02c76
+logName: projects/shaped-splicer-482602-v1/logs/run.googleapis.com%2Fstderr
+receiveTimestamp: '2026-04-17T21:18:29.742220227Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+textPayload: INFO:sqlalchemy.engine.Engine:[generated in 0.00025s] (1776460709508,)
+timestamp: '2026-04-17T21:18:29.527556Z'
+---
+insertId: 69e2a3a500080cb417bf4179
+labels:
+  instanceId: 008c15ff08805fbbdd09ba9fb47a0bd21fe0ce2e026ab2cc7530ffa5013f0d4b4d9652d9218fd2e3134cea3fbf6c24627dbc4b95da4be1fcf15d5d1c240d43c46284bd62ccc47e9f5078c76cdb3b28ca5eaa4a8955241d22f02c76
+logName: projects/shaped-splicer-482602-v1/logs/run.googleapis.com%2Fstdout
+receiveTimestamp: '2026-04-17T21:18:29.806721939Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+textPayload: 2026-04-17 21:18:29,526 INFO sqlalchemy.engine.Engine [generated in 0.00025s]
+  (1776460709508,)
+timestamp: '2026-04-17T21:18:29.527540Z'
+---
+insertId: 69e2a3a500080c58dcb212f7
+labels:
+  instanceId: 008c15ff08805fbbdd09ba9fb47a0bd21fe0ce2e026ab2cc7530ffa5013f0d4b4d9652d9218fd2e3134cea3fbf6c24627dbc4b95da4be1fcf15d5d1c240d43c46284bd62ccc47e9f5078c76cdb3b28ca5eaa4a8955241d22f02c76
+logName: projects/shaped-splicer-482602-v1/logs/run.googleapis.com%2Fstdout
+receiveTimestamp: '2026-04-17T21:18:29.806721939Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+textPayload: WHERE r2c_drone_owner_state.lease_expire_ms >= $1::BIGINT
+timestamp: '2026-04-17T21:18:29.527448Z'
+---
+insertId: 69e2a3a500080c57344fefc7
+labels:
+  instanceId: 008c15ff08805fbbdd09ba9fb47a0bd21fe0ce2e026ab2cc7530ffa5013f0d4b4d9652d9218fd2e3134cea3fbf6c24627dbc4b95da4be1fcf15d5d1c240d43c46284bd62ccc47e9f5078c76cdb3b28ca5eaa4a8955241d22f02c76
+logName: projects/shaped-splicer-482602-v1/logs/run.googleapis.com%2Fstderr
+receiveTimestamp: '2026-04-17T21:18:29.742220227Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+textPayload: WHERE r2c_drone_owner_state.lease_expire_ms >= $1::BIGINT
+timestamp: '2026-04-17T21:18:29.527447Z'
+---
+insertId: 69e2a3a500080c534e6e6f68
+labels:
+  instanceId: 008c15ff08805fbbdd09ba9fb47a0bd21fe0ce2e026ab2cc7530ffa5013f0d4b4d9652d9218fd2e3134cea3fbf6c24627dbc4b95da4be1fcf15d5d1c240d43c46284bd62ccc47e9f5078c76cdb3b28ca5eaa4a8955241d22f02c76
+logName: projects/shaped-splicer-482602-v1/logs/run.googleapis.com%2Fstdout
+receiveTimestamp: '2026-04-17T21:18:29.806721939Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+textPayload: 'FROM r2c_drone_owner_state '
+timestamp: '2026-04-17T21:18:29.527443Z'
+---
+insertId: 69e2a3a500080c520fd89843
+labels:
+  instanceId: 008c15ff08805fbbdd09ba9fb47a0bd21fe0ce2e026ab2cc7530ffa5013f0d4b4d9652d9218fd2e3134cea3fbf6c24627dbc4b95da4be1fcf15d5d1c240d43c46284bd62ccc47e9f5078c76cdb3b28ca5eaa4a8955241d22f02c76
+logName: projects/shaped-splicer-482602-v1/logs/run.googleapis.com%2Fstderr
+receiveTimestamp: '2026-04-17T21:18:29.742220227Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+textPayload: 'FROM r2c_drone_owner_state '
+timestamp: '2026-04-17T21:18:29.527442Z'
+---
+insertId: 69e2a3a500080c4b19b87e69
+labels:
+  instanceId: 008c15ff08805fbbdd09ba9fb47a0bd21fe0ce2e026ab2cc7530ffa5013f0d4b4d9652d9218fd2e3134cea3fbf6c24627dbc4b95da4be1fcf15d5d1c240d43c46284bd62ccc47e9f5078c76cdb3b28ca5eaa4a8955241d22f02c76
+logName: projects/shaped-splicer-482602-v1/logs/run.googleapis.com%2Fstderr
+receiveTimestamp: '2026-04-17T21:18:29.742220227Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+textPayload: 'INFO:sqlalchemy.engine.Engine:SELECT r2c_drone_owner_state.id, r2c_drone_owner_state.map_id,
+  r2c_drone_owner_state.remote_id, r2c_drone_owner_state.owner_guid, r2c_drone_owner_state.owner_zone_id,
+  r2c_drone_owner_state.first_drone_ts, r2c_drone_owner_state.first_distance_m, r2c_drone_owner_state.mapped_id,
+  r2c_drone_owner_state.lease_seq, r2c_drone_owner_state.lease_expire_ms, r2c_drone_owner_state.updated_ms '
+timestamp: '2026-04-17T21:18:29.527435Z'
+---
+insertId: 69e2a3a500080c4860aedc48
+labels:
+  instanceId: 008c15ff08805fbbdd09ba9fb47a0bd21fe0ce2e026ab2cc7530ffa5013f0d4b4d9652d9218fd2e3134cea3fbf6c24627dbc4b95da4be1fcf15d5d1c240d43c46284bd62ccc47e9f5078c76cdb3b28ca5eaa4a8955241d22f02c76
+logName: projects/shaped-splicer-482602-v1/logs/run.googleapis.com%2Fstdout
+receiveTimestamp: '2026-04-17T21:18:29.806721939Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+textPayload: '2026-04-17 21:18:29,526 INFO sqlalchemy.engine.Engine SELECT r2c_drone_owner_state.id,
+  r2c_drone_owner_state.map_id, r2c_drone_owner_state.remote_id, r2c_drone_owner_state.owner_guid,
+  r2c_drone_owner_state.owner_zone_id, r2c_drone_owner_state.first_drone_ts, r2c_drone_owner_state.first_distance_m,
+  r2c_drone_owner_state.mapped_id, r2c_drone_owner_state.lease_seq, r2c_drone_owner_state.lease_expire_ms,
+  r2c_drone_owner_state.updated_ms '
+timestamp: '2026-04-17T21:18:29.527432Z'
+---
+insertId: 69e2a3a50007faed21dc95f5
+labels:
+  instanceId: 008c15ff08805fbbdd09ba9fb47a0bd21fe0ce2e026ab2cc7530ffa5013f0d4b4d9652d9218fd2e3134cea3fbf6c24627dbc4b95da4be1fcf15d5d1c240d43c46284bd62ccc47e9f5078c76cdb3b28ca5eaa4a8955241d22f02c76
+logName: projects/shaped-splicer-482602-v1/logs/run.googleapis.com%2Fvarlog%2Fsystem
+receiveTimestamp: '2026-04-17T21:18:29.696870787Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+severity: INFO
+textPayload: Default STARTUP TCP probe succeeded after 1 attempt for container "r2c-tracker-1"
+  on port 8080.
+timestamp: '2026-04-17T21:18:29.522989Z'
+---
+insertId: 69e2a3a50007f92ea5dc5e38
+labels:
+  instanceId: 008c15ff08805fbbdd09ba9fb47a0bd21fe0ce2e026ab2cc7530ffa5013f0d4b4d9652d9218fd2e3134cea3fbf6c24627dbc4b95da4be1fcf15d5d1c240d43c46284bd62ccc47e9f5078c76cdb3b28ca5eaa4a8955241d22f02c76
+logName: projects/shaped-splicer-482602-v1/logs/run.googleapis.com%2Fstderr
+receiveTimestamp: '2026-04-17T21:18:29.742220227Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+textPayload: 'INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)'
+timestamp: '2026-04-17T21:18:29.522542Z'
+---
+insertId: 69e2a3a50007ebf7d5e01dac
+labels:
+  instanceId: 008c15ff08805fbbdd09ba9fb47a0bd21fe0ce2e026ab2cc7530ffa5013f0d4b4d9652d9218fd2e3134cea3fbf6c24627dbc4b95da4be1fcf15d5d1c240d43c46284bd62ccc47e9f5078c76cdb3b28ca5eaa4a8955241d22f02c76
+logName: projects/shaped-splicer-482602-v1/logs/run.googleapis.com%2Fstderr
+receiveTimestamp: '2026-04-17T21:18:29.742220227Z'
+resource:
+  labels:
+    configuration_name: r2c-tracker
+    location: us-west1
+    project_id: shaped-splicer-482602-v1
+    revision_name: r2c-tracker-00104-fhl
+    service_name: r2c-tracker
+  type: cloud_run_revision
+textPayload: 'INFO:     Application startup complete.'
+timestamp: '2026-04-17T21:18:29.519159Z'
