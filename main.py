@@ -436,6 +436,7 @@ class R2CCoordinationHub:
                         "prevOwnerGuid": zone_guid
                     }
                 )
+            await manager.broadcast("refresh")
 
     async def handle_message(self, websocket: WebSocket, payload: dict):
         mtype = payload.get("type", "")
@@ -474,6 +475,7 @@ class R2CCoordinationHub:
             "leaseSec": R2C_LEASE_SEC
         }))
         await self.broadcast_zone_update(map_id)
+        await manager.broadcast("refresh")
 
     async def _handle_heartbeat(self, websocket: WebSocket, payload: dict):
         now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
@@ -541,6 +543,7 @@ class R2CCoordinationHub:
                 "leaseExpireTs": owner["lease_expire_ms"]
             }
         )
+        await manager.broadcast("refresh")
 
     async def _handle_sighting(self, websocket: WebSocket, payload: dict):
         map_id = payload.get("mapId", "")
@@ -599,6 +602,7 @@ class R2CCoordinationHub:
                     "prevOwnerGuid": payload.get("guid", zone_id)
                 }
             )
+            await manager.broadcast("refresh")
 
     async def broadcast_zone_update(self, map_id: str):
         async with self._lock:
@@ -714,6 +718,8 @@ class R2CCoordinationHub:
                     "prevOwnerGuid": owner_guid
                 }
             )
+        if expired_maps or expired_owners:
+            await manager.broadcast("refresh")
 
     async def _upsert_zone_state(self, map_id: str, zone_id: str, guid: str, name: str,
                                  lat: float, lng: float, caltopo_rtt_ms: int,
@@ -1324,6 +1330,89 @@ def export_url(start_date: Optional[date] = None, end_date: Optional[date] = Non
         params["end_date"] = end_date.isoformat()
     return f"/export?{urlencode(params)}" if params else "/export"
 
+
+def format_elapsed_ms(elapsed_ms: Optional[int]) -> str:
+    if elapsed_ms is None:
+        return "unknown"
+    elapsed_ms = max(int(elapsed_ms), 0)
+    total_seconds = elapsed_ms // 1000
+    if total_seconds < 60:
+        return f"{total_seconds}s"
+    if total_seconds < 3600:
+        minutes, seconds = divmod(total_seconds, 60)
+        return f"{minutes}m {seconds:02d}s"
+    hours, rem = divmod(total_seconds, 3600)
+    minutes = rem // 60
+    return f"{hours}h {minutes:02d}m"
+
+
+def build_r2c_snapshot(zones, owners, now_ms: int):
+    owner_rows_by_zone = {}
+    for owner in owners:
+        owner_rows_by_zone.setdefault((owner.map_id, owner.owner_zone_id), []).append({
+            "remote_id": owner.remote_id,
+            "mapped_id": owner.mapped_id,
+            "lease_seq": owner.lease_seq,
+            "lease_expire_ms": owner.lease_expire_ms,
+            "lease_remaining_ms": max(int(owner.lease_expire_ms or 0) - now_ms, 0),
+            "lease_remaining_label": format_elapsed_ms(int(owner.lease_expire_ms or 0) - now_ms),
+            "first_drone_ts": owner.first_drone_ts,
+            "first_distance_m": owner.first_distance_m,
+        })
+
+    maps = {}
+    for zone in zones:
+        elapsed_ms = max(now_ms - int(zone.last_seen_ms or 0), 0)
+        zone_status = "online" if elapsed_ms <= (R2C_HEARTBEAT_SEC * 1000 * 2) else "quiet"
+        owned_drones = sorted(
+            owner_rows_by_zone.get((zone.map_id, zone.zone_id), []),
+            key=lambda row: (
+                0 if row["mapped_id"] else 1,
+                row["mapped_id"] or row["remote_id"],
+                row["remote_id"],
+            ),
+        )
+        zone_entry = {
+            "map_id": zone.map_id,
+            "zone_id": zone.zone_id,
+            "guid": zone.guid,
+            "name": zone.name or zone.zone_id,
+            "lat": zone.lat,
+            "lng": zone.lng,
+            "caltopo_rtt_ms": zone.caltopo_rtt_ms,
+            "last_seen_ms": zone.last_seen_ms,
+            "last_seen_age_ms": elapsed_ms,
+            "last_seen_age_label": format_elapsed_ms(elapsed_ms),
+            "status": zone_status,
+            "owned_drones": owned_drones,
+            "owned_drone_count": len(owned_drones),
+        }
+        maps.setdefault(zone.map_id, []).append(zone_entry)
+
+    snapshot_maps = []
+    for map_id in sorted(maps.keys()):
+        zone_entries = sorted(
+            maps[map_id],
+            key=lambda row: (
+                row["status"] != "online",
+                row["name"].lower(),
+                row["zone_id"].lower(),
+            ),
+        )
+        snapshot_maps.append({
+            "map_id": map_id,
+            "zones": zone_entries,
+            "zone_count": len(zone_entries),
+            "owned_drone_count": sum(zone["owned_drone_count"] for zone in zone_entries),
+        })
+
+    return {
+        "maps": snapshot_maps,
+        "map_count": len(snapshot_maps),
+        "zone_count": sum(entry["zone_count"] for entry in snapshot_maps),
+        "owned_drone_count": sum(entry["owned_drone_count"] for entry in snapshot_maps),
+    }
+
 FILTER_TIMEZONE = ZoneInfo("America/Los_Angeles")
 
 def local_date_bounds_to_utc(start_date: Optional[date] = None, end_date: Optional[date] = None):
@@ -1569,6 +1658,38 @@ async def public_dashboard(
             "leaderboard": leaderboard,
             "start_date" : start_date,
             "end_date" : end_date
+        },
+    )
+
+
+@app.get("/r2c", response_class=HTMLResponse)
+async def public_r2c_snapshot(
+        request: Request,
+        response: Response,
+        db: AsyncSession = Depends(get_db)):
+    response.headers["X-Robots-Tag"] = "noindex, nofollow"
+
+    now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
+    zone_stmt = select(R2CZoneState).order_by(R2CZoneState.map_id, R2CZoneState.name, R2CZoneState.zone_id)
+    owner_stmt = select(R2CDroneOwnerState).where(R2CDroneOwnerState.lease_expire_ms >= now_ms)
+
+    zone_result = await db.execute(zone_stmt)
+    owner_result = await db.execute(owner_stmt)
+
+    zones = zone_result.scalars().all()
+    owners = owner_result.scalars().all()
+    snapshot = build_r2c_snapshot(zones, owners, now_ms)
+
+    return templates.TemplateResponse(
+        request=request,
+        name="r2c_snapshot.html",
+        context={
+            "request": request,
+            "snapshot": snapshot,
+            "generated_at": datetime.now(tz=UTC),
+            "generated_at_ms": now_ms,
+            "heartbeat_sec": R2C_HEARTBEAT_SEC,
+            "lease_sec": R2C_LEASE_SEC,
         },
     )
 

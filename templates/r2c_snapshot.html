@@ -1,0 +1,365 @@
+{% extends "base.html" %}
+
+{% block title %}R2C Instance Status{% endblock %}
+
+{% block extra_head %}
+<style>
+  :root {
+    --ink: #183153;
+    --muted: #607087;
+    --paper: #fbfcfe;
+    --panel: #ffffff;
+    --line: #d9e2ec;
+    --accent: #0d6e6e;
+    --accent-soft: #e4f5f3;
+    --warn: #9a6700;
+    --warn-soft: #fff2cc;
+  }
+
+  body {
+    margin: 0;
+    background:
+      radial-gradient(circle at top left, #eef8ff 0%, transparent 35%),
+      linear-gradient(180deg, #f7fafc 0%, #edf2f7 100%);
+    color: var(--ink);
+  }
+
+  main {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 28px 18px 40px;
+  }
+
+  .hero {
+    background: linear-gradient(135deg, #16324f 0%, #255d67 100%);
+    color: white;
+    border-radius: 18px;
+    padding: 24px;
+    box-shadow: 0 18px 40px rgba(22, 50, 79, 0.18);
+    margin-bottom: 22px;
+  }
+
+  .hero h1 {
+    margin: 0 0 8px;
+    font-size: 2rem;
+  }
+
+  .hero p {
+    margin: 0;
+    color: rgba(255, 255, 255, 0.86);
+    max-width: 60rem;
+  }
+
+  .toolbar, .summary, .map-card, .empty-state {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    box-shadow: 0 10px 30px rgba(24, 49, 83, 0.06);
+  }
+
+  .toolbar {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    align-items: center;
+    padding: 16px 18px;
+    margin-bottom: 20px;
+  }
+
+  .toolbar .meta {
+    color: var(--muted);
+    font-size: 0.95rem;
+  }
+
+  .reload-link {
+    display: inline-block;
+    background: var(--accent);
+    color: white;
+    text-decoration: none;
+    padding: 10px 16px;
+    border-radius: 999px;
+    font-weight: 600;
+  }
+
+  .summary {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 14px;
+    padding: 18px;
+    margin-bottom: 22px;
+  }
+
+  .stat {
+    background: var(--paper);
+    border-radius: 14px;
+    padding: 16px;
+  }
+
+  .stat .label {
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    margin-bottom: 6px;
+  }
+
+  .stat .value {
+    font-size: 1.75rem;
+    font-weight: 700;
+  }
+
+  .map-card {
+    padding: 20px;
+    margin-bottom: 20px;
+  }
+
+  .map-header {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    align-items: baseline;
+    margin-bottom: 14px;
+  }
+
+  .map-title {
+    margin: 0;
+  }
+
+  .map-title a {
+    color: #0b63c9;
+    text-decoration: none;
+    border-bottom: 2px solid rgba(11, 99, 201, 0.28);
+  }
+
+  .map-title a:hover {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+
+  .map-meta {
+    color: var(--muted);
+    font-size: 0.95rem;
+  }
+
+  .instance-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 16px;
+  }
+
+  .instance-card {
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: var(--paper);
+    padding: 16px;
+  }
+
+  .instance-top {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    align-items: flex-start;
+    margin-bottom: 10px;
+  }
+
+  .instance-name {
+    margin: 0 0 4px;
+  }
+
+  .instance-subtitle, .detail-list, .drone-meta {
+    color: var(--muted);
+  }
+
+  .badge {
+    border-radius: 999px;
+    padding: 6px 10px;
+    font-size: 0.82rem;
+    font-weight: 700;
+    white-space: nowrap;
+  }
+
+  .badge.online {
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+
+  .badge.quiet {
+    background: var(--warn-soft);
+    color: var(--warn);
+  }
+
+  .detail-list {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px 14px;
+    font-size: 0.92rem;
+    margin: 12px 0 0;
+  }
+
+  .drone-list {
+    margin: 14px 0 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .drone-item {
+    border-top: 1px solid var(--line);
+    padding: 12px 0 0;
+    margin-top: 12px;
+  }
+
+  .drone-id {
+    font-weight: 700;
+  }
+
+  .empty-state {
+    padding: 26px;
+    text-align: center;
+    color: var(--muted);
+  }
+
+  @media (max-width: 700px) {
+    .toolbar, .map-header, .instance-top {
+      display: block;
+    }
+
+    .reload-link {
+      margin-top: 12px;
+    }
+
+    .detail-list {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>
+<script>
+  function formatElapsedMs(elapsedMs) {
+    const safeMs = Math.max(Number(elapsedMs) || 0, 0);
+    const totalSeconds = Math.floor(safeMs / 1000);
+    if (totalSeconds < 60) {
+      return `${totalSeconds}s`;
+    }
+    if (totalSeconds < 3600) {
+      const minutes = Math.floor(totalSeconds / 60);
+      const seconds = totalSeconds % 60;
+      return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
+    }
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    return `${hours}h ${String(minutes).padStart(2, '0')}m`;
+  }
+
+  document.addEventListener("DOMContentLoaded", function() {
+    const generatedAtMs = Number(document.body.dataset.generatedAtMs || 0);
+    const quietAfterMs = Number(document.body.dataset.quietAfterMs || 0);
+    const ageElements = document.querySelectorAll('[data-last-seen-ms]');
+    const statusElements = document.querySelectorAll('[data-status-badge]');
+
+    function refreshAges() {
+      const browserNowMs = Date.now();
+      const snapshotNowMs = generatedAtMs + (browserNowMs - browserNowMsAtLoad);
+      ageElements.forEach((el) => {
+        const lastSeenMs = Number(el.dataset.lastSeenMs || 0);
+        const elapsedMs = snapshotNowMs - lastSeenMs;
+        el.textContent = `${formatElapsedMs(elapsedMs)} ago`;
+      });
+      statusElements.forEach((el) => {
+        const lastSeenMs = Number(el.dataset.lastSeenMs || 0);
+        const elapsedMs = Math.max(snapshotNowMs - lastSeenMs, 0);
+        const isOnline = elapsedMs <= quietAfterMs;
+        el.textContent = isOnline ? 'ONLINE' : 'QUIET';
+        el.classList.toggle('online', isOnline);
+        el.classList.toggle('quiet', !isOnline);
+      });
+    }
+
+    const browserNowMsAtLoad = Date.now();
+    refreshAges();
+    window.setInterval(refreshAges, 1000);
+  });
+</script>
+{% endblock %}
+
+{% block content %}
+<script>
+  document.body.dataset.generatedAtMs = "{{ generated_at_ms }}";
+  document.body.dataset.quietAfterMs = "{{ heartbeat_sec * 2000 }}";
+</script>
+<section class="hero">
+  <h1>R2C Instance Status</h1>
+  <p>This page shows a live snapshot of currently registered R2C instances and the drones they currently own. It will refresh when the tracker publishes an update, and you can still reload manually whenever you want a fresh read.</p>
+</section>
+
+<section class="toolbar">
+  <div class="meta">
+    Snapshot generated at
+    <strong>{{ generated_at.strftime('%Y-%m-%d %H:%M:%S UTC') }}</strong>.
+    Instances that have not checked in for more than about {{ heartbeat_sec * 2 }} seconds are marked quiet.
+  </div>
+  <a class="reload-link" href="/r2c">Reload Now</a>
+</section>
+
+<section class="summary">
+  <div class="stat">
+    <div class="label">Maps</div>
+    <div class="value">{{ snapshot.map_count }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Instances</div>
+    <div class="value">{{ snapshot.zone_count }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Owned Drones</div>
+    <div class="value">{{ snapshot.owned_drone_count }}</div>
+  </div>
+</section>
+
+{% if snapshot.maps %}
+  {% for map_entry in snapshot.maps %}
+  <section class="map-card">
+    <div class="map-header">
+      <h2 class="map-title"><a href="https://caltopo.com/m/{{ map_entry.map_id }}" target="_blank" rel="noopener noreferrer">Map {{ map_entry.map_id }}</a></h2>
+      <div class="map-meta">{{ map_entry.zone_count }} instance{{ '' if map_entry.zone_count == 1 else 's' }}, {{ map_entry.owned_drone_count }} owned drone{{ '' if map_entry.owned_drone_count == 1 else 's' }}</div>
+    </div>
+
+    <div class="instance-grid">
+      {% for zone in map_entry.zones %}
+      <article class="instance-card">
+        <div class="instance-top">
+          <div>
+            <h3 class="instance-name">{{ zone.name }}</h3>
+          </div>
+          <span class="badge {{ zone.status }}" data-status-badge data-last-seen-ms="{{ zone.last_seen_ms }}">{{ zone.status|upper }}</span>
+        </div>
+
+        <div class="detail-list">
+          <div>Last communication: <strong data-last-seen-ms="{{ zone.last_seen_ms }}">{{ zone.last_seen_age_label }} ago</strong></div>
+          <div>Caltopo RTT: <strong>{{ zone.caltopo_rtt_ms }} ms</strong></div>
+          <div>Location: <strong>{{ '%.5f'|format(zone.lat) }}, {{ '%.5f'|format(zone.lng) }}</strong></div>
+        </div>
+
+        {% if zone.owned_drones %}
+        <ul class="drone-list">
+          {% for drone in zone.owned_drones %}
+          <li class="drone-item">
+            <div class="drone-id">{{ drone.mapped_id or drone.remote_id }}</div>
+            <div class="drone-meta">Remote ID: {{ drone.remote_id }}</div>
+            <div class="drone-meta">Lease remaining: {{ drone.lease_remaining_label }}</div>
+            <div class="drone-meta">First distance from zone: {{ '%.1f'|format(drone.first_distance_m) }} m</div>
+          </li>
+          {% endfor %}
+        </ul>
+        {% else %}
+        <p class="drone-meta">No drones currently owned.</p>
+        {% endif %}
+      </article>
+      {% endfor %}
+    </div>
+  </section>
+  {% endfor %}
+{% else %}
+  <section class="empty-state">
+    No registered R2C instances are currently available in this snapshot.
+  </section>
+{% endif %}
+{% endblock %}

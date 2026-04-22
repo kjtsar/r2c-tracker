@@ -15,6 +15,7 @@ def load_coordination_classes():
     snippet = source[start:end]
 
     logger = types.SimpleNamespace(warning=lambda *args, **kwargs: None)
+    manager = types.SimpleNamespace(broadcast=lambda *args, **kwargs: asyncio.sleep(0))
     namespace = {
         "asyncio": asyncio,
         "json": json,
@@ -23,6 +24,7 @@ def load_coordination_classes():
         "datetime": datetime,
         "WebSocket": type("WebSocket", (), {}),
         "logger": logger,
+        "manager": manager,
         "R2C_HEARTBEAT_SEC": 15,
         "R2C_LEASE_SEC": 45,
         "R2C_SWEEP_SEC": 15,

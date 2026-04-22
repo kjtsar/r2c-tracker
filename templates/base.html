@@ -72,32 +72,30 @@
     {% endblock %}
   </main>
   
+{% if enable_live_refresh | default(True) %}
 <script>
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const socket = new WebSocket(`${protocol}//${window.location.host}/ws`);
-      
+
   socket.onmessage = function(event) {
       if (event.data === "refresh") {
-          window.location.reload(); // Force the browser to refresh
+          window.location.reload();
       }
   };
-
+</script>
+{% endif %}
+<script>
   document.addEventListener("DOMContentLoaded", function() {
-      // Find all elements marked for conversion:
-      const timeElements = document.querySelectorAll('.local-datetime')
-
-      // Create a formatter that uses the Browser's default (no timezone option)
+      const timeElements = document.querySelectorAll('.local-datetime');
       const formatter = new Intl.DateTimeFormat(undefined, {
 	  day: '2-digit', month: 'short', year: '2-digit',
 	  hour: '2-digit', minute: '2-digit', hour12: false
       });
-      
-      timeElements.foreach(el => {
+
+      timeElements.forEach(el => {
 	  const timeStr = el.getAttribute('data-utc');
 	  if (timeStr) {
-	      // without 'Z' or '+HH:MM', Date() treats timeStr as local system time.
 	      const date = new Date(timeStr);
-	      
 	      const formatted = formatter.format(date).replace(',', '').replace(' ', '@');
 	      el.textContent = formatted;
 	  }
@@ -110,6 +108,7 @@
 
 
     <footer style="margin-top: 50px; text-align: center; border-top: 1px solid #ddd; padding-top: 20px;">
+      <p><a href="/r2c" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">R2C Instance Status</a></p>
       <p><a href="/flightlogs/list" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Admin Flight Logs</a></p>
       <p><a href="/admin" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Admin Access</a></p>
       <p><a href="/export" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Export as CSV</a></p>
