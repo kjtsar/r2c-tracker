@@ -129,10 +129,13 @@ PY
 echo "Wrote Cloud Run env vars file to ${ENV_VARS_FILE}."
 echo "Deploying ${SERVICE_NAME} version ${TRACKER_VERSION} to Cloud Run in ${REGION}..."
 
+WEB_REQUEST_TIMEOUT="${WEB_REQUEST_TIMEOUT:-3600s}"
+
 run_gcloud run deploy "${SERVICE_NAME}" \
   --source . \
   --region "${REGION}" \
   --project "${GCLOUD_PROJECT}" \
   --service-account "${RUNTIME_SERVICE_ACCOUNT}" \
+  --timeout "${WEB_REQUEST_TIMEOUT}" \
   --env-vars-file "${ENV_VARS_FILE}" \
   --set-secrets "SECRET_KEY=${SECRET_KEY_SECRET_NAME}:latest"

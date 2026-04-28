@@ -78,6 +78,7 @@ TRACKER_VERSION = resolve_tracker_version()
 BASE_LOG_DIRECTORY = '/flightlogs-vol'
 R2C_HEARTBEAT_SEC = int(os.environ.get("R2C_HEARTBEAT_SEC", "15"))
 R2C_LEASE_SEC = int(os.environ.get("R2C_LEASE_SEC", "45"))
+R2C_DB_CLEANUP_SEC = int(os.environ.get("R2C_DB_CLEANUP_SEC", "86400"))
 
 
 def _mask_token(token: Optional[str]) -> str:
@@ -114,6 +115,31 @@ logger = logging.getLogger(__name__)
 filepath = __file__
 filedate = datetime.fromtimestamp(os.path.getmtime(filepath))
 print(f"{filepath} version is {filedate}")
+
+_flight_submission_locks: dict[str, asyncio.Lock] = {}
+_flight_submission_locks_guard = asyncio.Lock()
+
+
+def normalize_flight_submission_key(remote_id: Optional[str], sar_id: Optional[str] = None) -> str:
+    remote_key = (remote_id or "").strip().upper()
+    if remote_key:
+        return f"RID:{remote_key}"
+    sar_key = (sar_id or "").strip().upper()
+    if sar_key:
+        return f"SAR:{sar_key}"
+    return ""
+
+
+@asynccontextmanager
+async def serialized_flight_submission(remote_id: Optional[str], sar_id: Optional[str] = None):
+    key = normalize_flight_submission_key(remote_id, sar_id)
+    async with _flight_submission_locks_guard:
+        lock = _flight_submission_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _flight_submission_locks[key] = lock
+    async with lock:
+        yield
 
 
 def load_recent_versions(limit: int = 10):
@@ -175,6 +201,7 @@ class Flight(Base):
     __tablename__ = "flights"
     id = Column(Integer, primary_key=True)
     sar_id = Column(String, default="undefined")
+    remote_id = Column(String, default="", index=True)
     uas = Column(String, default="")
     incident = Column(String, default="")
     op_period = Column(String, default="")
@@ -205,7 +232,7 @@ class R2CZoneState(Base):
     name = Column(String, default="")
     lat = Column(Float, default=0.0)
     lng = Column(Float, default=0.0)
-    caltopo_rtt_ms = Column(Integer, default=2000)
+    caltopo_rtt_ms = Column(Integer, default=0)
     online = Column(Boolean, default=True)
     last_seen_ms = Column(BigInteger, default=0)
 
@@ -291,15 +318,21 @@ async def migrate_flight_archive_schema():
                 FROM information_schema.columns
                 WHERE table_schema = current_schema()
                   AND table_name = 'flights'
-                  AND column_name = 'archive_relpath'
             """))
-            if result.scalar_one_or_none() is None:
+            columns = {row[0] for row in result.fetchall()}
+            if "archive_relpath" not in columns:
                 await conn.execute(text("ALTER TABLE flights ADD COLUMN archive_relpath VARCHAR DEFAULT ''"))
+            if "remote_id" not in columns:
+                await conn.execute(text("ALTER TABLE flights ADD COLUMN remote_id VARCHAR DEFAULT ''"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_flights_remote_id ON flights (remote_id)"))
         elif dialect == "sqlite":
             result = await conn.execute(text("PRAGMA table_info(flights)"))
             columns = {row[1] for row in result.fetchall()}
             if "archive_relpath" not in columns:
                 await conn.execute(text("ALTER TABLE flights ADD COLUMN archive_relpath TEXT DEFAULT ''"))
+            if "remote_id" not in columns:
+                await conn.execute(text("ALTER TABLE flights ADD COLUMN remote_id TEXT DEFAULT ''"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_flights_remote_id ON flights (remote_id)"))
 
 
 async def init_db():
@@ -363,7 +396,9 @@ class R2CZoneConnection:
         self.name: str = ""
         self.lat: float = 0.0
         self.lng: float = 0.0
-        self.caltopo_rtt_ms: int = 2000
+        self.caltopo_rtt_ms: int = 0
+        self.connected_at_ms: int = 0
+        self.hello_received_at_ms: int = 0
         self.last_seen_ms: int = 0
 
 
@@ -375,12 +410,15 @@ class R2CCoordinationHub:
         self._owners: dict[tuple[str, str], dict] = {}
         self._sweep_task: Optional[asyncio.Task] = None
         self._load_task: Optional[asyncio.Task] = None
+        self._cleanup_task: Optional[asyncio.Task] = None
 
     async def start(self):
         if self._sweep_task is None:
             self._sweep_task = asyncio.create_task(self._expiry_loop())
         if self._load_task is None:
             self._load_task = asyncio.create_task(self._load_state_safe())
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
 
     async def stop(self):
         if self._sweep_task is not None:
@@ -397,46 +435,66 @@ class R2CCoordinationHub:
             except asyncio.CancelledError:
                 pass
             self._load_task = None
+        if self._cleanup_task is not None:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+            self._cleanup_task = None
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
+        now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
         async with self._lock:
-            self._connections[websocket] = R2CZoneConnection(websocket)
+            conn = R2CZoneConnection(websocket)
+            conn.connected_at_ms = now_ms
+            self._connections[websocket] = conn
 
     async def disconnect(self, websocket: WebSocket):
         async with self._lock:
             conn = self._connections.pop(websocket, None)
             if conn is None:
                 return
-            expired: list[tuple[str, str]] = []
-            if conn.map_id and conn.zone_id:
-                zones = self._zones_by_map.get(conn.map_id, {})
-                zones.pop(conn.zone_id, None)
-                if not zones:
-                    self._zones_by_map.pop(conn.map_id, None)
-                for key, owner in list(self._owners.items()):
-                    if owner.get("owner_guid") == conn.guid:
-                        expired.append(key)
-                        self._owners.pop(key, None)
             map_id = conn.map_id
             zone_guid = conn.guid or ""
             zone_id = conn.zone_id or ""
+            name = conn.name
+            lat = conn.lat
+            lng = conn.lng
+            caltopo_rtt_ms = conn.caltopo_rtt_ms
+            connected_at_ms = conn.connected_at_ms
+            hello_received_at_ms = conn.hello_received_at_ms
+            last_seen_ms = conn.last_seen_ms
+            if map_id and zone_id:
+                zones = self._zones_by_map.get(map_id, {})
+                tracked = zones.get(zone_id)
+                if tracked is conn:
+                    conn.websocket = None
+        now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
         if map_id and zone_id:
-            await self._delete_zone_state(map_id, zone_id)
-            for owner_map_id, remote_id in expired:
-                await self._delete_owner_state(owner_map_id, remote_id)
+            logger.info(
+                "r2c websocket disconnected: map=%s zone=%s guid=%s conn_age_ms=%s hello_age_ms=%s last_seen_age_ms=%s",
+                map_id,
+                zone_id,
+                zone_guid,
+                max(now_ms - int(connected_at_ms or 0), 0),
+                max(now_ms - int(hello_received_at_ms or connected_at_ms or 0), 0),
+                max(now_ms - int(last_seen_ms or 0), 0),
+            )
+            await self._upsert_zone_state(
+                map_id,
+                zone_id,
+                zone_guid or zone_id,
+                name,
+                lat,
+                lng,
+                caltopo_rtt_ms,
+                False,
+                last_seen_ms,
+            )
         if map_id:
             await self.broadcast_zone_update(map_id)
-            for owner_map_id, remote_id in expired:
-                await self.broadcast(
-                    owner_map_id,
-                    {
-                        "type": "owner_expired",
-                        "remoteId": remote_id,
-                        "prevOwnerGuid": zone_guid
-                    }
-                )
-            await manager.broadcast("refresh")
 
     async def handle_message(self, websocket: WebSocket, payload: dict):
         mtype = payload.get("type", "")
@@ -463,10 +521,18 @@ class R2CCoordinationHub:
             conn.name = payload.get("name", zone_id)
             conn.lat = float(payload.get("lat", 0.0) or 0.0)
             conn.lng = float(payload.get("lng", 0.0) or 0.0)
-            conn.caltopo_rtt_ms = int(payload.get("caltopoRttMs", 2000) or 2000)
+            conn.caltopo_rtt_ms = self._parse_caltopo_rtt_ms(payload.get("caltopoRttMs"))
+            conn.hello_received_at_ms = now_ms
             conn.last_seen_ms = now_ms
             zones = self._zones_by_map.setdefault(map_id, {})
             zones[zone_id] = conn
+        logger.info(
+            "r2c hello received: map=%s zone=%s guid=%s handshake_age_ms=%s",
+            map_id,
+            zone_id,
+            conn.guid or zone_id,
+            max(now_ms - int(conn.connected_at_ms or now_ms), 0),
+        )
         await self._upsert_zone_state(map_id, zone_id, conn.guid or zone_id, conn.name, conn.lat, conn.lng, conn.caltopo_rtt_ms, True, now_ms)
         await websocket.send_text(json.dumps({
             "type": "hello_ack",
@@ -475,18 +541,20 @@ class R2CCoordinationHub:
             "leaseSec": R2C_LEASE_SEC
         }))
         await self.broadcast_zone_update(map_id)
-        await manager.broadcast("refresh")
 
     async def _handle_heartbeat(self, websocket: WebSocket, payload: dict):
         now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
         owner_updates: list[tuple[str, str, dict]] = []
+        owner_lease_expire_ms = 0
         async with self._lock:
             conn = self._connections.get(websocket)
             if conn is None:
                 return
             conn.lat = float(payload.get("lat", conn.lat) or 0.0)
             conn.lng = float(payload.get("lng", conn.lng) or 0.0)
-            conn.caltopo_rtt_ms = int(payload.get("caltopoRttMs", conn.caltopo_rtt_ms) or conn.caltopo_rtt_ms)
+            incoming_rtt_ms = self._parse_caltopo_rtt_ms(payload.get("caltopoRttMs"))
+            if incoming_rtt_ms > 0:
+                conn.caltopo_rtt_ms = incoming_rtt_ms
             conn.last_seen_ms = now_ms
             map_id = conn.map_id
             zone_id = conn.zone_id
@@ -499,11 +567,30 @@ class R2CCoordinationHub:
                 for (owner_map_id, remote_id), owner in self._owners.items():
                     if owner.get("owner_guid") == guid:
                         owner["lease_expire_ms"] = now_ms + (R2C_LEASE_SEC * 1000)
+                        owner_lease_expire_ms = max(owner_lease_expire_ms, int(owner["lease_expire_ms"]))
                         owner_updates.append((owner_map_id, remote_id, dict(owner)))
         if map_id and zone_id:
             await self._upsert_zone_state(map_id, zone_id, guid or zone_id, name, lat, lng, caltopo_rtt_ms, True, now_ms)
         for owner_map_id, remote_id, owner in owner_updates:
             await self._upsert_owner_state(owner_map_id, remote_id, owner)
+        logger.info(
+            "r2c heartbeat_ack: map=%s zone=%s guid=%s client_seq=%s owner_lease_expire_ts=%s",
+            map_id,
+            zone_id,
+            guid,
+            payload.get("seq"),
+            owner_lease_expire_ms,
+        )
+        await websocket.send_text(json.dumps({
+            "type": "heartbeat_ack",
+            "serverTime": now_ms,
+            "mapId": map_id,
+            "zoneId": zone_id,
+            "guid": guid,
+            "leaseSec": R2C_LEASE_SEC,
+            "ownerLeaseExpireTs": owner_lease_expire_ms,
+            "clientSeq": payload.get("seq"),
+        }))
         if map_id:
             await self.broadcast_zone_update(map_id)
 
@@ -523,14 +610,39 @@ class R2CCoordinationHub:
                 "mapped_id": payload.get("mappedId", "") or "",
                 "lease_seq": 1
             }
+            decision_reason = "initial_claim"
             if existing is None:
                 owner = candidate
             else:
                 owner = self._pick_owner(existing, candidate)
+                decision_reason = "candidate_better" if owner is candidate else "existing_better"
                 if owner is candidate:
                     candidate["lease_seq"] = int(existing.get("lease_seq", 0)) + 1
             owner["lease_expire_ms"] = int(datetime.now(tz=UTC).timestamp() * 1000) + (R2C_LEASE_SEC * 1000)
             self._owners[(map_id, remote_id)] = owner
+        logger.info(
+            "r2c owner_decision: map=%s remote_id=%s reason=%s prev_owner_guid=%s prev_zone_id=%s "
+            "prev_drone_ts=%s prev_distance_m=%s prev_mapped_id=%s candidate_guid=%s candidate_zone_id=%s "
+            "candidate_drone_ts=%s candidate_distance_m=%s candidate_mapped_id=%s chosen_owner_guid=%s "
+            "chosen_zone_id=%s lease_seq=%s lease_expire_ts=%s",
+            map_id,
+            remote_id,
+            decision_reason,
+            (existing or {}).get("owner_guid", ""),
+            (existing or {}).get("owner_zone_id", ""),
+            (existing or {}).get("drone_ts", 0),
+            (existing or {}).get("distance_m", 0.0),
+            (existing or {}).get("mapped_id", ""),
+            candidate.get("owner_guid", ""),
+            candidate.get("owner_zone_id", ""),
+            candidate.get("drone_ts", 0),
+            candidate.get("distance_m", 0.0),
+            candidate.get("mapped_id", ""),
+            owner.get("owner_guid", ""),
+            owner.get("owner_zone_id", ""),
+            owner.get("lease_seq", 0),
+            owner.get("lease_expire_ms", 0),
+        )
         await self._upsert_owner_state(map_id, remote_id, owner)
         await self.broadcast(
             map_id,
@@ -543,7 +655,6 @@ class R2CCoordinationHub:
                 "leaseExpireTs": owner["lease_expire_ms"]
             }
         )
-        await manager.broadcast("refresh")
 
     async def _handle_sighting(self, websocket: WebSocket, payload: dict):
         map_id = payload.get("mapId", "")
@@ -560,7 +671,13 @@ class R2CCoordinationHub:
                 return
             zones = self._zones_by_map.get(map_id, {})
             target = zones.get(owner_zone_id)
-        if target is None:
+        if target is None or target.websocket is None:
+            logger.warning(
+                "relay_sighting skipped: owner unavailable map=%s remote_id=%s owner_zone_id=%s",
+                map_id,
+                remote_id,
+                owner_zone_id,
+            )
             return
         relay = dict(payload)
         relay["type"] = "relay_sighting"
@@ -593,6 +710,13 @@ class R2CCoordinationHub:
                 self._owners.pop((map_id, remote_id), None)
                 expired = True
         if expired:
+            logger.info(
+                "r2c owner_expired: map=%s remote_id=%s reason=drone_lost prev_owner_guid=%s prev_zone_id=%s",
+                map_id,
+                remote_id,
+                payload.get("guid", zone_id),
+                zone_id,
+            )
             await self._delete_owner_state(map_id, remote_id)
             await self.broadcast(
                 map_id,
@@ -602,7 +726,6 @@ class R2CCoordinationHub:
                     "prevOwnerGuid": payload.get("guid", zone_id)
                 }
             )
-            await manager.broadcast("refresh")
 
     async def broadcast_zone_update(self, map_id: str):
         async with self._lock:
@@ -644,6 +767,9 @@ class R2CCoordinationHub:
             owner_result = await session.execute(select(R2CDroneOwnerState).where(R2CDroneOwnerState.lease_expire_ms >= now_ms))
             zones = zone_result.scalars().all()
             owners = owner_result.scalars().all()
+            for zone in zones:
+                zone.online = False
+            await session.commit()
         async with self._lock:
             self._zones_by_map.clear()
             for zone in zones:
@@ -678,6 +804,61 @@ class R2CCoordinationHub:
         except Exception as e:
             logger.warning("R2C coordination state load failed: %s", e)
 
+    async def _cleanup_loop(self):
+        try:
+            await self._cleanup_persisted_state_safe()
+            while True:
+                await asyncio.sleep(R2C_DB_CLEANUP_SEC)
+                await self._cleanup_persisted_state_safe()
+        except asyncio.CancelledError:
+            raise
+
+    async def _cleanup_persisted_state_safe(self):
+        try:
+            await asyncio.wait_for(self._cleanup_persisted_state(), timeout=30)
+        except asyncio.TimeoutError:
+            logger.warning("R2C persisted-state cleanup timed out")
+        except Exception as e:
+            logger.warning("R2C persisted-state cleanup failed: %s", e)
+
+    async def _cleanup_persisted_state(self):
+        now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
+        stale_zone_cutoff_ms = now_ms - (R2C_LEASE_SEC * 1000)
+        stale_sighting_cutoff_ms = now_ms - (R2C_LEASE_SEC * 1000 * 4)
+        deleted_zone_count = 0
+        deleted_owner_count = 0
+        deleted_sighting_count = 0
+        async with AsyncSessionLocal() as session:
+            stale_zones = await session.execute(
+                select(R2CZoneState).where(R2CZoneState.last_seen_ms < stale_zone_cutoff_ms)
+            )
+            for state in stale_zones.scalars().all():
+                await session.delete(state)
+                deleted_zone_count += 1
+
+            stale_owners = await session.execute(
+                select(R2CDroneOwnerState).where(R2CDroneOwnerState.lease_expire_ms < now_ms)
+            )
+            for state in stale_owners.scalars().all():
+                await session.delete(state)
+                deleted_owner_count += 1
+
+            stale_sightings = await session.execute(
+                select(R2CRecentSighting).where(R2CRecentSighting.received_ms < stale_sighting_cutoff_ms)
+            )
+            for state in stale_sightings.scalars().all():
+                await session.delete(state)
+                deleted_sighting_count += 1
+
+            await session.commit()
+        if deleted_zone_count or deleted_owner_count or deleted_sighting_count:
+            logger.info(
+                "R2C persisted-state cleanup removed zones=%s owners=%s sightings=%s",
+                deleted_zone_count,
+                deleted_owner_count,
+                deleted_sighting_count,
+            )
+
     async def _expiry_loop(self):
         try:
             while True:
@@ -709,6 +890,12 @@ class R2CCoordinationHub:
             await self._delete_stale_zones(map_id, stale_cutoff_ms)
             await self.broadcast_zone_update(map_id)
         for map_id, remote_id, owner_guid in expired_owners:
+            logger.info(
+                "r2c owner_expired: map=%s remote_id=%s reason=lease_timeout prev_owner_guid=%s",
+                map_id,
+                remote_id,
+                owner_guid,
+            )
             await self._delete_owner_state(map_id, remote_id)
             await self.broadcast(
                 map_id,
@@ -718,8 +905,6 @@ class R2CCoordinationHub:
                     "prevOwnerGuid": owner_guid
                 }
             )
-        if expired_maps or expired_owners:
-            await manager.broadcast("refresh")
 
     async def _upsert_zone_state(self, map_id: str, zone_id: str, guid: str, name: str,
                                  lat: float, lng: float, caltopo_rtt_ms: int,
@@ -840,6 +1025,29 @@ class R2CCoordinationHub:
             str(candidate.get("owner_guid", ""))
         )
         return candidate if candidate_key < existing_key else existing
+
+    @staticmethod
+    def _parse_caltopo_rtt_ms(value) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return parsed if parsed > 0 else 0
+
+    async def get_connection_debug_info(self, websocket: WebSocket) -> dict:
+        now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
+        async with self._lock:
+            conn = self._connections.get(websocket)
+            if conn is None:
+                return {}
+            return {
+                "map_id": conn.map_id or "",
+                "zone_id": conn.zone_id or "",
+                "guid": conn.guid or "",
+                "conn_age_ms": max(now_ms - int(conn.connected_at_ms or now_ms), 0),
+                "hello_age_ms": max(now_ms - int(conn.hello_received_at_ms or conn.connected_at_ms or now_ms), 0),
+                "last_seen_age_ms": max(now_ms - int(conn.last_seen_ms or 0), 0),
+            }
 
 
 r2c_hub = R2CCoordinationHub()
@@ -1198,13 +1406,21 @@ async def create_flight_and_archive(db: AsyncSession, data: dict, flight_inputs:
     title = flight_inputs["title"]
     start_time = flight_inputs["start_time"]
     end_time = flight_inputs["end_time"]
+    remote_id = normalize_remote_id(spec.get('rid'))
 
-    result = await find_overlap(db, spec['sar_id'], start_time, end_time)
+    result = await find_overlap(
+        db,
+        start_time,
+        end_time,
+        remote_id=remote_id,
+        sar_id=spec['sar_id'],
+    )
     existing = result.scalars().first()
     if existing:
+        overlap_identity = remote_id if remote_id else spec['sar_id']
         raise HTTPException(
             status_code=409,
-            detail=f"Conflict: This log overlaps with existing entry {existing.id} for {spec['sar_id']}"
+            detail=f"Conflict: This log overlaps with existing entry {existing.id} for {overlap_identity}"
         )
 
     timeofday_str = get_time_of_day(flight_inputs["start_ts_sec"], flight_inputs["start_lat"], flight_inputs["start_lng"])
@@ -1213,6 +1429,7 @@ async def create_flight_and_archive(db: AsyncSession, data: dict, flight_inputs:
     data['r2c-tracker'] = flight_inputs["processing_comments"]
     new_flight = Flight(
         sar_id=spec['sar_id'].upper(),
+        remote_id=remote_id,
         start_time=start_time,
         end_time=end_time,
         hours=flight_inputs["duration_hrs"],
@@ -1247,6 +1464,7 @@ async def create_flight_and_archive(db: AsyncSession, data: dict, flight_inputs:
 
 async def create_imported_flight_and_archive(db: AsyncSession, data: dict, flight_inputs: dict):
     spec = flight_inputs["spec"]
+    remote_id = normalize_remote_id(spec.get('rid'))
     timeofday_str = get_time_of_day(
         flight_inputs["start_ts_sec"],
         flight_inputs["start_lat"],
@@ -1256,6 +1474,7 @@ async def create_imported_flight_and_archive(db: AsyncSession, data: dict, fligh
     data['r2c-tracker'] = flight_inputs["processing_comments"]
     new_flight = Flight(
         sar_id=spec['sar_id'].upper(),
+        remote_id=remote_id,
         start_time=flight_inputs["start_time"],
         end_time=flight_inputs["end_time"],
         hours=flight_inputs["duration_hrs"],
@@ -1363,7 +1582,13 @@ def build_r2c_snapshot(zones, owners, now_ms: int):
     maps = {}
     for zone in zones:
         elapsed_ms = max(now_ms - int(zone.last_seen_ms or 0), 0)
-        zone_status = "online" if elapsed_ms <= (R2C_HEARTBEAT_SEC * 1000 * 2) else "quiet"
+        is_online = bool(getattr(zone, "online", True))
+        if not is_online:
+            zone_status = "disconnected"
+        elif elapsed_ms <= (R2C_HEARTBEAT_SEC * 1000 * 2):
+            zone_status = "online"
+        else:
+            zone_status = "quiet"
         owned_drones = sorted(
             owner_rows_by_zone.get((zone.map_id, zone.zone_id), []),
             key=lambda row: (
@@ -1380,6 +1605,7 @@ def build_r2c_snapshot(zones, owners, now_ms: int):
             "lat": zone.lat,
             "lng": zone.lng,
             "caltopo_rtt_ms": zone.caltopo_rtt_ms,
+            "online": is_online,
             "last_seen_ms": zone.last_seen_ms,
             "last_seen_age_ms": elapsed_ms,
             "last_seen_age_label": format_elapsed_ms(elapsed_ms),
@@ -1476,6 +1702,17 @@ def normalize_csv_value(value, default=""):
     return value if value else default
 
 
+def normalize_remote_id(value, default=""):
+    return normalize_csv_value(value, default).upper()
+
+
+def resolve_overlap_identity(remote_id: Optional[str], sar_id: Optional[str]) -> tuple[str, str, bool]:
+    normalized_remote_id = normalize_remote_id(remote_id)
+    normalized_sar_id = normalize_csv_value(sar_id).upper()
+    fallback_to_sar = bool(normalized_remote_id and normalized_sar_id)
+    return normalized_remote_id, normalized_sar_id, fallback_to_sar
+
+
 def parse_csv_float(value, default=0.0):
     try:
         return float(normalize_csv_value(value, default))
@@ -1536,9 +1773,24 @@ def localize_flight_time(dt, lat, lng):
     return dt_utc
 
 
-async def find_overlap(db, sar_id, start_time, end_time):
-    # Make sure flight doesn't overlap an existing flight (prevent duplicate submissions):
-    stmt = select(Flight).filter(Flight.sar_id == sar_id).filter(
+async def find_overlap(db, start_time, end_time, remote_id: Optional[str] = None, sar_id: Optional[str] = None):
+    # Make sure a flight doesn't overlap an existing flight for the same aircraft identity.
+    remote_id, sar_id, fallback_to_sar = resolve_overlap_identity(remote_id, sar_id)
+
+    identity_filters = []
+    if remote_id:
+        identity_filters.append(Flight.remote_id == remote_id)
+        if fallback_to_sar:
+            identity_filters.append(and_(
+                or_(Flight.remote_id.is_(None), Flight.remote_id == ""),
+                Flight.sar_id == sar_id
+            ))
+    elif sar_id:
+        identity_filters.append(Flight.sar_id == sar_id)
+    else:
+        return await db.execute(select(Flight).where(text("1 = 0")))
+
+    stmt = select(Flight).filter(or_(*identity_filters)).filter(
         or_(
             # New start falls inside an existing flight
             and_(Flight.start_time <= start_time, Flight.end_time > start_time),
@@ -1576,8 +1828,12 @@ async def upload(
         logger.error(f"Exception in /upload:\n{error_details}")
         raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
     flight_inputs = await extract_flight_inputs_from_geojson(data)
-    new_flight, archive_path = await create_flight_and_archive(db, data, flight_inputs)
-    await db.commit()
+    async with serialized_flight_submission(
+            flight_inputs["spec"].get("rid"),
+            flight_inputs["spec"].get("sar_id"),
+    ):
+        new_flight, archive_path = await create_flight_and_archive(db, data, flight_inputs)
+        await db.commit()
 
     await manager.broadcast("refresh") # Tell everyone to reload
     return {"status": "Logged",
@@ -1752,7 +2008,13 @@ async def edit_flight(
 
     new_sar_id = new_sar_id.upper().strip()
     new_uas = new_uas.lower().strip()
-    result = await find_overlap(db, new_sar_id, flight.start_time, flight.end_time)
+    result = await find_overlap(
+        db,
+        flight.start_time,
+        flight.end_time,
+        remote_id=flight.remote_id,
+        sar_id=new_sar_id,
+    )
     overlap = result.scalars().first()
 
     if overlap and {flight_id} != {overlap.id}:
@@ -1848,7 +2110,13 @@ async def batch_update_flights(
         if flight.sar_id == new_sar_id and flight.uas == new_uas:
             continue
 
-        result = await find_overlap(db, new_sar_id, flight.start_time, flight.end_time)
+        result = await find_overlap(
+            db,
+            flight.start_time,
+            flight.end_time,
+            remote_id=flight.remote_id,
+            sar_id=new_sar_id,
+        )
         overlap = result.scalars().first()
 
         if overlap and overlap.id != flight.id:
@@ -1915,27 +2183,27 @@ async def export(
     # N.B. keys need to match those used in import:
     if admin_user:
         filename = "r2c_audit_full"
-        writer.writerow(["Flight", "Sar Id", "UAS", "Incident", "Op Period", "Map Id", "Start Time", "End Time",
+        writer.writerow(["Flight", "Sar Id", "Remote Id", "UAS", "Incident", "Op Period", "Map Id", "Start Time", "End Time",
                          "Start Lattitude", "Start Longitude", "Hours", "Distance (mi)",
                          "Temp (F)", "Rel Humidity (%)", "Dew Pt (F)", "Precip (in)", "Wind (mph)", "Gusts (mph)",
                          "Cloud Cover (%)", "Time Of Day", "Archive Path"])
     else:
         filename = "r2c_audit_part"
-        writer.writerow(["Flight", "Sar Id", "UAS", "Start Time", "End Time", "Hours", "Distance (mi)",
+        writer.writerow(["Flight", "Sar Id", "Remote Id", "UAS", "Start Time", "End Time", "Hours", "Distance (mi)",
                          "Temp (F)", "Rel Humidity (%)", "Dew Pt (F)", "Precip (in)", "Wind (mph)", "Gusts (mph)",
                          "Cloud Cover (%)", "Time Of Day"])
         
     
     for f in flights:
         if admin_user:
-            writer.writerow([f.id, f.sar_id.upper(), f.uas.lower(), f.incident, f.op_period, f.map_id.upper(),
+            writer.writerow([f.id, f.sar_id.upper(), (f.remote_id or "").upper(), f.uas.lower(), f.incident, f.op_period, f.map_id.upper(),
                              format_datetime(f.start_time.replace(tzinfo=UTC)),
                              format_datetime(f.end_time.replace(tzinfo=UTC)),
                              f.start_lat, f.start_lng, f.hours, f.distance_mi, f.temp_f,
                              f.rhum_pct, f.dewpt_f, f.precip_in, f.wind_mph, f.gusts_mph,
                              f.cloudcvr_pct, f.timeofday, f.archive_relpath or ""])
         else:
-            writer.writerow([f.id, f.sar_id.upper(), f.uas.lower(), 
+            writer.writerow([f.id, f.sar_id.upper(), (f.remote_id or "").upper(), f.uas.lower(), 
                              format_datetime(f.start_time.replace(tzinfo=UTC)),
                              format_datetime(f.end_time.replace(tzinfo=UTC)),
                              f.hours, f.distance_mi, f.temp_f,
@@ -1980,6 +2248,7 @@ async def import_csv(
             # Create a new Flight object for each row
             new_flight = Flight(
                 sar_id=row.get('Sar Id', '').upper(),
+                remote_id=normalize_remote_id(row.get('Remote Id', '')),
                 uas=row.get('UAS', '').lower(),
                 incident=row.get('Incident', ''),
                 op_period=row.get('Op Period', ''),
@@ -2042,6 +2311,7 @@ async def backfill_csv(
     for flight in flights:
         key = (
             normalize_csv_value(flight.sar_id).upper(),
+            normalize_remote_id(flight.remote_id),
             normalize_csv_value(flight.uas).lower(),
             normalize_match_datetime(flight.start_time),
             normalize_match_datetime(flight.end_time),
@@ -2057,6 +2327,7 @@ async def backfill_csv(
         end_time = datetime_from_format(row.get('End Time', None))
         key = (
             normalize_csv_value(row.get('Sar Id', '')).upper(),
+            normalize_remote_id(row.get('Remote Id', '')),
             normalize_csv_value(row.get('UAS', '')).lower(),
             normalize_match_datetime(start_time),
             normalize_match_datetime(end_time),
@@ -2087,6 +2358,9 @@ async def backfill_csv(
 
         flight.incident = normalize_csv_value(row.get('Incident', ''))
         flight.op_period = normalize_csv_value(row.get('Op Period', ''))
+        remote_id = normalize_remote_id(row.get('Remote Id', ''))
+        if remote_id:
+            flight.remote_id = remote_id
         flight.map_id = normalize_csv_value(row.get('Map Id', '')).upper()
         flight.start_lat = parse_csv_float(row.get('Start Lattitude', 0.0))
         flight.start_lng = parse_csv_float(row.get('Start Longitude', 0.0))
@@ -2411,11 +2685,44 @@ async def r2c_websocket_endpoint(websocket: WebSocket):
         )
         await websocket.close(code=1008, reason="Invalid tracker token")
         return
+    client_host = websocket.client.host if websocket.client else "unknown"
     await r2c_hub.connect(websocket)
+    logger.info(
+        "r2c websocket connected: client=%s user_agent=%s",
+        client_host,
+        websocket.headers.get("user-agent", ""),
+    )
     try:
         while True:
             payload = json.loads(await websocket.receive_text())
             if isinstance(payload, dict):
                 await r2c_hub.handle_message(websocket, payload)
-    except WebSocketDisconnect:
+    except WebSocketDisconnect as e:
+        conn_info = await r2c_hub.get_connection_debug_info(websocket)
+        logger.info(
+            "r2c websocket closed: client=%s code=%s reason=%s map=%s zone=%s guid=%s conn_age_ms=%s hello_age_ms=%s last_seen_age_ms=%s",
+            client_host,
+            getattr(e, "code", ""),
+            getattr(e, "reason", ""),
+            conn_info.get("map_id", ""),
+            conn_info.get("zone_id", ""),
+            conn_info.get("guid", ""),
+            conn_info.get("conn_age_ms", ""),
+            conn_info.get("hello_age_ms", ""),
+            conn_info.get("last_seen_age_ms", ""),
+        )
+        await r2c_hub.disconnect(websocket)
+    except Exception as e:
+        conn_info = await r2c_hub.get_connection_debug_info(websocket)
+        logger.warning(
+            "r2c websocket error: client=%s error=%s map=%s zone=%s guid=%s conn_age_ms=%s hello_age_ms=%s last_seen_age_ms=%s",
+            client_host,
+            e,
+            conn_info.get("map_id", ""),
+            conn_info.get("zone_id", ""),
+            conn_info.get("guid", ""),
+            conn_info.get("conn_age_ms", ""),
+            conn_info.get("hello_age_ms", ""),
+            conn_info.get("last_seen_age_ms", ""),
+        )
         await r2c_hub.disconnect(websocket)

@@ -14,6 +14,8 @@
     --accent-soft: #e4f5f3;
     --warn: #9a6700;
     --warn-soft: #fff2cc;
+    --danger: #a53b2a;
+    --danger-soft: #fde7e3;
   }
 
   body {
@@ -188,6 +190,11 @@
     color: var(--warn);
   }
 
+  .badge.disconnected {
+    background: var(--danger-soft);
+    color: var(--danger);
+  }
+
   .detail-list {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -252,8 +259,10 @@
   document.addEventListener("DOMContentLoaded", function() {
     const generatedAtMs = Number(document.body.dataset.generatedAtMs || 0);
     const quietAfterMs = Number(document.body.dataset.quietAfterMs || 0);
+    const autoReloadMs = Number(document.body.dataset.autoReloadMs || 0);
     const ageElements = document.querySelectorAll('[data-last-seen-ms]');
     const statusElements = document.querySelectorAll('[data-status-badge]');
+    const leaseElements = document.querySelectorAll('[data-lease-expire-ms]');
 
     function refreshAges() {
       const browserNowMs = Date.now();
@@ -264,18 +273,30 @@
         el.textContent = `${formatElapsedMs(elapsedMs)} ago`;
       });
       statusElements.forEach((el) => {
+        const isConnected = el.dataset.online === 'true';
         const lastSeenMs = Number(el.dataset.lastSeenMs || 0);
         const elapsedMs = Math.max(snapshotNowMs - lastSeenMs, 0);
-        const isOnline = elapsedMs <= quietAfterMs;
-        el.textContent = isOnline ? 'ONLINE' : 'QUIET';
-        el.classList.toggle('online', isOnline);
-        el.classList.toggle('quiet', !isOnline);
+        const status = !isConnected ? 'DISCONNECTED' : (elapsedMs <= quietAfterMs ? 'ONLINE' : 'QUIET');
+        el.textContent = status;
+        el.classList.toggle('online', status === 'ONLINE');
+        el.classList.toggle('quiet', status === 'QUIET');
+        el.classList.toggle('disconnected', status === 'DISCONNECTED');
+      });
+      leaseElements.forEach((el) => {
+        const leaseExpireMs = Number(el.dataset.leaseExpireMs || 0);
+        const remainingMs = Math.max(leaseExpireMs - snapshotNowMs, 0);
+        el.textContent = formatElapsedMs(remainingMs);
       });
     }
 
     const browserNowMsAtLoad = Date.now();
     refreshAges();
     window.setInterval(refreshAges, 1000);
+    if (autoReloadMs > 0) {
+      window.setInterval(function() {
+        window.location.reload();
+      }, autoReloadMs);
+    }
   });
 </script>
 {% endblock %}
@@ -284,10 +305,11 @@
 <script>
   document.body.dataset.generatedAtMs = "{{ generated_at_ms }}";
   document.body.dataset.quietAfterMs = "{{ heartbeat_sec * 2000 }}";
+  document.body.dataset.autoReloadMs = "30000";
 </script>
 <section class="hero">
   <h1>R2C Instance Status</h1>
-  <p>This page shows a live snapshot of currently registered R2C instances and the drones they currently own. It will refresh when the tracker publishes an update, and you can still reload manually whenever you want a fresh read.</p>
+  <p>This page shows a live snapshot of currently registered R2C instances and the drones they currently own. Relative ages update live in the browser, the page automatically reconnects if the browser websocket drops, and it falls back to a full reload about every 30 seconds.</p>
 </section>
 
 <section class="toolbar">
@@ -329,12 +351,12 @@
           <div>
             <h3 class="instance-name">{{ zone.name }}</h3>
           </div>
-          <span class="badge {{ zone.status }}" data-status-badge data-last-seen-ms="{{ zone.last_seen_ms }}">{{ zone.status|upper }}</span>
+          <span class="badge {{ zone.status }}" data-status-badge data-last-seen-ms="{{ zone.last_seen_ms }}" data-online="{{ 'true' if zone.online else 'false' }}">{{ zone.status|upper }}</span>
         </div>
 
         <div class="detail-list">
           <div>Last communication: <strong data-last-seen-ms="{{ zone.last_seen_ms }}">{{ zone.last_seen_age_label }} ago</strong></div>
-          <div>Caltopo RTT: <strong>{{ zone.caltopo_rtt_ms }} ms</strong></div>
+          <div>Caltopo RTT: <strong>{{ zone.caltopo_rtt_ms ~ ' ms' if zone.caltopo_rtt_ms > 0 else 'unknown' }}</strong></div>
           <div>Location: <strong>{{ '%.5f'|format(zone.lat) }}, {{ '%.5f'|format(zone.lng) }}</strong></div>
         </div>
 
@@ -344,7 +366,7 @@
           <li class="drone-item">
             <div class="drone-id">{{ drone.mapped_id or drone.remote_id }}</div>
             <div class="drone-meta">Remote ID: {{ drone.remote_id }}</div>
-            <div class="drone-meta">Lease remaining: {{ drone.lease_remaining_label }}</div>
+            <div class="drone-meta">Lease remaining: <span data-lease-expire-ms="{{ drone.lease_expire_ms }}">{{ drone.lease_remaining_label }}</span></div>
             <div class="drone-meta">First distance from zone: {{ '%.1f'|format(drone.first_distance_m) }} m</div>
           </li>
           {% endfor %}

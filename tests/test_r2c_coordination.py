@@ -13,9 +13,17 @@ def load_coordination_classes():
     start = source.index("class R2CZoneConnection:")
     end = source.index("\nr2c_hub = R2CCoordinationHub()")
     snippet = source[start:end]
+    manager_broadcasts = []
 
-    logger = types.SimpleNamespace(warning=lambda *args, **kwargs: None)
-    manager = types.SimpleNamespace(broadcast=lambda *args, **kwargs: asyncio.sleep(0))
+    logger = types.SimpleNamespace(
+        info=lambda *args, **kwargs: None,
+        warning=lambda *args, **kwargs: None,
+    )
+
+    async def _broadcast(*args, **kwargs):
+        manager_broadcasts.append((args, kwargs))
+
+    manager = types.SimpleNamespace(broadcast=_broadcast)
     namespace = {
         "asyncio": asyncio,
         "json": json,
@@ -30,10 +38,10 @@ def load_coordination_classes():
         "R2C_SWEEP_SEC": 15,
     }
     exec(snippet, namespace)
-    return namespace["R2CZoneConnection"], namespace["R2CCoordinationHub"]
+    return namespace["R2CZoneConnection"], namespace["R2CCoordinationHub"], manager_broadcasts
 
 
-_, BaseHub = load_coordination_classes()
+_, BaseHub, MANAGER_BROADCASTS = load_coordination_classes()
 
 
 def load_token_helpers():
@@ -65,10 +73,15 @@ class FakeWebSocket:
 
 
 class TestHub(BaseHub):
+    def __init__(self):
+        super().__init__()
+        self.zone_state_updates = []
+
     async def _load_state(self):
         return
 
     async def _upsert_zone_state(self, *args, **kwargs):
+        self.zone_state_updates.append((args, kwargs))
         return
 
     async def _delete_zone_state(self, *args, **kwargs):
@@ -89,6 +102,7 @@ class TestHub(BaseHub):
 
 class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        MANAGER_BROADCASTS.clear()
         self.hub = TestHub()
         self.ws_alpha = FakeWebSocket()
         self.ws_bravo = FakeWebSocket()
@@ -213,6 +227,120 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
         await self.hub.expire_stale_entries()
 
         self.assertNotIn(("MAP1", "DRONE3"), self.hub._owners)
+
+    async def test_disconnect_marks_zone_offline_without_immediate_owner_expiry(self):
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "first_sighting",
+            "mapId": "MAP1",
+            "remoteId": "DRONE4",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "droneTs": 1000,
+            "distanceFromZoneM": 10.0,
+            "mappedId": "1sar7Dj"
+        })
+
+        await self.hub.disconnect(self.ws_alpha)
+
+        self.assertIn("zone-alpha", self.hub._zones_by_map["MAP1"])
+        self.assertIsNone(self.hub._zones_by_map["MAP1"]["zone-alpha"].websocket)
+        self.assertIn(("MAP1", "DRONE4"), self.hub._owners)
+        self.assertTrue(any(call[0][7] is False for call in self.hub.zone_state_updates if len(call[0]) >= 8))
+
+    async def test_sighting_to_disconnected_owner_is_not_relayed(self):
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "first_sighting",
+            "mapId": "MAP1",
+            "remoteId": "DRONE5",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "droneTs": 1000,
+            "distanceFromZoneM": 10.0,
+            "mappedId": "1sar7Dj"
+        })
+        await self.hub.disconnect(self.ws_alpha)
+
+        before = len(self.ws_alpha.sent_texts)
+        await self.hub.handle_message(self.ws_bravo, {
+            "type": "sighting",
+            "mapId": "MAP1",
+            "remoteId": "DRONE5",
+            "zoneId": "zone-bravo",
+            "guid": "zone-bravo",
+            "droneTs": 1234,
+            "lat": 39.3,
+            "lng": -121.3,
+            "altM": 120.0
+        })
+
+        self.assertEqual(before, len(self.ws_alpha.sent_texts))
+
+    async def test_missing_caltopo_rtt_defaults_to_unknown_value(self):
+        ws_charlie = FakeWebSocket()
+        await self.hub.connect(ws_charlie)
+        await self.hub.handle_message(ws_charlie, {
+            "type": "hello",
+            "mapId": "MAP1",
+            "zoneId": "zone-charlie",
+            "guid": "zone-charlie",
+            "name": "Charlie",
+            "lat": 39.3,
+            "lng": -121.3
+        })
+
+        conn = self.hub._zones_by_map["MAP1"]["zone-charlie"]
+        self.assertEqual(0, conn.caltopo_rtt_ms)
+
+    async def test_hello_sends_ack_with_timing_parameters(self):
+        ack = json.loads(self.ws_alpha.sent_texts[0])
+
+        self.assertEqual("hello_ack", ack["type"])
+        self.assertEqual(15, ack["heartbeatSec"])
+        self.assertEqual(45, ack["leaseSec"])
+
+    async def test_heartbeat_sends_ack_and_echoes_client_seq(self):
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "first_sighting",
+            "mapId": "MAP1",
+            "remoteId": "DRONE6",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "droneTs": 1000,
+            "distanceFromZoneM": 10.0,
+            "mappedId": "1sar7Dj"
+        })
+
+        before = len(self.ws_alpha.sent_texts)
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "heartbeat",
+            "seq": 7,
+            "lat": 39.11,
+            "lng": -121.11,
+            "caltopoRttMs": 55,
+        })
+
+        ack = json.loads(self.ws_alpha.sent_texts[before])
+        self.assertEqual("heartbeat_ack", ack["type"])
+        self.assertEqual("MAP1", ack["mapId"])
+        self.assertEqual("zone-alpha", ack["zoneId"])
+        self.assertEqual("zone-alpha", ack["guid"])
+        self.assertEqual(7, ack["clientSeq"])
+        self.assertGreater(ack["ownerLeaseExpireTs"], ack["serverTime"])
+
+    async def test_coordination_updates_do_not_trigger_generic_page_refresh(self):
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "first_sighting",
+            "mapId": "MAP1",
+            "remoteId": "DRONE7",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "droneTs": 1000,
+            "distanceFromZoneM": 10.0,
+            "mappedId": "1sar7Dj"
+        })
+        await self.hub.disconnect(self.ws_alpha)
+
+        self.assertEqual([], MANAGER_BROADCASTS)
 
 
 class TrackerTokenNormalizationTest(unittest.TestCase):

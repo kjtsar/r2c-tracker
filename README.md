@@ -21,6 +21,10 @@ A FastAPI-based flight log aggregator for SAR operations.
 - Basic Admin and CSV Export
 - Optional RID2Caltopo multi-zone coordination hub on `/ws/r2c`
 
+## Coordination Docs
+- [R2C protocol and robustness guide](/Users/kjt/Projects/r2c-tracker/R2C_PROTOCOL.md)
+- [Google Cloud reproduction/setup guide](/Users/kjt/Projects/r2c-tracker/GCLOUD_SETUP.md)
+
 ## Flight Archive Recovery
 When rebuilding the tracker from archived flight logs:
 
@@ -43,3 +47,10 @@ Run the coordination tests with:
 
 These exercise owner selection, relayed sightings, and heartbeat/lease expiry
 without requiring filesystem persistence.
+
+The suite also covers deterministic tie-breaking, map isolation, lease refresh
+behavior, and owner-release edge cases for the multi-zone coordination path.
+
+For higher-confidence release checks, `tests/test_r2c_scenarios.py` simulates
+multi-zone timelines with overlapping drone sightings, disconnect/expiry
+handoffs, and deterministic ownership assertions.

@@ -6,6 +6,24 @@
     <title>{% block title %}R2C Flight Tracker{% endblock %}</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <style>
+      .site-home {
+          display: inline-flex;
+          align-items: center;
+          gap: 10px;
+          margin-bottom: 18px;
+          color: #183153;
+          text-decoration: none;
+          font-weight: 700;
+          font-size: 1.05rem;
+      }
+      .site-home:hover {
+          color: #0b63c9;
+      }
+      .site-home img {
+          width: 28px;
+          height: 28px;
+          display: block;
+      }
       .dashboard-container {
 	  max-width: 1000px;
 	  margin: 0 auto;
@@ -62,6 +80,10 @@
   </head>
 
   <main>
+    <a class="site-home" href="/">
+      <img src="/static/favicon-96x96.png" alt="R2C Tracker icon">
+      <span>R2C Tracker</span>
+    </a>
     {% for msg in get_flashed_messages(request) %}
     <div class="alert alert-{{ msg.category }}">
       {{ msg.message }}
@@ -74,14 +96,52 @@
   
 {% if enable_live_refresh | default(True) %}
 <script>
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const socket = new WebSocket(`${protocol}//${window.location.host}/ws`);
+  (function() {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const socketUrl = `${protocol}//${window.location.host}/ws`;
+    let reconnectDelayMs = 1000;
+    let reconnectTimer = null;
+    let socket = null;
 
-  socket.onmessage = function(event) {
-      if (event.data === "refresh") {
-          window.location.reload();
+    function scheduleReconnect() {
+      if (reconnectTimer !== null) {
+        return;
       }
-  };
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        connectLiveRefresh();
+      }, reconnectDelayMs);
+      reconnectDelayMs = Math.min(reconnectDelayMs * 2, 15000);
+    }
+
+    function connectLiveRefresh() {
+      socket = new WebSocket(socketUrl);
+
+      socket.onopen = function() {
+        reconnectDelayMs = 1000;
+      };
+
+      socket.onmessage = function(event) {
+        if (event.data === "refresh") {
+          window.location.reload();
+        }
+      };
+
+      socket.onclose = function() {
+        scheduleReconnect();
+      };
+
+      socket.onerror = function() {
+        try {
+          socket.close();
+        } catch (error) {
+          // Ignore browser-specific close races.
+        }
+      };
+    }
+
+    connectLiveRefresh();
+  })();
 </script>
 {% endif %}
 <script>

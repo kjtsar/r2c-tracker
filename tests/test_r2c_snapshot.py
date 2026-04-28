@@ -38,6 +38,7 @@ class SnapshotHelpersTest(unittest.TestCase):
                 lat=39.2,
                 lng=-121.2,
                 caltopo_rtt_ms=2100,
+                online=True,
                 last_seen_ms=999_980,
             ),
             types.SimpleNamespace(
@@ -48,6 +49,7 @@ class SnapshotHelpersTest(unittest.TestCase):
                 lat=39.1,
                 lng=-121.1,
                 caltopo_rtt_ms=1200,
+                online=True,
                 last_seen_ms=969_000,
             ),
         ]
@@ -84,6 +86,26 @@ class SnapshotHelpersTest(unittest.TestCase):
         self.assertEqual("1SAR7DJ", snapshot["maps"][0]["zones"][0]["owned_drones"][0]["mapped_id"])
         self.assertEqual("RID-1", snapshot["maps"][0]["zones"][0]["owned_drones"][1]["remote_id"])
         self.assertEqual("online", snapshot["maps"][1]["zones"][0]["status"])
+
+    def test_build_r2c_snapshot_marks_disconnected_zone_from_persisted_state(self):
+        now_ms = 1_000_000
+        zones = [
+            types.SimpleNamespace(
+                map_id="MAP1",
+                zone_id="zone-a",
+                guid="guid-a",
+                name="Alpha",
+                lat=39.1,
+                lng=-121.1,
+                caltopo_rtt_ms=1200,
+                online=False,
+                last_seen_ms=999_995,
+            ),
+        ]
+
+        snapshot = build_r2c_snapshot(zones, [], now_ms)
+
+        self.assertEqual("disconnected", snapshot["maps"][0]["zones"][0]["status"])
 
 
 if __name__ == "__main__":
