@@ -1926,7 +1926,7 @@ async def public_r2c_snapshot(
     response.headers["X-Robots-Tag"] = "noindex, nofollow"
 
     now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
-    zone_stmt = select(R2CZoneState).order_by(R2CZoneState.map_id, R2CZoneState.name, R2CZoneState.zone_id)
+    zone_stmt = select(R2CZoneState).where(R2CZoneState.online == True).order_by(R2CZoneState.map_id, R2CZoneState.name, R2CZoneState.zone_id)
     owner_stmt = select(R2CDroneOwnerState).where(R2CDroneOwnerState.lease_expire_ms >= now_ms)
 
     zone_result = await db.execute(zone_stmt)

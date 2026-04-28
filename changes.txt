@@ -1,2 +1,2 @@
-v1.4.0:
-* enforce cloud run --max-instances 1
+v1.4.1:
+* Update R2C Instance Status to only display online zones.
