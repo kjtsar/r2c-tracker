@@ -29,11 +29,15 @@ if git -C "$(dirname "$0")" tag | grep -qx "$VERSION"; then
     exit 1
 fi
 
-COMMIT_MSG="$(printf '%s:\n%s' "$VERSION" "$BULLETS")"
+COMMIT_MSG="$BULLETS"
 
 echo "Version : $VERSION"
 echo "Message :"
 echo "$COMMIT_MSG"
+echo ""
+echo "Changes :"
+git -C "$(dirname "$0")" diff --stat HEAD
+git -C "$(dirname "$0")" ls-files --others --exclude-standard | sed 's/^/  (new) /'
 echo ""
 
 printf 'Proceed? [y/N] '

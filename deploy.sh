@@ -137,5 +137,6 @@ run_gcloud run deploy "${SERVICE_NAME}" \
   --project "${GCLOUD_PROJECT}" \
   --service-account "${RUNTIME_SERVICE_ACCOUNT}" \
   --timeout "${WEB_REQUEST_TIMEOUT}" \
+  --max-instances 1 \
   --env-vars-file "${ENV_VARS_FILE}" \
   --set-secrets "SECRET_KEY=${SECRET_KEY_SECRET_NAME}:latest"

@@ -1,6 +1,2 @@
-v1.3.0:
-* Server-side robustness changes to prevent concurrent submits and reconnect storm and add regression tests.
-* Add sticky ownership rule and implement better logging for ownership transitions.
-* Prune drone/zone arbitration database >= 24hrs.
-* Add documentation for arbitration protocol and GCI replicate.
-* Add test cases for multi-zone coordination.
+v1.4.0:
+* enforce cloud run --max-instances 1
