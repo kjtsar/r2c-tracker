@@ -1,2 +1,2 @@
-v1.4.1:
-* Update R2C Instance Status to only display online zones.
+v1.4.2:
+* Prevent R2C Tracker Status from reloading continuously - now pauses after 5 minutes idle.

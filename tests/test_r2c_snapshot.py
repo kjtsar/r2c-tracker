@@ -108,5 +108,16 @@ class SnapshotHelpersTest(unittest.TestCase):
         self.assertEqual("disconnected", snapshot["maps"][0]["zones"][0]["status"])
 
 
+class SnapshotTemplateTest(unittest.TestCase):
+    def test_snapshot_template_stops_auto_reload_after_idle_timeout(self):
+        template_path = pathlib.Path(__file__).resolve().parents[1] / "templates" / "r2c_snapshot.html"
+        template = template_path.read_text()
+
+        self.assertIn('document.body.dataset.autoReloadMs = "30000";', template)
+        self.assertIn('document.body.dataset.autoReloadIdleTimeoutMs = "300000";', template)
+        self.assertIn("scheduleIdleAutoReloadStop", template)
+        self.assertIn("stopAutoReload();", template)
+
+
 if __name__ == "__main__":
     unittest.main()

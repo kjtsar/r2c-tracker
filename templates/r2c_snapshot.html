@@ -260,9 +260,12 @@
     const generatedAtMs = Number(document.body.dataset.generatedAtMs || 0);
     const quietAfterMs = Number(document.body.dataset.quietAfterMs || 0);
     const autoReloadMs = Number(document.body.dataset.autoReloadMs || 0);
+    const autoReloadIdleTimeoutMs = Number(document.body.dataset.autoReloadIdleTimeoutMs || 0);
     const ageElements = document.querySelectorAll('[data-last-seen-ms]');
     const statusElements = document.querySelectorAll('[data-status-badge]');
     const leaseElements = document.querySelectorAll('[data-lease-expire-ms]');
+    let reloadIntervalId = null;
+    let idleTimeoutId = null;
 
     function refreshAges() {
       const browserNowMs = Date.now();
@@ -289,14 +292,46 @@
       });
     }
 
-    const browserNowMsAtLoad = Date.now();
-    refreshAges();
-    window.setInterval(refreshAges, 1000);
-    if (autoReloadMs > 0) {
-      window.setInterval(function() {
+    function stopAutoReload() {
+      if (reloadIntervalId !== null) {
+        window.clearInterval(reloadIntervalId);
+        reloadIntervalId = null;
+      }
+    }
+
+    function startAutoReload() {
+      if (autoReloadMs <= 0 || reloadIntervalId !== null) {
+        return;
+      }
+      reloadIntervalId = window.setInterval(function() {
         window.location.reload();
       }, autoReloadMs);
     }
+
+    function scheduleIdleAutoReloadStop() {
+      if (autoReloadIdleTimeoutMs <= 0) {
+        return;
+      }
+      if (idleTimeoutId !== null) {
+        window.clearTimeout(idleTimeoutId);
+      }
+      idleTimeoutId = window.setTimeout(function() {
+        stopAutoReload();
+      }, autoReloadIdleTimeoutMs);
+    }
+
+    function noteUserActivity() {
+      startAutoReload();
+      scheduleIdleAutoReloadStop();
+    }
+
+    const browserNowMsAtLoad = Date.now();
+    refreshAges();
+    window.setInterval(refreshAges, 1000);
+    noteUserActivity();
+    ['pointerdown', 'keydown', 'scroll', 'touchstart', 'mousemove', 'focus'].forEach((eventName) => {
+      window.addEventListener(eventName, noteUserActivity, { passive: true });
+    });
   });
 </script>
 {% endblock %}
@@ -306,10 +341,11 @@
   document.body.dataset.generatedAtMs = "{{ generated_at_ms }}";
   document.body.dataset.quietAfterMs = "{{ heartbeat_sec * 2000 }}";
   document.body.dataset.autoReloadMs = "30000";
+  document.body.dataset.autoReloadIdleTimeoutMs = "300000";
 </script>
 <section class="hero">
   <h1>R2C Instance Status</h1>
-  <p>This page shows a live snapshot of currently registered R2C instances and the drones they currently own. Relative ages update live in the browser, the page automatically reconnects if the browser websocket drops, and it falls back to a full reload about every 30 seconds.</p>
+  <p>This page shows a live snapshot of currently registered R2C instances and the drones they currently own. Relative ages update live in the browser, the page automatically reconnects if the browser websocket drops, and it falls back to a full reload about every 30 seconds while the page remains active. Automatic reloads pause after five minutes without interaction.</p>
 </section>
 
 <section class="toolbar">
