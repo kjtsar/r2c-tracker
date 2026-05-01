@@ -376,9 +376,12 @@ class ConnectionManager:
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.append(websocket)
+        logger.info("live refresh websocket connected: active_connections=%s", len(self.active_connections))
 
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+        logger.info("live refresh websocket disconnected: active_connections=%s", len(self.active_connections))
 
     async def broadcast(self, message: str):
         for connection in self.active_connections:
@@ -1941,6 +1944,7 @@ async def public_r2c_snapshot(
         name="r2c_snapshot.html",
         context={
             "request": request,
+            "enable_live_refresh": False,
             "snapshot": snapshot,
             "generated_at": datetime.now(tz=UTC),
             "generated_at_ms": now_ms,
@@ -2664,11 +2668,22 @@ async def download_current_year_flight_logs_archive(
         
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    client_host = websocket.client.host if websocket.client else "unknown"
     await manager.connect(websocket)
+    logger.info(
+        "live refresh websocket open: client=%s user_agent=%s",
+        client_host,
+        websocket.headers.get("user-agent", ""),
+    )
     try:
         while True:
             await websocket.receive_text() # Keep connection alive
     except WebSocketDisconnect:
+        logger.info(
+            "live refresh websocket closed: client=%s user_agent=%s",
+            client_host,
+            websocket.headers.get("user-agent", ""),
+        )
         manager.disconnect(websocket)
 
 

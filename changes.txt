@@ -1,2 +1,3 @@
-v1.4.2:
-* Prevent R2C Tracker Status from reloading continuously - now pauses after 5 minutes idle.
+v1.4.3:
+* Additional attempts to keep /r2c from continuously reloading after idle.
+

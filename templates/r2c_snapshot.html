@@ -300,7 +300,7 @@
     }
 
     function startAutoReload() {
-      if (autoReloadMs <= 0 || reloadIntervalId !== null) {
+      if (autoReloadMs <= 0 || reloadIntervalId !== null || document.visibilityState === 'hidden') {
         return;
       }
       reloadIntervalId = window.setInterval(function() {
@@ -325,13 +325,22 @@
       scheduleIdleAutoReloadStop();
     }
 
+    function syncAutoReloadWithVisibility() {
+      if (document.visibilityState === 'hidden') {
+        stopAutoReload();
+        return;
+      }
+      noteUserActivity();
+    }
+
     const browserNowMsAtLoad = Date.now();
     refreshAges();
     window.setInterval(refreshAges, 1000);
-    noteUserActivity();
-    ['pointerdown', 'keydown', 'scroll', 'touchstart', 'mousemove', 'focus'].forEach((eventName) => {
+    syncAutoReloadWithVisibility();
+    ['pointerdown', 'keydown', 'scroll', 'touchstart', 'focus'].forEach((eventName) => {
       window.addEventListener(eventName, noteUserActivity, { passive: true });
     });
+    document.addEventListener('visibilitychange', syncAutoReloadWithVisibility);
   });
 </script>
 {% endblock %}
@@ -345,7 +354,7 @@
 </script>
 <section class="hero">
   <h1>R2C Instance Status</h1>
-  <p>This page shows a live snapshot of currently registered R2C instances and the drones they currently own. Relative ages update live in the browser, the page automatically reconnects if the browser websocket drops, and it falls back to a full reload about every 30 seconds while the page remains active. Automatic reloads pause after five minutes without interaction.</p>
+  <p>This page shows a live snapshot of currently registered R2C instances and the drones they currently own. Relative ages update live in the browser, and the page falls back to a full reload about every 30 seconds while it remains active and visible. Automatic reloads pause after five minutes without interaction.</p>
 </section>
 
 <section class="toolbar">

@@ -117,6 +117,14 @@ class SnapshotTemplateTest(unittest.TestCase):
         self.assertIn('document.body.dataset.autoReloadIdleTimeoutMs = "300000";', template)
         self.assertIn("scheduleIdleAutoReloadStop", template)
         self.assertIn("stopAutoReload();", template)
+        self.assertIn("document.visibilityState === 'hidden'", template)
+        self.assertIn("document.addEventListener('visibilitychange', syncAutoReloadWithVisibility);", template)
+
+    def test_r2c_route_disables_shared_live_refresh_websocket(self):
+        main_path = pathlib.Path(__file__).resolve().parents[1] / "main.py"
+        source = main_path.read_text()
+
+        self.assertIn('"enable_live_refresh": False,', source)
 
 
 if __name__ == "__main__":
