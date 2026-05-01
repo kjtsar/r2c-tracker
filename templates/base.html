@@ -99,12 +99,59 @@
   (function() {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const socketUrl = `${protocol}//${window.location.host}/ws`;
+    const liveRefreshIdleTimeoutMs = 300000;
     let reconnectDelayMs = 1000;
     let reconnectTimer = null;
     let socket = null;
+    let idleTimeoutId = null;
+
+    function clearReconnectTimer() {
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+    }
+
+    function clearIdleTimeout() {
+      if (idleTimeoutId !== null) {
+        window.clearTimeout(idleTimeoutId);
+        idleTimeoutId = null;
+      }
+    }
+
+    function closeLiveRefreshSocket() {
+      clearReconnectTimer();
+      clearIdleTimeout();
+      if (socket === null) {
+        return;
+      }
+      const activeSocket = socket;
+      socket = null;
+      try {
+        activeSocket.close();
+      } catch (error) {
+        // Ignore browser-specific close races.
+      }
+    }
+
+    function scheduleIdleDisconnect() {
+      clearIdleTimeout();
+      idleTimeoutId = window.setTimeout(() => {
+        closeLiveRefreshSocket();
+      }, liveRefreshIdleTimeoutMs);
+    }
+
+    function noteLiveRefreshActivity() {
+      if (document.visibilityState === 'hidden') {
+        closeLiveRefreshSocket();
+        return;
+      }
+      scheduleIdleDisconnect();
+      connectLiveRefresh();
+    }
 
     function scheduleReconnect() {
-      if (reconnectTimer !== null) {
+      if (reconnectTimer !== null || document.visibilityState === 'hidden') {
         return;
       }
       reconnectTimer = window.setTimeout(() => {
@@ -115,32 +162,38 @@
     }
 
     function connectLiveRefresh() {
+      if (document.visibilityState === 'hidden' || socket !== null) {
+        return;
+      }
       socket = new WebSocket(socketUrl);
 
       socket.onopen = function() {
         reconnectDelayMs = 1000;
+        scheduleIdleDisconnect();
       };
 
       socket.onmessage = function(event) {
+        scheduleIdleDisconnect();
         if (event.data === "refresh") {
           window.location.reload();
         }
       };
 
       socket.onclose = function() {
+        socket = null;
         scheduleReconnect();
       };
 
       socket.onerror = function() {
-        try {
-          socket.close();
-        } catch (error) {
-          // Ignore browser-specific close races.
-        }
+        closeLiveRefreshSocket();
       };
     }
 
-    connectLiveRefresh();
+    ['pointerdown', 'keydown', 'scroll', 'touchstart', 'focus'].forEach((eventName) => {
+      window.addEventListener(eventName, noteLiveRefreshActivity, { passive: true });
+    });
+    document.addEventListener('visibilitychange', noteLiveRefreshActivity);
+    noteLiveRefreshActivity();
   })();
 </script>
 {% endif %}

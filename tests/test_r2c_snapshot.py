@@ -109,6 +109,15 @@ class SnapshotHelpersTest(unittest.TestCase):
 
 
 class SnapshotTemplateTest(unittest.TestCase):
+    def test_base_template_live_refresh_stops_when_hidden_or_idle(self):
+        template_path = pathlib.Path(__file__).resolve().parents[1] / "templates" / "base.html"
+        template = template_path.read_text()
+
+        self.assertIn("const liveRefreshIdleTimeoutMs = 300000;", template)
+        self.assertIn("document.visibilityState === 'hidden'", template)
+        self.assertIn("function closeLiveRefreshSocket()", template)
+        self.assertIn("document.addEventListener('visibilitychange', noteLiveRefreshActivity);", template)
+
     def test_snapshot_template_stops_auto_reload_after_idle_timeout(self):
         template_path = pathlib.Path(__file__).resolve().parents[1] / "templates" / "r2c_snapshot.html"
         template = template_path.read_text()
