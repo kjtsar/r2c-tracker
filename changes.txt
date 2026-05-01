@@ -1,3 +1,3 @@
-v1.4.4:
-* Similar changes for the main dashboard.  Disable live refreshes if the tab looses focus or five minutes without activity.
+v1.4.5:
+* Disable main dashboard auto-reloads on activity to cut down on GCI expense.
 

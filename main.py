@@ -1912,6 +1912,7 @@ async def public_dashboard(
         name="dashboard.html",
         context={
             "request": request,
+            "enable_live_refresh": False,
             "flights": flights,
             "timezone" : ZoneInfo("America/Los_Angeles"),
             "leaderboard": leaderboard,

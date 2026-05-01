@@ -1,0 +1,21 @@
+#!/bin/sh
+
+
+gcloud logging read '
+resource.type="cloud_run_revision"
+resource.labels.service_name="r2c-tracker"
+logName:"run.googleapis.com%2Frequests"
+timestamp>="2026-04-27T00:00:00Z"
+timestamp<"2026-05-01T00:00:00Z"
+' --limit=200 --format=json >allServicies.json
+
+gcloud logging read '
+resource.type="cloud_run_revision"
+resource.labels.service_name="r2c-tracker"
+logName:"run.googleapis.com%2Frequests"
+httpRequest.requestUrl:("/r2c" OR "/ws")
+timestamp>="2026-04-27T00:00:00Z"
+timestamp<"2026-05-01T00:00:00Z"
+' --limit=200 --format=json >r2cOrWsServices.json
+
+

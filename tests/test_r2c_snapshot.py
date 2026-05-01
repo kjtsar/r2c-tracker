@@ -129,11 +129,11 @@ class SnapshotTemplateTest(unittest.TestCase):
         self.assertIn("document.visibilityState === 'hidden'", template)
         self.assertIn("document.addEventListener('visibilitychange', syncAutoReloadWithVisibility);", template)
 
-    def test_r2c_route_disables_shared_live_refresh_websocket(self):
+    def test_dashboard_and_r2c_routes_disable_shared_live_refresh_websocket(self):
         main_path = pathlib.Path(__file__).resolve().parents[1] / "main.py"
         source = main_path.read_text()
 
-        self.assertIn('"enable_live_refresh": False,', source)
+        self.assertGreaterEqual(source.count('"enable_live_refresh": False,'), 2)
 
 
 if __name__ == "__main__":
