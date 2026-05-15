@@ -210,6 +210,47 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
         owner = self.hub._owners[(alpha_map_id, "RID-STANDALONE")]
         self.assertEqual("zone-bravo", owner["owner_guid"])
 
+    async def test_nearby_standalone_instance_joins_real_map_group(self):
+        ws_charlie = FakeWebSocket()
+        await self.hub.connect(ws_charlie)
+
+        await self.hub.handle_message(ws_charlie, {
+            "type": "hello",
+            "mapId": "",
+            "zoneId": "zone-charlie",
+            "guid": "zone-charlie",
+            "name": "Charlie",
+            "lat": 39.1001,
+            "lng": -121.1001,
+        })
+
+        self.assertEqual("MAP1", self.hub._connections[ws_charlie].map_id)
+        self.assertEqual("standalone", self.hub._connections[ws_charlie].coordination_mode)
+        self.assertEqual("map", self.hub._connections[self.ws_alpha].coordination_mode)
+
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "first_sighting",
+            "mapId": "MAP1",
+            "remoteId": "RID-FORGOT-MAP",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "droneTs": 2000,
+            "distanceFromZoneM": 50.0,
+            "mappedId": "",
+        })
+        await self.hub.handle_message(ws_charlie, {
+            "type": "first_sighting",
+            "mapId": "",
+            "remoteId": "RID-FORGOT-MAP",
+            "zoneId": "zone-charlie",
+            "guid": "zone-charlie",
+            "droneTs": 1000,
+            "distanceFromZoneM": 75.0,
+            "mappedId": "",
+        })
+
+        self.assertEqual("zone-charlie", self.hub._owners[("MAP1", "RID-FORGOT-MAP")]["owner_guid"])
+
     async def test_drone_confirmed_broadcasts_to_all_zones_on_map(self):
         self.ws_alpha.sent_texts.clear()
         self.ws_bravo.sent_texts.clear()

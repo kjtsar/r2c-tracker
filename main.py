@@ -530,23 +530,35 @@ class R2CCoordinationHub:
         if not self._has_usable_location(lat, lng):
             return fallback_map_id, self.COORDINATION_MODE_STANDALONE
 
-        nearby: list[tuple[float, str]] = []
+        nearby_mapped: list[tuple[float, str]] = []
+        nearby_standalone: list[tuple[float, str]] = []
         for map_id, zones in self._zones_by_map.items():
-            if not map_id.startswith(self.STANDALONE_PREFIX):
-                continue
             for zone in zones.values():
                 if zone.zone_id == zone_id:
                     continue
-                if zone.coordination_mode != self.COORDINATION_MODE_STANDALONE:
+                if zone.websocket is None:
                     continue
                 if not self._has_usable_location(zone.lat, zone.lng):
                     continue
                 distance_m = self._distance_meters(lat, lng, zone.lat, zone.lng)
-                if distance_m <= self.STANDALONE_GROUP_RADIUS_M:
-                    nearby.append((distance_m, map_id))
-        if nearby:
-            nearby.sort(key=lambda row: (row[0], row[1]))
-            return nearby[0][1], self.COORDINATION_MODE_STANDALONE
+                if distance_m > self.STANDALONE_GROUP_RADIUS_M:
+                    continue
+                if (
+                    not map_id.startswith(self.STANDALONE_PREFIX)
+                    and zone.coordination_mode == self.COORDINATION_MODE_MAP
+                ):
+                    nearby_mapped.append((distance_m, map_id))
+                elif (
+                    map_id.startswith(self.STANDALONE_PREFIX)
+                    and zone.coordination_mode == self.COORDINATION_MODE_STANDALONE
+                ):
+                    nearby_standalone.append((distance_m, map_id))
+        if nearby_mapped:
+            nearby_mapped.sort(key=lambda row: (row[0], row[1]))
+            return nearby_mapped[0][1], self.COORDINATION_MODE_STANDALONE
+        if nearby_standalone:
+            nearby_standalone.sort(key=lambda row: (row[0], row[1]))
+            return nearby_standalone[0][1], self.COORDINATION_MODE_STANDALONE
         return fallback_map_id, self.COORDINATION_MODE_STANDALONE
 
     def _message_context(self, websocket: WebSocket, payload: dict) -> tuple[str, str, str]:

@@ -19,12 +19,17 @@ RID2Caltopo logic that actually writes ordered track state into Caltopo.
 
 - Ownership is isolated by the tracker coordination key. For connected
   RID2Caltopo instances, this is the real CalTopo `mapId`. For standalone
-  instances with no map configured, the tracker assigns a `Standalone_<key>`
-  coordination group by two-mile proximity.
+  instances with no map configured, the tracker first looks for a nearby online
+  map-connected instance within two miles and adopts that real map coordination
+  key. If no nearby mapped instance is available, the tracker assigns a
+  `Standalone_<key>` coordination group by two-mile proximity.
 - Standalone grouping ignores incident, op-period, profile, and other local
   RID2Caltopo configuration metadata. Two nearby standalone instances may share
   drone ownership and waypoint updates even if their local incident/op-period
   settings differ.
+- A mapped instance never changes coordination key because a standalone instance
+  is nearby. The proximity adoption only moves standalone instances into an
+  existing mapped group.
 - Standalone instances without a usable location are isolated into their own
   `Standalone_<zone-or-guid>` coordination group.
 - The same `remoteId` can legitimately have a different owner on another
@@ -82,8 +87,8 @@ Server responds:
 Effects:
 
 - zone presence is registered under the effective coordination key. Connected
-  instances use the reported CalTopo `mapId`; standalone instances use a
-  tracker-assigned `Standalone_<key>` group.
+  instances use the reported CalTopo `mapId`; standalone instances either adopt
+  a nearby mapped group or use a tracker-assigned `Standalone_<key>` group.
 - zone state is mirrored into SQL
 - all connected zones on the map receive a `zone_update`
 

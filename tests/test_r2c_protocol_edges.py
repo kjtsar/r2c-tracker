@@ -306,6 +306,73 @@ class R2CProtocolEdgeCaseTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("Standalone_zone-alpha", self.hub._connections[self.ws_alpha].map_id)
         self.assertEqual("Standalone_zone-bravo", self.hub._connections[self.ws_bravo].map_id)
 
+    async def test_standalone_joins_nearest_real_map_group(self):
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "hello",
+            "mapId": "MAP1",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "name": "Alpha",
+            "lat": 39.1000,
+            "lng": -121.1000,
+        })
+        await self.hub.handle_message(self.ws_delta, {
+            "type": "hello",
+            "mapId": "MAP2",
+            "zoneId": "zone-delta",
+            "guid": "zone-delta",
+            "name": "Delta",
+            "lat": 39.1100,
+            "lng": -121.1000,
+        })
+        await self.hub.handle_message(self.ws_charlie, {
+            "type": "hello",
+            "mapId": "",
+            "zoneId": "zone-charlie",
+            "guid": "zone-charlie",
+            "name": "Charlie",
+            "lat": 39.1099,
+            "lng": -121.1000,
+        })
+
+        self.assertEqual("MAP2", self.hub._connections[self.ws_charlie].map_id)
+        self.assertEqual("standalone", self.hub._connections[self.ws_charlie].coordination_mode)
+        self.assertEqual("MAP1", self.hub._connections[self.ws_alpha].map_id)
+        self.assertEqual("MAP2", self.hub._connections[self.ws_delta].map_id)
+
+    async def test_standalone_does_not_join_map_group_without_online_mapped_anchor(self):
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "hello",
+            "mapId": "MAP1",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "name": "Alpha",
+            "lat": 39.15306,
+            "lng": -121.13296,
+        })
+        await self.hub.handle_message(self.ws_bravo, {
+            "type": "hello",
+            "mapId": "",
+            "zoneId": "zone-bravo",
+            "guid": "zone-bravo",
+            "name": "Bravo",
+            "lat": 39.15307,
+            "lng": -121.13298,
+        })
+        await self.hub.disconnect(self.ws_alpha)
+        await self.hub.handle_message(self.ws_charlie, {
+            "type": "hello",
+            "mapId": "",
+            "zoneId": "zone-charlie",
+            "guid": "zone-charlie",
+            "name": "Charlie",
+            "lat": 39.15308,
+            "lng": -121.13299,
+        })
+
+        self.assertEqual("MAP1", self.hub._connections[self.ws_bravo].map_id)
+        self.assertTrue(self.hub._connections[self.ws_charlie].map_id.startswith("Standalone_"))
+
     async def test_heartbeat_only_extends_leases_for_matching_owner_guid(self):
         await self.hub.handle_message(self.ws_alpha, {
             "type": "first_sighting",

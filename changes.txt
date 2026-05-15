@@ -1,13 +1,3 @@
-v1.4.7:
-* Improved R2C tracker coordination for standalone devices.
-  R2C instances that are not connected to a CalTopo map are now grouped
-  into Standalone_... coordination zones by proximity, so nearby standalone
-  devices can still share drone updates while distant or locationless
-  devices remain isolated. Connected devices continue to coordinate by actual
-  CalTopo map ID.
-
-
-
-
-
-
+v1.4.8:
+* Add Standalone devices to a map if w/in close proximity.
+  This is for cases where user starts r2c, but forgets to connect to map.
