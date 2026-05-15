@@ -1,3 +1,2 @@
-v1.4.8:
-* Add Standalone devices to a map if w/in close proximity.
-  This is for cases where user starts r2c, but forgets to connect to map.
+v1.4.9:
+* Support standalone devices declaring mapid=""

@@ -2149,7 +2149,13 @@ async def public_r2c_snapshot(
     response.headers["X-Robots-Tag"] = "noindex, nofollow"
 
     now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
-    zone_stmt = select(R2CZoneState).where(R2CZoneState.online == True).order_by(R2CZoneState.map_id, R2CZoneState.name, R2CZoneState.zone_id)
+    recent_zone_cutoff_ms = now_ms - (R2C_HEARTBEAT_SEC * 1000 * 2)
+    zone_stmt = select(R2CZoneState).where(
+        or_(
+            R2CZoneState.online == True,
+            R2CZoneState.last_seen_ms >= recent_zone_cutoff_ms,
+        )
+    ).order_by(R2CZoneState.map_id, R2CZoneState.name, R2CZoneState.zone_id)
     owner_stmt = select(R2CDroneOwnerState).where(R2CDroneOwnerState.lease_expire_ms >= now_ms)
 
     zone_result = await db.execute(zone_stmt)
@@ -2157,7 +2163,17 @@ async def public_r2c_snapshot(
 
     zones = zone_result.scalars().all()
     owners = owner_result.scalars().all()
+    for zone in zones:
+        if int(zone.last_seen_ms or 0) >= recent_zone_cutoff_ms:
+            zone.online = True
     snapshot = build_r2c_snapshot(zones, owners, now_ms)
+    logger.info(
+        "r2c snapshot rendered: maps=%s zones=%s owners=%s recent_cutoff_ms=%s",
+        snapshot["map_count"],
+        snapshot["zone_count"],
+        snapshot["owned_drone_count"],
+        recent_zone_cutoff_ms,
+    )
 
     return templates.TemplateResponse(
         request=request,
