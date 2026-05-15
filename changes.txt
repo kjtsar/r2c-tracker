@@ -1,3 +1,4 @@
-v1.4.5:
-* Disable main dashboard auto-reloads on activity to cut down on GCI expense.
+v1.4.6:
+* Add support for syncing Drone Confirmation panels across multiple R2C instances.
+* Updated docs and tests for Drone Confirmation panel syncing.
 

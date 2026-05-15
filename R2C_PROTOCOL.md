@@ -195,6 +195,32 @@ Notes:
 - if the owner zone is currently disconnected, the relay is skipped
 - recent relay breadcrumbs are mirrored into SQL for troubleshooting
 
+## Drone confirmation broadcast
+
+When an operator presses Save in the Drone Confirmation panel, the Android app
+sends:
+
+```json
+{
+  "type": "drone_confirmed",
+  "mapId": "MAP1",
+  "remoteId": "RID-123",
+  "zoneId": "zone-alpha",
+  "guid": "zone-alpha",
+  "flightStartMsec": 1710000001000,
+  "mappedId": "1SAR7DJ",
+  "org": "NCSSAR",
+  "model": "Mavic 3",
+  "ownerName": "Pilot"
+}
+```
+
+The tracker validates the sender is connected to the requested `mapId` and
+broadcasts the event to every online zone on that map, including the sender.
+Clients treat the `remoteId` as already handled for the rest of that app
+lifecycle, so they dismiss any matching active confirmation panel and do not
+queue future panels for that drone until restart.
+
 ## Ownership release and expiry
 
 There are three ways an owner stops owning a drone:

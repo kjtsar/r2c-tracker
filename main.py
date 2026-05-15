@@ -511,6 +511,8 @@ class R2CCoordinationHub:
             await self._handle_sighting(websocket, payload)
         elif mtype == "drone_lost":
             await self._handle_drone_lost(payload)
+        elif mtype == "drone_confirmed":
+            await self._handle_drone_confirmed(websocket, payload)
 
     async def _handle_hello(self, websocket: WebSocket, payload: dict):
         map_id = payload.get("mapId", "")
@@ -699,6 +701,39 @@ class R2CCoordinationHub:
             await target.websocket.send_text(json.dumps(relay))
         except Exception as e:
             logger.warning("relay_sighting failed for %s/%s: %s", map_id, remote_id, e)
+
+    async def _handle_drone_confirmed(self, websocket: WebSocket, payload: dict):
+        map_id = payload.get("mapId", "")
+        remote_id = payload.get("remoteId", "")
+        if not map_id or not remote_id:
+            return
+        zone_id = payload.get("zoneId", "") or payload.get("guid", "")
+        async with self._lock:
+            conn = self._connections.get(websocket)
+            if conn is None or conn.map_id != map_id:
+                return
+            event = {
+                "type": "drone_confirmed",
+                "mapId": map_id,
+                "remoteId": remote_id,
+                "zoneId": zone_id,
+                "guid": payload.get("guid", zone_id),
+                "confirmedByGuid": payload.get("guid", zone_id),
+                "flightStartMsec": int(payload.get("flightStartMsec", 0) or 0),
+                "mappedId": payload.get("mappedId", "") or "",
+                "trackLabel": payload.get("trackLabel", "") or payload.get("mappedId", "") or "",
+                "org": payload.get("org", "") or "",
+                "model": payload.get("model", "") or "",
+                "ownerName": payload.get("ownerName", "") or "",
+            }
+        logger.info(
+            "r2c drone_confirmed: map=%s remote_id=%s confirmed_by=%s mapped_id=%s",
+            map_id,
+            remote_id,
+            event["confirmedByGuid"],
+            event["mappedId"],
+        )
+        await self.broadcast(map_id, event)
 
     async def _handle_drone_lost(self, payload: dict):
         map_id = payload.get("mapId", "")

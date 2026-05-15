@@ -152,6 +152,32 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
         owner = self.hub._owners[("MAP1", "DRONE1")]
         self.assertEqual("zone-alpha", owner["owner_guid"])
 
+    async def test_drone_confirmed_broadcasts_to_all_zones_on_map(self):
+        self.ws_alpha.sent_texts.clear()
+        self.ws_bravo.sent_texts.clear()
+
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "drone_confirmed",
+            "mapId": "MAP1",
+            "remoteId": "RID-CONFIRM",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "flightStartMsec": 1710000001000,
+            "mappedId": "1SAR7DJ",
+            "trackLabel": "1SAR7DJ",
+            "org": "NCSSAR",
+            "model": "Mavic 3",
+            "ownerName": "Pilot"
+        })
+
+        for ws in (self.ws_alpha, self.ws_bravo):
+            messages = [json.loads(text) for text in ws.sent_texts]
+            confirmed = [msg for msg in messages if msg.get("type") == "drone_confirmed"]
+            self.assertEqual(1, len(confirmed))
+            self.assertEqual("RID-CONFIRM", confirmed[0]["remoteId"])
+            self.assertEqual("1SAR7DJ", confirmed[0]["mappedId"])
+            self.assertEqual("zone-alpha", confirmed[0]["confirmedByGuid"])
+
     async def test_sighting_relay_goes_to_current_owner(self):
         await self.hub.handle_message(self.ws_alpha, {
             "type": "first_sighting",
