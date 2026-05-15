@@ -1,6 +1,8 @@
 import asyncio
 import json
+import math
 import pathlib
+import re
 import types
 import unittest
 from datetime import UTC, datetime
@@ -22,6 +24,8 @@ def load_coordination_classes():
     namespace = {
         "asyncio": asyncio,
         "json": json,
+        "math": math,
+        "re": re,
         "Optional": Optional,
         "UTC": UTC,
         "datetime": datetime,

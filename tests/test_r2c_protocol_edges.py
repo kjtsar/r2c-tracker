@@ -1,6 +1,8 @@
 import asyncio
 import json
+import math
 import pathlib
+import re
 import types
 import unittest
 from datetime import UTC, datetime
@@ -29,6 +31,8 @@ def load_coordination_classes():
     namespace = {
         "asyncio": asyncio,
         "json": json,
+        "math": math,
+        "re": re,
         "Optional": Optional,
         "UTC": UTC,
         "datetime": datetime,
@@ -237,6 +241,70 @@ class R2CProtocolEdgeCaseTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("zone-alpha", self.hub._owners[("MAP1", "RID-SHARED")]["owner_guid"])
         self.assertEqual("zone-delta", self.hub._owners[("MAP2", "RID-SHARED")]["owner_guid"])
+
+    async def test_standalone_ownership_is_isolated_beyond_two_miles(self):
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "hello",
+            "mapId": "",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "name": "Alpha",
+            "lat": 39.15306,
+            "lng": -121.13296,
+        })
+        await self.hub.handle_message(self.ws_bravo, {
+            "type": "hello",
+            "mapId": "",
+            "zoneId": "zone-bravo",
+            "guid": "zone-bravo",
+            "name": "Bravo",
+            "lat": 39.25306,
+            "lng": -121.13296,
+        })
+
+        alpha_map_id = self.hub._connections[self.ws_alpha].map_id
+        bravo_map_id = self.hub._connections[self.ws_bravo].map_id
+        self.assertNotEqual(alpha_map_id, bravo_map_id)
+        self.assertTrue(alpha_map_id.startswith("Standalone_"))
+        self.assertTrue(bravo_map_id.startswith("Standalone_"))
+
+        for ws, zone_id in ((self.ws_alpha, "zone-alpha"), (self.ws_bravo, "zone-bravo")):
+            await self.hub.handle_message(ws, {
+                "type": "first_sighting",
+                "mapId": "",
+                "remoteId": "RID-STANDALONE-SHARED",
+                "zoneId": zone_id,
+                "guid": zone_id,
+                "droneTs": 1000,
+                "distanceFromZoneM": 10.0,
+                "mappedId": "",
+            })
+
+        self.assertEqual("zone-alpha", self.hub._owners[(alpha_map_id, "RID-STANDALONE-SHARED")]["owner_guid"])
+        self.assertEqual("zone-bravo", self.hub._owners[(bravo_map_id, "RID-STANDALONE-SHARED")]["owner_guid"])
+
+    async def test_standalone_without_usable_location_is_isolated(self):
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "hello",
+            "mapId": "",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "name": "Alpha",
+            "lat": 0.0,
+            "lng": 0.0,
+        })
+        await self.hub.handle_message(self.ws_bravo, {
+            "type": "hello",
+            "mapId": "",
+            "zoneId": "zone-bravo",
+            "guid": "zone-bravo",
+            "name": "Bravo",
+            "lat": 0.0,
+            "lng": 0.0,
+        })
+
+        self.assertEqual("Standalone_zone-alpha", self.hub._connections[self.ws_alpha].map_id)
+        self.assertEqual("Standalone_zone-bravo", self.hub._connections[self.ws_bravo].map_id)
 
     async def test_heartbeat_only_extends_leases_for_matching_owner_guid(self):
         await self.hub.handle_message(self.ws_alpha, {

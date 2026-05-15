@@ -107,6 +107,30 @@ class SnapshotHelpersTest(unittest.TestCase):
 
         self.assertEqual("disconnected", snapshot["maps"][0]["zones"][0]["status"])
 
+    def test_build_r2c_snapshot_preserves_standalone_coordination_group(self):
+        now_ms = 1_000_000
+        zones = [
+            types.SimpleNamespace(
+                map_id="Standalone_zone-a",
+                reported_map_id="profile:home-default:incident:Training:op:1",
+                coordination_mode="standalone",
+                zone_id="zone-a",
+                guid="guid-a",
+                name="Alpha",
+                lat=39.15306,
+                lng=-121.13296,
+                caltopo_rtt_ms=0,
+                online=True,
+                last_seen_ms=999_995,
+            ),
+        ]
+
+        snapshot = build_r2c_snapshot(zones, [], now_ms)
+
+        self.assertEqual("Standalone_zone-a", snapshot["maps"][0]["map_id"])
+        self.assertEqual("standalone", snapshot["maps"][0]["coordination_mode"])
+        self.assertEqual("profile:home-default:incident:Training:op:1", snapshot["maps"][0]["zones"][0]["reported_map_id"])
+
 
 class SnapshotTemplateTest(unittest.TestCase):
     def test_base_template_live_refresh_stops_when_hidden_or_idle(self):

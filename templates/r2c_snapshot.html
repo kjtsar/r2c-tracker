@@ -385,7 +385,11 @@
   {% for map_entry in snapshot.maps %}
   <section class="map-card">
     <div class="map-header">
+      {% if map_entry.coordination_mode == 'standalone' %}
+      <h2 class="map-title">{{ map_entry.map_id }}</h2>
+      {% else %}
       <h2 class="map-title"><a href="https://caltopo.com/m/{{ map_entry.map_id }}" target="_blank" rel="noopener noreferrer">Map {{ map_entry.map_id }}</a></h2>
+      {% endif %}
       <div class="map-meta">{{ map_entry.zone_count }} instance{{ '' if map_entry.zone_count == 1 else 's' }}, {{ map_entry.owned_drone_count }} owned drone{{ '' if map_entry.owned_drone_count == 1 else 's' }}</div>
     </div>
 
@@ -402,6 +406,9 @@
         <div class="detail-list">
           <div>Last communication: <strong data-last-seen-ms="{{ zone.last_seen_ms }}">{{ zone.last_seen_age_label }} ago</strong></div>
           <div>Caltopo RTT: <strong>{{ zone.caltopo_rtt_ms ~ ' ms' if zone.caltopo_rtt_ms > 0 else 'unknown' }}</strong></div>
+          {% if zone.reported_map_id and zone.reported_map_id != zone.map_id %}
+          <div>Reported map: <strong>{{ zone.reported_map_id }}</strong></div>
+          {% endif %}
           <div>Location: <strong>{{ '%.5f'|format(zone.lat) }}, {{ '%.5f'|format(zone.lng) }}</strong></div>
         </div>
 

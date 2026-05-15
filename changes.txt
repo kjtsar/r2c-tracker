@@ -1,4 +1,13 @@
-v1.4.6:
-* Add support for syncing Drone Confirmation panels across multiple R2C instances.
-* Updated docs and tests for Drone Confirmation panel syncing.
+v1.4.7:
+* Improved R2C tracker coordination for standalone devices.
+  R2C instances that are not connected to a CalTopo map are now grouped
+  into Standalone_... coordination zones by proximity, so nearby standalone
+  devices can still share drone updates while distant or locationless
+  devices remain isolated. Connected devices continue to coordinate by actual
+  CalTopo map ID.
+
+
+
+
+
 

@@ -79,6 +79,8 @@ BASE_LOG_DIRECTORY = '/flightlogs-vol'
 R2C_HEARTBEAT_SEC = int(os.environ.get("R2C_HEARTBEAT_SEC", "15"))
 R2C_LEASE_SEC = int(os.environ.get("R2C_LEASE_SEC", "45"))
 R2C_DB_CLEANUP_SEC = int(os.environ.get("R2C_DB_CLEANUP_SEC", "86400"))
+R2C_COORDINATION_MODE_MAP = "map"
+R2C_COORDINATION_MODE_STANDALONE = "standalone"
 
 
 def _mask_token(token: Optional[str]) -> str:
@@ -227,6 +229,8 @@ class R2CZoneState(Base):
     __tablename__ = "r2c_zone_state"
     id = Column(Integer, primary_key=True)
     map_id = Column(String, index=True, nullable=False)
+    reported_map_id = Column(String, default="")
+    coordination_mode = Column(String, default=R2C_COORDINATION_MODE_MAP)
     zone_id = Column(String, index=True, nullable=False)
     guid = Column(String, index=True, nullable=False)
     name = Column(String, default="")
@@ -306,7 +310,30 @@ async def migrate_r2c_coordination_schema():
                     ))
         elif dialect == "sqlite":
             # SQLite INTEGER is already 64-bit and does not need migration here.
-            return
+            pass
+        if dialect == "postgresql":
+            result = await conn.execute(text("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'r2c_zone_state'
+            """))
+            columns = {row[0] for row in result.fetchall()}
+            if "reported_map_id" not in columns:
+                await conn.execute(text("ALTER TABLE r2c_zone_state ADD COLUMN reported_map_id VARCHAR DEFAULT ''"))
+            if "coordination_mode" not in columns:
+                await conn.execute(text(
+                    f"ALTER TABLE r2c_zone_state ADD COLUMN coordination_mode VARCHAR DEFAULT '{R2C_COORDINATION_MODE_MAP}'"
+                ))
+        elif dialect == "sqlite":
+            result = await conn.execute(text("PRAGMA table_info(r2c_zone_state)"))
+            columns = {row[1] for row in result.fetchall()}
+            if "reported_map_id" not in columns:
+                await conn.execute(text("ALTER TABLE r2c_zone_state ADD COLUMN reported_map_id TEXT DEFAULT ''"))
+            if "coordination_mode" not in columns:
+                await conn.execute(text(
+                    f"ALTER TABLE r2c_zone_state ADD COLUMN coordination_mode TEXT DEFAULT '{R2C_COORDINATION_MODE_MAP}'"
+                ))
 
 
 async def migrate_flight_archive_schema():
@@ -394,6 +421,8 @@ class R2CZoneConnection:
     def __init__(self, websocket: Optional[WebSocket]):
         self.websocket = websocket
         self.map_id: Optional[str] = None
+        self.reported_map_id: str = ""
+        self.coordination_mode: str = "map"
         self.zone_id: Optional[str] = None
         self.guid: Optional[str] = None
         self.name: str = ""
@@ -406,6 +435,11 @@ class R2CZoneConnection:
 
 
 class R2CCoordinationHub:
+    STANDALONE_PREFIX = "Standalone_"
+    STANDALONE_GROUP_RADIUS_M = 2.0 * 1609.344
+    COORDINATION_MODE_MAP = "map"
+    COORDINATION_MODE_STANDALONE = "standalone"
+
     def __init__(self):
         self._lock = asyncio.Lock()
         self._connections: dict[WebSocket, R2CZoneConnection] = {}
@@ -446,6 +480,86 @@ class R2CCoordinationHub:
                 pass
             self._cleanup_task = None
 
+    @classmethod
+    def _is_standalone_reported_map_id(cls, reported_map_id: str) -> bool:
+        normalized = (reported_map_id or "").strip()
+        return (
+            normalized == ""
+            or normalized.startswith("profile:")
+            or normalized.startswith(cls.STANDALONE_PREFIX)
+        )
+
+    @classmethod
+    def _sanitize_standalone_key(cls, value: str) -> str:
+        key = re.sub(r"[^A-Za-z0-9_-]+", "_", value or "").strip("_")
+        return key or "isolated"
+
+    @staticmethod
+    def _has_usable_location(lat: float, lng: float) -> bool:
+        return (
+            math.isfinite(lat)
+            and math.isfinite(lng)
+            and -90.0 <= lat <= 90.0
+            and -180.0 <= lng <= 180.0
+            and not (abs(lat) < 0.000001 and abs(lng) < 0.000001)
+        )
+
+    @staticmethod
+    def _distance_meters(lat_a: float, lng_a: float, lat_b: float, lng_b: float) -> float:
+        radius_m = 6371000.0
+        phi_a = math.radians(lat_a)
+        phi_b = math.radians(lat_b)
+        delta_phi = math.radians(lat_b - lat_a)
+        delta_lambda = math.radians(lng_b - lng_a)
+        haversine = (
+            math.sin(delta_phi / 2.0) ** 2
+            + math.cos(phi_a) * math.cos(phi_b) * math.sin(delta_lambda / 2.0) ** 2
+        )
+        return 2.0 * radius_m * math.atan2(math.sqrt(haversine), math.sqrt(1.0 - haversine))
+
+    @classmethod
+    def _standalone_map_id_for_zone(cls, zone_id: str, guid: str) -> str:
+        return f"{cls.STANDALONE_PREFIX}{cls._sanitize_standalone_key(zone_id or guid)}"
+
+    def _resolve_coordination_map_id(self, reported_map_id: str, zone_id: str, guid: str,
+                                     lat: float, lng: float) -> tuple[str, str]:
+        normalized = (reported_map_id or "").strip()
+        if not self._is_standalone_reported_map_id(normalized):
+            return normalized, self.COORDINATION_MODE_MAP
+        fallback_map_id = self._standalone_map_id_for_zone(zone_id, guid)
+        if not self._has_usable_location(lat, lng):
+            return fallback_map_id, self.COORDINATION_MODE_STANDALONE
+
+        nearby: list[tuple[float, str]] = []
+        for map_id, zones in self._zones_by_map.items():
+            if not map_id.startswith(self.STANDALONE_PREFIX):
+                continue
+            for zone in zones.values():
+                if zone.zone_id == zone_id:
+                    continue
+                if zone.coordination_mode != self.COORDINATION_MODE_STANDALONE:
+                    continue
+                if not self._has_usable_location(zone.lat, zone.lng):
+                    continue
+                distance_m = self._distance_meters(lat, lng, zone.lat, zone.lng)
+                if distance_m <= self.STANDALONE_GROUP_RADIUS_M:
+                    nearby.append((distance_m, map_id))
+        if nearby:
+            nearby.sort(key=lambda row: (row[0], row[1]))
+            return nearby[0][1], self.COORDINATION_MODE_STANDALONE
+        return fallback_map_id, self.COORDINATION_MODE_STANDALONE
+
+    def _message_context(self, websocket: WebSocket, payload: dict) -> tuple[str, str, str]:
+        conn = self._connections.get(websocket)
+        payload_zone_id = payload.get("zoneId", "") or payload.get("guid", "")
+        if conn is not None:
+            return (
+                conn.map_id or payload.get("mapId", ""),
+                conn.zone_id or payload_zone_id,
+                conn.guid or payload.get("guid", payload_zone_id),
+            )
+        return payload.get("mapId", ""), payload_zone_id, payload.get("guid", payload_zone_id)
+
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
@@ -474,6 +588,8 @@ class R2CCoordinationHub:
                 tracked = zones.get(zone_id)
                 if tracked is conn:
                     conn.websocket = None
+            reported_map_id = conn.reported_map_id
+            coordination_mode = conn.coordination_mode
         now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
         if map_id and zone_id:
             logger.info(
@@ -495,6 +611,8 @@ class R2CCoordinationHub:
                 caltopo_rtt_ms,
                 False,
                 last_seen_ms,
+                reported_map_id,
+                coordination_mode,
             )
         if map_id:
             await self.broadcast_zone_update(map_id)
@@ -510,38 +628,72 @@ class R2CCoordinationHub:
         elif mtype == "sighting":
             await self._handle_sighting(websocket, payload)
         elif mtype == "drone_lost":
-            await self._handle_drone_lost(payload)
+            await self._handle_drone_lost(websocket, payload)
         elif mtype == "drone_confirmed":
             await self._handle_drone_confirmed(websocket, payload)
 
     async def _handle_hello(self, websocket: WebSocket, payload: dict):
-        map_id = payload.get("mapId", "")
+        reported_map_id = (payload.get("mapId", "") or "").strip()
         zone_id = payload.get("zoneId", "") or payload.get("guid", "")
         now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
         async with self._lock:
             conn = self._connections[websocket]
+            lat = float(payload.get("lat", 0.0) or 0.0)
+            lng = float(payload.get("lng", 0.0) or 0.0)
+            map_id, coordination_mode = self._resolve_coordination_map_id(
+                reported_map_id,
+                zone_id,
+                payload.get("guid", zone_id),
+                lat,
+                lng,
+            )
+            old_map_id = conn.map_id
+            old_zone_id = conn.zone_id
+            if old_map_id and old_zone_id:
+                old_zones = self._zones_by_map.get(old_map_id, {})
+                if old_zones.get(old_zone_id) is conn:
+                    old_zones.pop(old_zone_id, None)
+                if not old_zones:
+                    self._zones_by_map.pop(old_map_id, None)
             conn.map_id = map_id
+            conn.reported_map_id = reported_map_id
+            conn.coordination_mode = coordination_mode
             conn.zone_id = zone_id
             conn.guid = payload.get("guid", zone_id)
             conn.name = payload.get("name", zone_id)
-            conn.lat = float(payload.get("lat", 0.0) or 0.0)
-            conn.lng = float(payload.get("lng", 0.0) or 0.0)
+            conn.lat = lat
+            conn.lng = lng
             conn.caltopo_rtt_ms = self._parse_caltopo_rtt_ms(payload.get("caltopoRttMs"))
             conn.hello_received_at_ms = now_ms
             conn.last_seen_ms = now_ms
             zones = self._zones_by_map.setdefault(map_id, {})
             zones[zone_id] = conn
         logger.info(
-            "r2c hello received: map=%s zone=%s guid=%s handshake_age_ms=%s",
+            "r2c hello received: map=%s reported_map=%s coordination_mode=%s zone=%s guid=%s handshake_age_ms=%s",
             map_id,
+            reported_map_id,
+            coordination_mode,
             zone_id,
             conn.guid or zone_id,
             max(now_ms - int(conn.connected_at_ms or now_ms), 0),
         )
-        await self._upsert_zone_state(map_id, zone_id, conn.guid or zone_id, conn.name, conn.lat, conn.lng, conn.caltopo_rtt_ms, True, now_ms)
+        await self._upsert_zone_state(
+            map_id,
+            zone_id,
+            conn.guid or zone_id,
+            conn.name,
+            conn.lat,
+            conn.lng,
+            conn.caltopo_rtt_ms,
+            True,
+            now_ms,
+            reported_map_id,
+            coordination_mode,
+        )
         await websocket.send_text(json.dumps({
             "type": "hello_ack",
             "serverTime": now_ms,
+            "mapId": map_id,
             "heartbeatSec": R2C_HEARTBEAT_SEC,
             "leaseSec": R2C_LEASE_SEC
         }))
@@ -568,6 +720,8 @@ class R2CCoordinationHub:
             lat = conn.lat
             lng = conn.lng
             caltopo_rtt_ms = conn.caltopo_rtt_ms
+            reported_map_id = conn.reported_map_id
+            coordination_mode = conn.coordination_mode
             if guid:
                 for (owner_map_id, remote_id), owner in self._owners.items():
                     if owner.get("owner_guid") == guid:
@@ -575,7 +729,19 @@ class R2CCoordinationHub:
                         owner_lease_expire_ms = max(owner_lease_expire_ms, int(owner["lease_expire_ms"]))
                         owner_updates.append((owner_map_id, remote_id, dict(owner)))
         if map_id and zone_id:
-            await self._upsert_zone_state(map_id, zone_id, guid or zone_id, name, lat, lng, caltopo_rtt_ms, True, now_ms)
+            await self._upsert_zone_state(
+                map_id,
+                zone_id,
+                guid or zone_id,
+                name,
+                lat,
+                lng,
+                caltopo_rtt_ms,
+                True,
+                now_ms,
+                reported_map_id,
+                coordination_mode,
+            )
         for owner_map_id, remote_id, owner in owner_updates:
             await self._upsert_owner_state(owner_map_id, remote_id, owner)
         logger.info(
@@ -600,15 +766,14 @@ class R2CCoordinationHub:
             await self.broadcast_zone_update(map_id)
 
     async def _handle_first_sighting(self, websocket: WebSocket, payload: dict):
-        map_id = payload.get("mapId", "")
         remote_id = payload.get("remoteId", "")
-        zone_id = payload.get("zoneId", "") or payload.get("guid", "")
-        if not map_id or not remote_id or not zone_id:
-            return
         async with self._lock:
+            map_id, zone_id, guid = self._message_context(websocket, payload)
+            if not map_id or not remote_id or not zone_id:
+                return
             existing = self._owners.get((map_id, remote_id))
             candidate = {
-                "owner_guid": payload.get("guid", zone_id),
+                "owner_guid": guid,
                 "owner_zone_id": zone_id,
                 "drone_ts": int(payload.get("droneTs", 0) or 0),
                 "distance_m": float(payload.get("distanceFromZoneM", 0.0) or 0.0),
@@ -662,12 +827,11 @@ class R2CCoordinationHub:
         )
 
     async def _handle_sighting(self, websocket: WebSocket, payload: dict):
-        map_id = payload.get("mapId", "")
         remote_id = payload.get("remoteId", "")
-        if not map_id or not remote_id:
-            return
-        from_zone_id = payload.get("zoneId", "") or payload.get("guid", "")
         async with self._lock:
+            map_id, from_zone_id, guid = self._message_context(websocket, payload)
+            if not map_id or not remote_id:
+                return
             owner = self._owners.get((map_id, remote_id))
             if owner is None:
                 return
@@ -686,12 +850,13 @@ class R2CCoordinationHub:
             return
         relay = dict(payload)
         relay["type"] = "relay_sighting"
+        relay["mapId"] = map_id
         relay["fromZoneId"] = from_zone_id
         await self._record_sighting(
             map_id,
             remote_id,
             relay.get("fromZoneId", ""),
-            payload.get("guid", ""),
+            guid,
             int(payload.get("droneTs", 0) or 0),
             float(payload.get("lat", 0.0) or 0.0),
             float(payload.get("lng", 0.0) or 0.0),
@@ -703,22 +868,21 @@ class R2CCoordinationHub:
             logger.warning("relay_sighting failed for %s/%s: %s", map_id, remote_id, e)
 
     async def _handle_drone_confirmed(self, websocket: WebSocket, payload: dict):
-        map_id = payload.get("mapId", "")
         remote_id = payload.get("remoteId", "")
-        if not map_id or not remote_id:
-            return
-        zone_id = payload.get("zoneId", "") or payload.get("guid", "")
         async with self._lock:
             conn = self._connections.get(websocket)
-            if conn is None or conn.map_id != map_id:
+            if conn is None:
+                return
+            map_id, zone_id, guid = self._message_context(websocket, payload)
+            if not map_id or not remote_id:
                 return
             event = {
                 "type": "drone_confirmed",
                 "mapId": map_id,
                 "remoteId": remote_id,
                 "zoneId": zone_id,
-                "guid": payload.get("guid", zone_id),
-                "confirmedByGuid": payload.get("guid", zone_id),
+                "guid": guid,
+                "confirmedByGuid": guid,
                 "flightStartMsec": int(payload.get("flightStartMsec", 0) or 0),
                 "mappedId": payload.get("mappedId", "") or "",
                 "trackLabel": payload.get("trackLabel", "") or payload.get("mappedId", "") or "",
@@ -735,14 +899,13 @@ class R2CCoordinationHub:
         )
         await self.broadcast(map_id, event)
 
-    async def _handle_drone_lost(self, payload: dict):
-        map_id = payload.get("mapId", "")
+    async def _handle_drone_lost(self, websocket: WebSocket, payload: dict):
         remote_id = payload.get("remoteId", "")
-        zone_id = payload.get("zoneId", "")
-        if not map_id or not remote_id:
-            return
         expired = False
         async with self._lock:
+            map_id, zone_id, guid = self._message_context(websocket, payload)
+            if not map_id or not remote_id:
+                return
             owner = self._owners.get((map_id, remote_id))
             if owner and owner.get("owner_zone_id") == zone_id:
                 self._owners.pop((map_id, remote_id), None)
@@ -752,7 +915,7 @@ class R2CCoordinationHub:
                 "r2c owner_expired: map=%s remote_id=%s reason=drone_lost prev_owner_guid=%s prev_zone_id=%s",
                 map_id,
                 remote_id,
-                payload.get("guid", zone_id),
+                guid,
                 zone_id,
             )
             await self._delete_owner_state(map_id, remote_id)
@@ -761,7 +924,7 @@ class R2CCoordinationHub:
                 {
                     "type": "owner_expired",
                     "remoteId": remote_id,
-                    "prevOwnerGuid": payload.get("guid", zone_id)
+                    "prevOwnerGuid": guid
                 }
             )
 
@@ -813,6 +976,8 @@ class R2CCoordinationHub:
             for zone in zones:
                 conn = R2CZoneConnection(None)
                 conn.map_id = zone.map_id
+                conn.reported_map_id = getattr(zone, "reported_map_id", "") or ""
+                conn.coordination_mode = getattr(zone, "coordination_mode", "") or self.COORDINATION_MODE_MAP
                 conn.zone_id = zone.zone_id
                 conn.guid = zone.guid
                 conn.name = zone.name
@@ -946,7 +1111,9 @@ class R2CCoordinationHub:
 
     async def _upsert_zone_state(self, map_id: str, zone_id: str, guid: str, name: str,
                                  lat: float, lng: float, caltopo_rtt_ms: int,
-                                 online: bool, last_seen_ms: int):
+                                 online: bool, last_seen_ms: int,
+                                 reported_map_id: str = "",
+                                 coordination_mode: str = "map"):
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(R2CZoneState).where(
@@ -958,6 +1125,8 @@ class R2CCoordinationHub:
             if state is None:
                 state = R2CZoneState(map_id=map_id, zone_id=zone_id)
                 session.add(state)
+            state.reported_map_id = reported_map_id
+            state.coordination_mode = coordination_mode
             state.guid = guid
             state.name = name
             state.lat = lat
@@ -1637,6 +1806,8 @@ def build_r2c_snapshot(zones, owners, now_ms: int):
         )
         zone_entry = {
             "map_id": zone.map_id,
+            "reported_map_id": getattr(zone, "reported_map_id", "") or "",
+            "coordination_mode": getattr(zone, "coordination_mode", "map") or "map",
             "zone_id": zone.zone_id,
             "guid": zone.guid,
             "name": zone.name or zone.zone_id,
@@ -1665,6 +1836,7 @@ def build_r2c_snapshot(zones, owners, now_ms: int):
         )
         snapshot_maps.append({
             "map_id": map_id,
+            "coordination_mode": "standalone" if map_id.startswith("Standalone_") else "map",
             "zones": zone_entries,
             "zone_count": len(zone_entries),
             "owned_drone_count": sum(zone["owned_drone_count"] for zone in zone_entries),

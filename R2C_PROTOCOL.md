@@ -17,8 +17,18 @@ RID2Caltopo logic that actually writes ordered track state into Caltopo.
 
 ## Scope and assumptions
 
-- Ownership is isolated by `mapId`. The same `remoteId` can legitimately have a
-  different owner on another map.
+- Ownership is isolated by the tracker coordination key. For connected
+  RID2Caltopo instances, this is the real CalTopo `mapId`. For standalone
+  instances with no map configured, the tracker assigns a `Standalone_<key>`
+  coordination group by two-mile proximity.
+- Standalone grouping ignores incident, op-period, profile, and other local
+  RID2Caltopo configuration metadata. Two nearby standalone instances may share
+  drone ownership and waypoint updates even if their local incident/op-period
+  settings differ.
+- Standalone instances without a usable location are isolated into their own
+  `Standalone_<zone-or-guid>` coordination group.
+- The same `remoteId` can legitimately have a different owner on another
+  coordination key.
 - A "zone" is one RID2Caltopo client instance connected to `/ws/r2c`.
 - A zone should present a stable `guid` for its lifetime. Using the same value
   as `zoneId` is acceptable and is the common case in this implementation.
@@ -63,6 +73,7 @@ Server responds:
 {
   "type": "hello_ack",
   "serverTime": 1710000000000,
+  "mapId": "MAP1",
   "heartbeatSec": 15,
   "leaseSec": 45
 }
@@ -70,7 +81,9 @@ Server responds:
 
 Effects:
 
-- zone presence is registered under `mapId`
+- zone presence is registered under the effective coordination key. Connected
+  instances use the reported CalTopo `mapId`; standalone instances use a
+  tracker-assigned `Standalone_<key>` group.
 - zone state is mirrored into SQL
 - all connected zones on the map receive a `zone_update`
 

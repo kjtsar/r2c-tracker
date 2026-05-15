@@ -1,6 +1,8 @@
 import asyncio
 import json
+import math
 import pathlib
+import re
 import types
 import unittest
 from datetime import UTC, datetime
@@ -27,6 +29,8 @@ def load_coordination_classes():
     namespace = {
         "asyncio": asyncio,
         "json": json,
+        "math": math,
+        "re": re,
         "Optional": Optional,
         "UTC": UTC,
         "datetime": datetime,
@@ -151,6 +155,60 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
 
         owner = self.hub._owners[("MAP1", "DRONE1")]
         self.assertEqual("zone-alpha", owner["owner_guid"])
+
+    async def test_nearby_standalone_instances_share_coordination_group(self):
+        self.ws_alpha.sent_texts.clear()
+        self.ws_bravo.sent_texts.clear()
+
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "hello",
+            "mapId": "",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "name": "Alpha",
+            "lat": 39.15306,
+            "lng": -121.13296,
+        })
+        await self.hub.handle_message(self.ws_bravo, {
+            "type": "hello",
+            "mapId": "profile:home-default:incident:Training:op:1",
+            "zoneId": "zone-bravo",
+            "guid": "zone-bravo",
+            "name": "Bravo",
+            "lat": 39.15307,
+            "lng": -121.13298,
+        })
+
+        alpha_map_id = self.hub._connections[self.ws_alpha].map_id
+        bravo_map_id = self.hub._connections[self.ws_bravo].map_id
+        self.assertEqual(alpha_map_id, bravo_map_id)
+        self.assertTrue(alpha_map_id.startswith("Standalone_"))
+        self.assertNotIn("Training", alpha_map_id)
+        self.assertEqual("standalone", self.hub._connections[self.ws_alpha].coordination_mode)
+
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "first_sighting",
+            "mapId": "",
+            "remoteId": "RID-STANDALONE",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "droneTs": 2000,
+            "distanceFromZoneM": 25.0,
+            "mappedId": "",
+        })
+        await self.hub.handle_message(self.ws_bravo, {
+            "type": "first_sighting",
+            "mapId": "profile:home-default:incident:Other:op:9",
+            "remoteId": "RID-STANDALONE",
+            "zoneId": "zone-bravo",
+            "guid": "zone-bravo",
+            "droneTs": 1000,
+            "distanceFromZoneM": 40.0,
+            "mappedId": "",
+        })
+
+        owner = self.hub._owners[(alpha_map_id, "RID-STANDALONE")]
+        self.assertEqual("zone-bravo", owner["owner_guid"])
 
     async def test_drone_confirmed_broadcasts_to_all_zones_on_map(self):
         self.ws_alpha.sent_texts.clear()
