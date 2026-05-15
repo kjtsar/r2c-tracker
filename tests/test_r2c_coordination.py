@@ -81,6 +81,7 @@ class TestHub(BaseHub):
         super().__init__()
         self.zone_state_updates = []
         self.zone_state_deletes = []
+        self.persisted_mapped_map_id = None
 
     async def _load_state(self):
         return
@@ -104,6 +105,9 @@ class TestHub(BaseHub):
 
     async def _record_sighting(self, *args, **kwargs):
         return
+
+    async def _resolve_persisted_mapped_coordination_map_id(self, *args, **kwargs):
+        return self.persisted_mapped_map_id
 
 
 class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
@@ -289,6 +293,32 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(standalone_map_id, self.hub._zones_by_map)
         self.assertIn(((standalone_map_id, "zone-charlie"), {}), self.hub.zone_state_deletes)
         self.assertIn("zone-charlie", self.hub._zones_by_map["MAP-LATE"])
+
+    async def test_standalone_rehomes_to_persisted_map_anchor(self):
+        ws_charlie = FakeWebSocket()
+        await self.hub.connect(ws_charlie)
+
+        await self.hub.handle_message(ws_charlie, {
+            "type": "hello",
+            "mapId": "",
+            "zoneId": "zone-charlie",
+            "guid": "zone-charlie",
+            "name": "Charlie",
+            "lat": 39.15307,
+            "lng": -121.13294,
+        })
+        standalone_map_id = self.hub._connections[ws_charlie].map_id
+        self.hub.persisted_mapped_map_id = "4J0LF02"
+
+        await self.hub.handle_message(ws_charlie, {
+            "type": "heartbeat",
+            "seq": 3,
+            "lat": 39.15307,
+            "lng": -121.13294,
+        })
+
+        self.assertEqual("4J0LF02", self.hub._connections[ws_charlie].map_id)
+        self.assertIn(((standalone_map_id, "zone-charlie"), {}), self.hub.zone_state_deletes)
 
     async def test_drone_confirmed_broadcasts_to_all_zones_on_map(self):
         self.ws_alpha.sent_texts.clear()

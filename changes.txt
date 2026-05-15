@@ -1,2 +1,6 @@
-v1.4.10:
-* Handle out of order r2c arrivals.
+v1.4.11:
+* Improved standalone R2C coordination. Standalone instances now automatically
+  join nearby map-connected instances when colocated, even if the
+  map-connected peer appears later or is only visible through persisted tracker
+  state. This helps users who forget to connect to a map still participate in
+  local drone sharing.

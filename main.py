@@ -561,6 +561,38 @@ class R2CCoordinationHub:
             return nearby_standalone[0][1], self.COORDINATION_MODE_STANDALONE
         return fallback_map_id, self.COORDINATION_MODE_STANDALONE
 
+    async def _resolve_persisted_mapped_coordination_map_id(
+            self,
+            zone_id: str,
+            lat: float,
+            lng: float,
+            now_ms: int) -> Optional[str]:
+        if not self._has_usable_location(lat, lng):
+            return None
+        recent_cutoff_ms = now_ms - (R2C_HEARTBEAT_SEC * 1000 * 2)
+        candidates: list[tuple[float, str]] = []
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(R2CZoneState).where(
+                    R2CZoneState.last_seen_ms >= recent_cutoff_ms,
+                    R2CZoneState.map_id.not_like(f"{self.STANDALONE_PREFIX}%"),
+                )
+            )
+            for zone in result.scalars().all():
+                if zone.zone_id == zone_id:
+                    continue
+                if getattr(zone, "coordination_mode", self.COORDINATION_MODE_MAP) != self.COORDINATION_MODE_MAP:
+                    continue
+                if not self._has_usable_location(zone.lat, zone.lng):
+                    continue
+                distance_m = self._distance_meters(lat, lng, zone.lat, zone.lng)
+                if distance_m <= self.STANDALONE_GROUP_RADIUS_M:
+                    candidates.append((distance_m, zone.map_id))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda row: (row[0], row[1]))
+        return candidates[0][1]
+
     def _message_context(self, websocket: WebSocket, payload: dict) -> tuple[str, str, str]:
         conn = self._connections.get(websocket)
         payload_zone_id = payload.get("zoneId", "") or payload.get("guid", "")
@@ -735,6 +767,16 @@ class R2CCoordinationHub:
                     conn.lat,
                     conn.lng,
                 )
+                if resolved_map_id.startswith(self.STANDALONE_PREFIX):
+                    persisted_map_id = await self._resolve_persisted_mapped_coordination_map_id(
+                        conn.zone_id or "",
+                        conn.lat,
+                        conn.lng,
+                        now_ms,
+                    )
+                    if persisted_map_id:
+                        resolved_map_id = persisted_map_id
+                        resolved_mode = self.COORDINATION_MODE_STANDALONE
                 if resolved_map_id and resolved_map_id != conn.map_id:
                     old_map_id_for_update = conn.map_id
                     old_zone_id = conn.zone_id
