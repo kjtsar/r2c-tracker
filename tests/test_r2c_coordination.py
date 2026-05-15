@@ -80,6 +80,7 @@ class TestHub(BaseHub):
     def __init__(self):
         super().__init__()
         self.zone_state_updates = []
+        self.zone_state_deletes = []
 
     async def _load_state(self):
         return
@@ -89,6 +90,7 @@ class TestHub(BaseHub):
         return
 
     async def _delete_zone_state(self, *args, **kwargs):
+        self.zone_state_deletes.append((args, kwargs))
         return
 
     async def _delete_stale_zones(self, *args, **kwargs):
@@ -250,6 +252,43 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
         })
 
         self.assertEqual("zone-charlie", self.hub._owners[("MAP1", "RID-FORGOT-MAP")]["owner_guid"])
+
+    async def test_standalone_rehomes_to_map_when_mapped_peer_appears_later(self):
+        ws_charlie = FakeWebSocket()
+        await self.hub.connect(ws_charlie)
+
+        await self.hub.handle_message(ws_charlie, {
+            "type": "hello",
+            "mapId": "",
+            "zoneId": "zone-charlie",
+            "guid": "zone-charlie",
+            "name": "Charlie",
+            "lat": 40.0,
+            "lng": -122.0,
+        })
+        standalone_map_id = self.hub._connections[ws_charlie].map_id
+        self.assertTrue(standalone_map_id.startswith("Standalone_"))
+
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "hello",
+            "mapId": "MAP-LATE",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "name": "Alpha",
+            "lat": 40.0001,
+            "lng": -122.0001,
+        })
+        await self.hub.handle_message(ws_charlie, {
+            "type": "heartbeat",
+            "seq": 2,
+            "lat": 40.0002,
+            "lng": -122.0002,
+        })
+
+        self.assertEqual("MAP-LATE", self.hub._connections[ws_charlie].map_id)
+        self.assertNotIn(standalone_map_id, self.hub._zones_by_map)
+        self.assertIn(((standalone_map_id, "zone-charlie"), {}), self.hub.zone_state_deletes)
+        self.assertIn("zone-charlie", self.hub._zones_by_map["MAP-LATE"])
 
     async def test_drone_confirmed_broadcasts_to_all_zones_on_map(self):
         self.ws_alpha.sent_texts.clear()

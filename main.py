@@ -714,7 +714,9 @@ class R2CCoordinationHub:
     async def _handle_heartbeat(self, websocket: WebSocket, payload: dict):
         now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
         owner_updates: list[tuple[str, str, dict]] = []
+        owner_deletes: list[tuple[str, str]] = []
         owner_lease_expire_ms = 0
+        old_map_id_for_update: Optional[str] = None
         async with self._lock:
             conn = self._connections.get(websocket)
             if conn is None:
@@ -725,6 +727,47 @@ class R2CCoordinationHub:
             if incoming_rtt_ms > 0:
                 conn.caltopo_rtt_ms = incoming_rtt_ms
             conn.last_seen_ms = now_ms
+            if conn.coordination_mode == self.COORDINATION_MODE_STANDALONE:
+                resolved_map_id, resolved_mode = self._resolve_coordination_map_id(
+                    conn.reported_map_id,
+                    conn.zone_id or "",
+                    conn.guid or "",
+                    conn.lat,
+                    conn.lng,
+                )
+                if resolved_map_id and resolved_map_id != conn.map_id:
+                    old_map_id_for_update = conn.map_id
+                    old_zone_id = conn.zone_id
+                    if old_map_id_for_update and old_zone_id:
+                        old_zones = self._zones_by_map.get(old_map_id_for_update, {})
+                        if old_zones.get(old_zone_id) is conn:
+                            old_zones.pop(old_zone_id, None)
+                        if not old_zones:
+                            self._zones_by_map.pop(old_map_id_for_update, None)
+                    conn.map_id = resolved_map_id
+                    conn.coordination_mode = resolved_mode
+                    if old_zone_id:
+                        self._zones_by_map.setdefault(resolved_map_id, {})[old_zone_id] = conn
+                    logger.info(
+                        "r2c standalone rehomed: old_map=%s new_map=%s zone=%s guid=%s",
+                        old_map_id_for_update,
+                        resolved_map_id,
+                        old_zone_id,
+                        conn.guid or old_zone_id,
+                    )
+                    for (owner_map_id, remote_id), owner in list(self._owners.items()):
+                        if owner_map_id != old_map_id_for_update or owner.get("owner_guid") != conn.guid:
+                            continue
+                        self._owners.pop((owner_map_id, remote_id), None)
+                        existing = self._owners.get((resolved_map_id, remote_id))
+                        if existing is None:
+                            self._owners[(resolved_map_id, remote_id)] = owner
+                            owner_updates.append((resolved_map_id, remote_id, dict(owner)))
+                        else:
+                            chosen_owner = self._pick_owner(existing, owner)
+                            self._owners[(resolved_map_id, remote_id)] = chosen_owner
+                            owner_updates.append((resolved_map_id, remote_id, dict(chosen_owner)))
+                        owner_deletes.append((owner_map_id, remote_id))
             map_id = conn.map_id
             zone_id = conn.zone_id
             guid = conn.guid
@@ -754,8 +797,12 @@ class R2CCoordinationHub:
                 reported_map_id,
                 coordination_mode,
             )
+        if old_map_id_for_update and zone_id:
+            await self._delete_zone_state(old_map_id_for_update, zone_id)
         for owner_map_id, remote_id, owner in owner_updates:
             await self._upsert_owner_state(owner_map_id, remote_id, owner)
+        for owner_map_id, remote_id in owner_deletes:
+            await self._delete_owner_state(owner_map_id, remote_id)
         logger.info(
             "r2c heartbeat_ack: map=%s zone=%s guid=%s client_seq=%s owner_lease_expire_ts=%s",
             map_id,
@@ -776,6 +823,8 @@ class R2CCoordinationHub:
         }))
         if map_id:
             await self.broadcast_zone_update(map_id)
+        if old_map_id_for_update and old_map_id_for_update != map_id:
+            await self.broadcast_zone_update(old_map_id_for_update)
 
     async def _handle_first_sighting(self, websocket: WebSocket, payload: dict):
         remote_id = payload.get("remoteId", "")

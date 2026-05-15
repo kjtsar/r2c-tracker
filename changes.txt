@@ -1,2 +1,2 @@
-v1.4.9:
-* Support standalone devices declaring mapid=""
+v1.4.10:
+* Handle out of order r2c arrivals.
