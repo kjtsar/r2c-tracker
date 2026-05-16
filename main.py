@@ -437,6 +437,7 @@ class R2CZoneConnection:
 class R2CCoordinationHub:
     STANDALONE_PREFIX = "Standalone_"
     STANDALONE_GROUP_RADIUS_M = 2.0 * 1609.344
+    CONFIRMATION_RETENTION_MS = 12 * 60 * 60 * 1000
     COORDINATION_MODE_MAP = "map"
     COORDINATION_MODE_STANDALONE = "standalone"
 
@@ -445,6 +446,7 @@ class R2CCoordinationHub:
         self._connections: dict[WebSocket, R2CZoneConnection] = {}
         self._zones_by_map: dict[str, dict[str, R2CZoneConnection]] = {}
         self._owners: dict[tuple[str, str], dict] = {}
+        self._confirmed_drones_by_map: dict[str, dict[str, dict]] = {}
         self._sweep_task: Optional[asyncio.Task] = None
         self._load_task: Optional[asyncio.Task] = None
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -604,6 +606,60 @@ class R2CCoordinationHub:
             )
         return payload.get("mapId", ""), payload_zone_id, payload.get("guid", payload_zone_id)
 
+    def _prune_confirmed_drones_locked(self, now_ms: int):
+        cutoff_ms = now_ms - self.CONFIRMATION_RETENTION_MS
+        for map_id in list(self._confirmed_drones_by_map.keys()):
+            confirmations = self._confirmed_drones_by_map.get(map_id, {})
+            for remote_id in list(confirmations.keys()):
+                if int(confirmations[remote_id].get("confirmedAtMs", 0) or 0) < cutoff_ms:
+                    confirmations.pop(remote_id, None)
+            if not confirmations:
+                self._confirmed_drones_by_map.pop(map_id, None)
+
+    def _remember_drone_confirmation_locked(self, map_id: str, event: dict, now_ms: int):
+        if not map_id or not event.get("remoteId"):
+            return
+        self._prune_confirmed_drones_locked(now_ms)
+        stored = dict(event)
+        stored["mapId"] = map_id
+        stored["confirmedAtMs"] = now_ms
+        self._confirmed_drones_by_map.setdefault(map_id, {})[str(event["remoteId"])] = stored
+
+    def _merge_drone_confirmations_locked(self, old_map_id: Optional[str], new_map_id: str, now_ms: int) -> list[dict]:
+        if not old_map_id or not new_map_id or old_map_id == new_map_id:
+            return []
+        self._prune_confirmed_drones_locked(now_ms)
+        old_confirmations = self._confirmed_drones_by_map.get(old_map_id, {})
+        if not old_confirmations:
+            return []
+        new_confirmations = self._confirmed_drones_by_map.setdefault(new_map_id, {})
+        merged: list[dict] = []
+        for remote_id, event in old_confirmations.items():
+            copied = dict(event)
+            copied["mapId"] = new_map_id
+            existing = new_confirmations.get(remote_id)
+            if existing is None or int(copied.get("confirmedAtMs", 0) or 0) >= int(existing.get("confirmedAtMs", 0) or 0):
+                new_confirmations[remote_id] = copied
+                merged.append(copied)
+        return merged
+
+    def _recent_drone_confirmations_locked(self, map_id: str, now_ms: int) -> list[dict]:
+        self._prune_confirmed_drones_locked(now_ms)
+        return [
+            dict(event)
+            for event in self._confirmed_drones_by_map.get(map_id, {}).values()
+        ]
+
+    async def _send_recent_drone_confirmations(self, websocket: WebSocket, map_id: str, now_ms: int):
+        async with self._lock:
+            events = self._recent_drone_confirmations_locked(map_id, now_ms)
+        for event in events:
+            try:
+                await websocket.send_text(json.dumps(event))
+            except Exception as e:
+                logger.warning("drone_confirmed replay failed for %s: %s", map_id, e)
+                return
+
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
@@ -742,11 +798,13 @@ class R2CCoordinationHub:
             "leaseSec": R2C_LEASE_SEC
         }))
         await self.broadcast_zone_update(map_id)
+        await self._send_recent_drone_confirmations(websocket, map_id, now_ms)
 
     async def _handle_heartbeat(self, websocket: WebSocket, payload: dict):
         now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
         owner_updates: list[tuple[str, str, dict]] = []
         owner_deletes: list[tuple[str, str]] = []
+        confirmation_replays: list[dict] = []
         owner_lease_expire_ms = 0
         old_map_id_for_update: Optional[str] = None
         async with self._lock:
@@ -797,6 +855,17 @@ class R2CCoordinationHub:
                         old_zone_id,
                         conn.guid or old_zone_id,
                     )
+                    confirmation_replays.extend(
+                        self._merge_drone_confirmations_locked(old_map_id_for_update, resolved_map_id, now_ms)
+                    )
+                    confirmation_replays.extend(
+                        self._recent_drone_confirmations_locked(resolved_map_id, now_ms)
+                    )
+                    confirmation_replays = list({
+                        str(event.get("remoteId", "")): event
+                        for event in confirmation_replays
+                        if event.get("remoteId")
+                    }.values())
                     for (owner_map_id, remote_id), owner in list(self._owners.items()):
                         if owner_map_id != old_map_id_for_update or owner.get("owner_guid") != conn.guid:
                             continue
@@ -867,6 +936,9 @@ class R2CCoordinationHub:
             await self.broadcast_zone_update(map_id)
         if old_map_id_for_update and old_map_id_for_update != map_id:
             await self.broadcast_zone_update(old_map_id_for_update)
+        for event in confirmation_replays:
+            if map_id:
+                await self.broadcast(map_id, event)
 
     async def _handle_first_sighting(self, websocket: WebSocket, payload: dict):
         remote_id = payload.get("remoteId", "")
@@ -993,6 +1065,7 @@ class R2CCoordinationHub:
                 "model": payload.get("model", "") or "",
                 "ownerName": payload.get("ownerName", "") or "",
             }
+            self._remember_drone_confirmation_locked(map_id, event, int(datetime.now(tz=UTC).timestamp() * 1000))
         logger.info(
             "r2c drone_confirmed: map=%s remote_id=%s confirmed_by=%s mapped_id=%s",
             map_id,

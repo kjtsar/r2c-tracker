@@ -346,6 +346,92 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("1SAR7DJ", confirmed[0]["mappedId"])
             self.assertEqual("zone-alpha", confirmed[0]["confirmedByGuid"])
 
+    async def test_drone_confirmed_replays_to_late_zone_on_same_map(self):
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "drone_confirmed",
+            "mapId": "MAP1",
+            "remoteId": "RID-LATE",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "flightStartMsec": 1710000001000,
+            "mappedId": "1SAR7DJ",
+            "trackLabel": "1SAR7DJ",
+            "org": "NCSSAR",
+            "model": "Mavic 3",
+            "ownerName": "Pilot"
+        })
+
+        ws_charlie = FakeWebSocket()
+        await self.hub.connect(ws_charlie)
+        await self.hub.handle_message(ws_charlie, {
+            "type": "hello",
+            "mapId": "MAP1",
+            "zoneId": "zone-charlie",
+            "guid": "zone-charlie",
+            "name": "Charlie",
+            "lat": 39.3,
+            "lng": -121.3,
+        })
+
+        messages = [json.loads(text) for text in ws_charlie.sent_texts]
+        confirmed = [msg for msg in messages if msg.get("type") == "drone_confirmed"]
+        self.assertEqual(1, len(confirmed))
+        self.assertEqual("RID-LATE", confirmed[0]["remoteId"])
+        self.assertEqual("1SAR7DJ", confirmed[0]["mappedId"])
+
+    async def test_drone_confirmed_replays_when_standalone_zone_rehomes(self):
+        ws_charlie = FakeWebSocket()
+        await self.hub.connect(ws_charlie)
+
+        await self.hub.handle_message(ws_charlie, {
+            "type": "hello",
+            "mapId": "",
+            "zoneId": "zone-charlie",
+            "guid": "zone-charlie",
+            "name": "Charlie",
+            "lat": 40.0,
+            "lng": -122.0,
+        })
+        standalone_map_id = self.hub._connections[ws_charlie].map_id
+        await self.hub.handle_message(ws_charlie, {
+            "type": "drone_confirmed",
+            "mapId": "",
+            "remoteId": "RID-REHOME",
+            "zoneId": "zone-charlie",
+            "guid": "zone-charlie",
+            "flightStartMsec": 1710000001000,
+            "mappedId": "1SAR7DJ",
+            "trackLabel": "1SAR7DJ",
+            "org": "NCSSAR",
+            "model": "Mavic 3",
+            "ownerName": "Pilot"
+        })
+        self.ws_alpha.sent_texts.clear()
+        ws_charlie.sent_texts.clear()
+
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "hello",
+            "mapId": "MAP-LATE",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "name": "Alpha",
+            "lat": 40.0001,
+            "lng": -122.0001,
+        })
+        await self.hub.handle_message(ws_charlie, {
+            "type": "heartbeat",
+            "seq": 2,
+            "lat": 40.0002,
+            "lng": -122.0002,
+        })
+
+        self.assertEqual("MAP-LATE", self.hub._connections[ws_charlie].map_id)
+        self.assertNotIn(standalone_map_id, self.hub._zones_by_map)
+        alpha_messages = [json.loads(text) for text in self.ws_alpha.sent_texts]
+        alpha_confirmed = [msg for msg in alpha_messages if msg.get("type") == "drone_confirmed"]
+        self.assertEqual(1, len(alpha_confirmed))
+        self.assertEqual("RID-REHOME", alpha_confirmed[0]["remoteId"])
+
     async def test_sighting_relay_goes_to_current_owner(self):
         await self.hub.handle_message(self.ws_alpha, {
             "type": "first_sighting",

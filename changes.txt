@@ -1,6 +1,5 @@
-v1.4.11:
-* Improved standalone R2C coordination. Standalone instances now automatically
-  join nearby map-connected instances when colocated, even if the
-  map-connected peer appears later or is only visible through persisted tracker
-  state. This helps users who forget to connect to a map still participate in
-  local drone sharing.
+v1.4.12:
+* Fixed r2c-tracker coordination so drone confirmation saves are replayed to
+  nearby R2C instances that join or merge into the shared group shortly after
+  the save. This helps co-located tablets dismiss matching Drone Confirmation
+  panels reliably instead of waiting for the local flight to age out.
