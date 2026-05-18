@@ -256,6 +256,23 @@ class R2CDroneOwnerState(Base):
     updated_ms = Column(BigInteger, default=0)
 
 
+class R2CDroneConfirmationState(Base):
+    __tablename__ = "r2c_drone_confirmation_state"
+    id = Column(Integer, primary_key=True)
+    map_id = Column(String, index=True, nullable=False)
+    remote_id = Column(String, index=True, nullable=False)
+    zone_id = Column(String, default="")
+    guid = Column(String, default="")
+    confirmed_by_guid = Column(String, default="")
+    flight_start_msec = Column(BigInteger, default=0)
+    mapped_id = Column(String, default="")
+    track_label = Column(String, default="")
+    org = Column(String, default="")
+    model = Column(String, default="")
+    owner_name = Column(String, default="")
+    confirmed_at_ms = Column(BigInteger, default=0)
+
+
 class R2CRecentSighting(Base):
     __tablename__ = "r2c_recent_sighting"
     id = Column(Integer, primary_key=True)
@@ -280,6 +297,8 @@ async def migrate_r2c_coordination_schema():
         ("r2c_drone_owner_state", "first_drone_ts"),
         ("r2c_drone_owner_state", "lease_expire_ms"),
         ("r2c_drone_owner_state", "updated_ms"),
+        ("r2c_drone_confirmation_state", "flight_start_msec"),
+        ("r2c_drone_confirmation_state", "confirmed_at_ms"),
         ("r2c_recent_sighting", "drone_ts"),
         ("r2c_recent_sighting", "received_ms"),
     ]
@@ -432,6 +451,7 @@ class R2CZoneConnection:
         self.connected_at_ms: int = 0
         self.hello_received_at_ms: int = 0
         self.last_seen_ms: int = 0
+        self.sent_confirmed_remote_ids: set[str] = set()
 
 
 class R2CCoordinationHub:
@@ -650,15 +670,55 @@ class R2CCoordinationHub:
             for event in self._confirmed_drones_by_map.get(map_id, {}).values()
         ]
 
+    def _forget_drone_confirmations_for_zone_locked(self, map_id: str, guid: str, zone_id: str):
+        if not map_id:
+            return
+        confirmations = self._confirmed_drones_by_map.get(map_id, {})
+        for remote_id, event in list(confirmations.items()):
+            confirmed_by_guid = str(event.get("confirmedByGuid", "") or event.get("guid", "") or "")
+            event_zone_id = str(event.get("zoneId", "") or "")
+            if (guid and confirmed_by_guid == guid) or (zone_id and event_zone_id == zone_id):
+                confirmations.pop(remote_id, None)
+        if not confirmations:
+            self._confirmed_drones_by_map.pop(map_id, None)
+
+    def _dedupe_confirmation_events(self, events: list[dict]) -> list[dict]:
+        by_remote_id: dict[str, dict] = {}
+        for event in events:
+            remote_id = str(event.get("remoteId", "") or "")
+            if not remote_id:
+                continue
+            existing = by_remote_id.get(remote_id)
+            if existing is None or int(event.get("confirmedAtMs", 0) or 0) >= int(existing.get("confirmedAtMs", 0) or 0):
+                by_remote_id[remote_id] = event
+        return list(by_remote_id.values())
+
+    async def _send_drone_confirmation_to_zone(self, zone: R2CZoneConnection, event: dict):
+        remote_id = str(event.get("remoteId", "") or "")
+        if not remote_id or remote_id in zone.sent_confirmed_remote_ids or zone.websocket is None:
+            return
+        try:
+            await zone.websocket.send_text(json.dumps(event))
+            zone.sent_confirmed_remote_ids.add(remote_id)
+        except Exception as e:
+            logger.warning("drone_confirmed send failed for %s/%s: %s", event.get("mapId", ""), zone.zone_id, e)
+
+    async def _broadcast_drone_confirmation(self, map_id: str, event: dict):
+        async with self._lock:
+            recipients = [zone for zone in self._zones_by_map.get(map_id, {}).values() if zone.websocket is not None]
+        for zone in recipients:
+            await self._send_drone_confirmation_to_zone(zone, event)
+
     async def _send_recent_drone_confirmations(self, websocket: WebSocket, map_id: str, now_ms: int):
         async with self._lock:
+            zone = self._connections.get(websocket)
             events = self._recent_drone_confirmations_locked(map_id, now_ms)
+        events.extend(await self._load_recent_confirmation_events(map_id, now_ms))
+        events = self._dedupe_confirmation_events(events)
+        if zone is None:
+            return
         for event in events:
-            try:
-                await websocket.send_text(json.dumps(event))
-            except Exception as e:
-                logger.warning("drone_confirmed replay failed for %s: %s", map_id, e)
-                return
+            await self._send_drone_confirmation_to_zone(zone, event)
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -683,15 +743,19 @@ class R2CCoordinationHub:
             connected_at_ms = conn.connected_at_ms
             hello_received_at_ms = conn.hello_received_at_ms
             last_seen_ms = conn.last_seen_ms
+            should_mark_zone_offline = False
             if map_id and zone_id:
                 zones = self._zones_by_map.get(map_id, {})
                 tracked = zones.get(zone_id)
                 if tracked is conn:
                     conn.websocket = None
+                    should_mark_zone_offline = True
+            if should_mark_zone_offline:
+                self._forget_drone_confirmations_for_zone_locked(map_id, zone_guid, zone_id)
             reported_map_id = conn.reported_map_id
             coordination_mode = conn.coordination_mode
         now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
-        if map_id and zone_id:
+        if map_id and zone_id and should_mark_zone_offline:
             logger.info(
                 "r2c websocket disconnected: map=%s zone=%s guid=%s conn_age_ms=%s hello_age_ms=%s last_seen_age_ms=%s",
                 map_id,
@@ -714,6 +778,7 @@ class R2CCoordinationHub:
                 reported_map_id,
                 coordination_mode,
             )
+            await self._delete_confirmation_state_for_zone(map_id, zone_guid, zone_id)
         if map_id:
             await self.broadcast_zone_update(map_id)
 
@@ -938,7 +1003,7 @@ class R2CCoordinationHub:
             await self.broadcast_zone_update(old_map_id_for_update)
         for event in confirmation_replays:
             if map_id:
-                await self.broadcast(map_id, event)
+                await self._broadcast_drone_confirmation(map_id, event)
 
     async def _handle_first_sighting(self, websocket: WebSocket, payload: dict):
         remote_id = payload.get("remoteId", "")
@@ -1044,6 +1109,7 @@ class R2CCoordinationHub:
 
     async def _handle_drone_confirmed(self, websocket: WebSocket, payload: dict):
         remote_id = payload.get("remoteId", "")
+        now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
         async with self._lock:
             conn = self._connections.get(websocket)
             if conn is None:
@@ -1065,7 +1131,8 @@ class R2CCoordinationHub:
                 "model": payload.get("model", "") or "",
                 "ownerName": payload.get("ownerName", "") or "",
             }
-            self._remember_drone_confirmation_locked(map_id, event, int(datetime.now(tz=UTC).timestamp() * 1000))
+            self._remember_drone_confirmation_locked(map_id, event, now_ms)
+        await self._upsert_confirmation_state(map_id, event, now_ms)
         logger.info(
             "r2c drone_confirmed: map=%s remote_id=%s confirmed_by=%s mapped_id=%s",
             map_id,
@@ -1073,7 +1140,7 @@ class R2CCoordinationHub:
             event["confirmedByGuid"],
             event["mappedId"],
         )
-        await self.broadcast(map_id, event)
+        await self._broadcast_drone_confirmation(map_id, event)
 
     async def _handle_drone_lost(self, websocket: WebSocket, payload: dict):
         remote_id = payload.get("remoteId", "")
@@ -1371,6 +1438,122 @@ class R2CCoordinationHub:
             if state is not None:
                 await session.delete(state)
                 await session.commit()
+
+    async def _upsert_confirmation_state(self, map_id: str, event: dict, confirmed_at_ms: int):
+        remote_id = str(event.get("remoteId", "") or "")
+        if not map_id or not remote_id:
+            return
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(R2CDroneConfirmationState).where(
+                    R2CDroneConfirmationState.map_id == map_id,
+                    R2CDroneConfirmationState.remote_id == remote_id
+                )
+            )
+            state = result.scalar_one_or_none()
+            if state is None:
+                state = R2CDroneConfirmationState(map_id=map_id, remote_id=remote_id)
+                session.add(state)
+            state.zone_id = event.get("zoneId", "") or ""
+            state.guid = event.get("guid", "") or ""
+            state.confirmed_by_guid = event.get("confirmedByGuid", "") or ""
+            state.flight_start_msec = int(event.get("flightStartMsec", 0) or 0)
+            state.mapped_id = event.get("mappedId", "") or ""
+            state.track_label = event.get("trackLabel", "") or ""
+            state.org = event.get("org", "") or ""
+            state.model = event.get("model", "") or ""
+            state.owner_name = event.get("ownerName", "") or ""
+            state.confirmed_at_ms = confirmed_at_ms
+            cutoff_ms = confirmed_at_ms - self.CONFIRMATION_RETENTION_MS
+            result = await session.execute(
+                select(R2CDroneConfirmationState).where(
+                    R2CDroneConfirmationState.confirmed_at_ms < cutoff_ms
+                )
+            )
+            for stale in result.scalars().all():
+                await session.delete(stale)
+            await session.commit()
+
+    async def _delete_confirmation_state_for_zone(self, map_id: str, guid: str, zone_id: str):
+        if not map_id or (not guid and not zone_id):
+            return
+        async with AsyncSessionLocal() as session:
+            conditions = [R2CDroneConfirmationState.map_id == map_id]
+            zone_conditions = []
+            if guid:
+                zone_conditions.append(R2CDroneConfirmationState.confirmed_by_guid == guid)
+                zone_conditions.append(R2CDroneConfirmationState.guid == guid)
+            if zone_id:
+                zone_conditions.append(R2CDroneConfirmationState.zone_id == zone_id)
+            result = await session.execute(
+                select(R2CDroneConfirmationState).where(and_(*conditions), or_(*zone_conditions))
+            )
+            deleted_count = 0
+            for state in result.scalars().all():
+                await session.delete(state)
+                deleted_count += 1
+            await session.commit()
+        if deleted_count:
+            logger.info(
+                "r2c cleared drone confirmation state for disconnected zone: map=%s zone=%s guid=%s count=%s",
+                map_id,
+                zone_id,
+                guid,
+                deleted_count,
+            )
+
+    async def _load_recent_confirmation_events(self, map_id: str, now_ms: int) -> list[dict]:
+        cutoff_ms = now_ms - self.CONFIRMATION_RETENTION_MS
+        recent_zone_cutoff_ms = now_ms - (R2C_LEASE_SEC * 1000)
+        async with AsyncSessionLocal() as session:
+            confirmation_result = await session.execute(
+                select(R2CDroneConfirmationState).where(
+                    R2CDroneConfirmationState.map_id == map_id,
+                    R2CDroneConfirmationState.confirmed_at_ms >= cutoff_ms
+                )
+            )
+            zone_result = await session.execute(
+                select(R2CZoneState).where(
+                    R2CZoneState.map_id == map_id,
+                    R2CZoneState.online == True,
+                    R2CZoneState.last_seen_ms >= recent_zone_cutoff_ms,
+                )
+            )
+            active_zone_keys = set()
+            for zone in zone_result.scalars().all():
+                active_zone_keys.add(str(zone.zone_id or ""))
+                active_zone_keys.add(str(zone.guid or ""))
+            events = []
+            stale_states = []
+            for state in confirmation_result.scalars().all():
+                confirmer_keys = {
+                    str(state.confirmed_by_guid or ""),
+                    str(state.guid or ""),
+                    str(state.zone_id or ""),
+                }
+                if not any(key and key in active_zone_keys for key in confirmer_keys):
+                    stale_states.append(state)
+                    continue
+                events.append({
+                    "type": "drone_confirmed",
+                    "mapId": state.map_id,
+                    "remoteId": state.remote_id,
+                    "zoneId": state.zone_id,
+                    "guid": state.guid,
+                    "confirmedByGuid": state.confirmed_by_guid,
+                    "flightStartMsec": int(state.flight_start_msec or 0),
+                    "mappedId": state.mapped_id or "",
+                    "trackLabel": state.track_label or state.mapped_id or "",
+                    "org": state.org or "",
+                    "model": state.model or "",
+                    "ownerName": state.owner_name or "",
+                    "confirmedAtMs": int(state.confirmed_at_ms or 0),
+                })
+            for state in stale_states:
+                await session.delete(state)
+            if stale_states:
+                await session.commit()
+            return events
 
     async def _record_sighting(self, map_id: str, remote_id: str, zone_id: str, guid: str,
                                drone_ts: int, lat: float, lng: float, alt_m: float):
@@ -3029,7 +3212,7 @@ async def download_all_flight_logs_archive(
         print(f"Error creating archive: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to create archive: {e}")
 
-@app.get("/flightlogs/archive/current-year", response_class=Response, responses={
+@app.get("/flightlogs/archive/current-year", response_class=FileResponse, responses={
     200: {
         "content": {"application/gzip": {}},
         "description": "Return compressed archive of flight logs.",
@@ -3056,7 +3239,6 @@ async def download_current_year_flight_logs_archive(
         temp_archive_path = os.path.join(tmp_dir, archive_filename)
         with tarfile.open(temp_archive_path, "w:gz") as tar:
             tar.add(year_log_path, arcname=os.path.basename(year_log_path))
-        os.unlink(temp_archive_path)
         bg_tasks.add_task(os.unlink, temp_archive_path)
         return FileResponse(temp_archive_path, media_type="application/gzip", filename=archive_filename)
 

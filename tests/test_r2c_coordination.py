@@ -46,6 +46,7 @@ def load_coordination_classes():
 
 
 _, BaseHub, MANAGER_BROADCASTS = load_coordination_classes()
+R2C_LEASE_SEC = 45
 
 
 def load_token_helpers():
@@ -77,21 +78,40 @@ class FakeWebSocket:
 
 
 class TestHub(BaseHub):
-    def __init__(self):
+    def __init__(self, confirmation_store=None, zone_store=None):
         super().__init__()
         self.zone_state_updates = []
         self.zone_state_deletes = []
         self.persisted_mapped_map_id = None
+        self.confirmation_store = confirmation_store if confirmation_store is not None else {}
+        self.zone_store = zone_store if zone_store is not None else {}
 
     async def _load_state(self):
         return
 
     async def _upsert_zone_state(self, *args, **kwargs):
         self.zone_state_updates.append((args, kwargs))
+        if len(args) >= 11:
+            map_id, zone_id, guid, name, lat, lng, caltopo_rtt_ms, online, last_seen_ms, reported_map_id, coordination_mode = args[:11]
+            self.zone_store[(map_id, zone_id)] = {
+                "mapId": map_id,
+                "zoneId": zone_id,
+                "guid": guid,
+                "name": name,
+                "lat": lat,
+                "lng": lng,
+                "caltopoRttMs": caltopo_rtt_ms,
+                "online": online,
+                "lastSeenMs": last_seen_ms,
+                "reportedMapId": reported_map_id,
+                "coordinationMode": coordination_mode,
+            }
         return
 
     async def _delete_zone_state(self, *args, **kwargs):
         self.zone_state_deletes.append((args, kwargs))
+        if len(args) >= 2:
+            self.zone_store.pop((args[0], args[1]), None)
         return
 
     async def _delete_stale_zones(self, *args, **kwargs):
@@ -102,6 +122,43 @@ class TestHub(BaseHub):
 
     async def _delete_owner_state(self, *args, **kwargs):
         return
+
+    async def _upsert_confirmation_state(self, map_id, event, confirmed_at_ms):
+        stored = dict(event)
+        stored["confirmedAtMs"] = confirmed_at_ms
+        self.confirmation_store[(map_id, event["remoteId"])] = stored
+
+    async def _delete_confirmation_state_for_zone(self, map_id, guid, zone_id):
+        for (stored_map_id, remote_id), event in list(self.confirmation_store.items()):
+            confirmed_by_guid = event.get("confirmedByGuid") or event.get("guid") or ""
+            event_zone_id = event.get("zoneId") or ""
+            if stored_map_id == map_id and ((guid and confirmed_by_guid == guid) or (zone_id and event_zone_id == zone_id)):
+                self.confirmation_store.pop((stored_map_id, remote_id), None)
+
+    async def _load_recent_confirmation_events(self, map_id, now_ms):
+        cutoff_ms = now_ms - self.CONFIRMATION_RETENTION_MS
+        recent_zone_cutoff_ms = now_ms - (R2C_LEASE_SEC * 1000)
+        active_zone_keys = set()
+        for (stored_map_id, _), zone in self.zone_store.items():
+            if stored_map_id != map_id or not zone.get("online"):
+                continue
+            if int(zone.get("lastSeenMs", 0) or 0) < recent_zone_cutoff_ms:
+                continue
+            active_zone_keys.add(zone.get("zoneId") or "")
+            active_zone_keys.add(zone.get("guid") or "")
+        return [
+            dict(event)
+            for (stored_map_id, _), event in self.confirmation_store.items()
+            if stored_map_id == map_id and int(event.get("confirmedAtMs", 0) or 0) >= cutoff_ms
+            and any(
+                key and key in active_zone_keys
+                for key in (
+                    event.get("confirmedByGuid") or "",
+                    event.get("guid") or "",
+                    event.get("zoneId") or "",
+                )
+            )
+        ]
 
     async def _record_sighting(self, *args, **kwargs):
         return
@@ -378,6 +435,112 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(confirmed))
         self.assertEqual("RID-LATE", confirmed[0]["remoteId"])
         self.assertEqual("1SAR7DJ", confirmed[0]["mappedId"])
+
+    async def test_drone_confirmed_replays_across_hub_instances_on_hello(self):
+        shared_confirmations = {}
+        shared_zones = {}
+        hub_a = TestHub(shared_confirmations, shared_zones)
+        hub_b = TestHub(shared_confirmations, shared_zones)
+        ws_alpha = FakeWebSocket()
+        ws_bravo = FakeWebSocket()
+        await hub_a.connect(ws_alpha)
+        await hub_b.connect(ws_bravo)
+        await hub_a.handle_message(ws_alpha, {
+            "type": "hello",
+            "mapId": "MAP1",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "name": "Alpha",
+            "lat": 39.1,
+            "lng": -121.1,
+        })
+        await hub_b.handle_message(ws_bravo, {
+            "type": "hello",
+            "mapId": "MAP1",
+            "zoneId": "zone-bravo",
+            "guid": "zone-bravo",
+            "name": "Bravo",
+            "lat": 39.2,
+            "lng": -121.2,
+        })
+        ws_bravo.sent_texts.clear()
+
+        await hub_a.handle_message(ws_alpha, {
+            "type": "drone_confirmed",
+            "mapId": "MAP1",
+            "remoteId": "RID-CROSS-INSTANCE",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "flightStartMsec": 1710000001000,
+            "mappedId": "1SAR7DJ",
+            "trackLabel": "1SAR7DJ",
+            "org": "NCSSAR",
+            "model": "Mavic 3",
+            "ownerName": "Pilot"
+        })
+        ws_bravo_reconnect = FakeWebSocket()
+        await hub_b.connect(ws_bravo_reconnect)
+        await hub_b.handle_message(ws_bravo_reconnect, {
+            "type": "hello",
+            "mapId": "MAP1",
+            "zoneId": "zone-bravo-reconnect",
+            "guid": "zone-bravo-reconnect",
+            "name": "Bravo",
+            "lat": 39.2,
+            "lng": -121.2,
+        })
+
+        messages = [json.loads(text) for text in ws_bravo_reconnect.sent_texts]
+        confirmed = [msg for msg in messages if msg.get("type") == "drone_confirmed"]
+        self.assertEqual(1, len(confirmed))
+        self.assertEqual("RID-CROSS-INSTANCE", confirmed[0]["remoteId"])
+        self.assertEqual("1SAR7DJ", confirmed[0]["mappedId"])
+
+    async def test_drone_confirmed_does_not_replay_after_confirming_zone_disconnects(self):
+        shared_confirmations = {}
+        shared_zones = {}
+        hub_a = TestHub(shared_confirmations, shared_zones)
+        hub_b = TestHub(shared_confirmations, shared_zones)
+        ws_alpha = FakeWebSocket()
+        await hub_a.connect(ws_alpha)
+        await hub_a.handle_message(ws_alpha, {
+            "type": "hello",
+            "mapId": "MAP1",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "name": "Alpha",
+            "lat": 39.1,
+            "lng": -121.1,
+        })
+        await hub_a.handle_message(ws_alpha, {
+            "type": "drone_confirmed",
+            "mapId": "MAP1",
+            "remoteId": "RID-STALE-CONFIRMATION",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "flightStartMsec": 1710000001000,
+            "mappedId": "1SAR7DJ",
+            "trackLabel": "1SAR7DJ",
+        })
+
+        await hub_a.disconnect(ws_alpha)
+
+        ws_bravo = FakeWebSocket()
+        await hub_b.connect(ws_bravo)
+        await hub_b.handle_message(ws_bravo, {
+            "type": "hello",
+            "mapId": "MAP1",
+            "zoneId": "zone-bravo",
+            "guid": "zone-bravo",
+            "name": "Bravo",
+            "lat": 39.2,
+            "lng": -121.2,
+        })
+
+        messages = [json.loads(text) for text in ws_bravo.sent_texts]
+        confirmed = [msg for msg in messages if msg.get("type") == "drone_confirmed"]
+        self.assertEqual([], confirmed)
+        self.assertNotIn(("MAP1", "RID-STALE-CONFIRMATION"), shared_confirmations)
 
     async def test_drone_confirmed_replays_when_standalone_zone_rehomes(self):
         ws_charlie = FakeWebSocket()

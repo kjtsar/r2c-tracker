@@ -1,5 +1,2 @@
-v1.4.12:
-* Fixed r2c-tracker coordination so drone confirmation saves are replayed to
-  nearby R2C instances that join or merge into the shared group shortly after
-  the save. This helps co-located tablets dismiss matching Drone Confirmation
-  panels reliably instead of waiting for the local flight to age out.
+v1.4.14:
+* Address "Server Internal Error" during export of 2026 flight logs.
