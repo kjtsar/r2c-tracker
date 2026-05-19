@@ -1,2 +1,6 @@
-v1.4.14:
-* Address "Server Internal Error" during export of 2026 flight logs.
+v1.4.15: 
+* Fixed tracker-coordinated Drone Confirmation so each Save broadcasts as a
+  new event, even for the same drone Remote ID, while Ignore remains the only
+  action that suppresses future prompts.
+* Removed flightStartMsec from key - silly Codex. Gotta keep closer tabs...
+* Missing from untagged v1.1.13: Persist per-ws r2c coordination - tracker can run in multiple processes.

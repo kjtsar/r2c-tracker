@@ -264,7 +264,6 @@ class R2CDroneConfirmationState(Base):
     zone_id = Column(String, default="")
     guid = Column(String, default="")
     confirmed_by_guid = Column(String, default="")
-    flight_start_msec = Column(BigInteger, default=0)
     mapped_id = Column(String, default="")
     track_label = Column(String, default="")
     org = Column(String, default="")
@@ -297,7 +296,6 @@ async def migrate_r2c_coordination_schema():
         ("r2c_drone_owner_state", "first_drone_ts"),
         ("r2c_drone_owner_state", "lease_expire_ms"),
         ("r2c_drone_owner_state", "updated_ms"),
-        ("r2c_drone_confirmation_state", "flight_start_msec"),
         ("r2c_drone_confirmation_state", "confirmed_at_ms"),
         ("r2c_recent_sighting", "drone_ts"),
         ("r2c_recent_sighting", "received_ms"),
@@ -451,7 +449,7 @@ class R2CZoneConnection:
         self.connected_at_ms: int = 0
         self.hello_received_at_ms: int = 0
         self.last_seen_ms: int = 0
-        self.sent_confirmed_remote_ids: set[str] = set()
+        self.sent_confirmed_event_keys: set[str] = set()
 
 
 class R2CCoordinationHub:
@@ -467,6 +465,7 @@ class R2CCoordinationHub:
         self._zones_by_map: dict[str, dict[str, R2CZoneConnection]] = {}
         self._owners: dict[tuple[str, str], dict] = {}
         self._confirmed_drones_by_map: dict[str, dict[str, dict]] = {}
+        self._confirmation_event_seq: int = 0
         self._sweep_task: Optional[asyncio.Task] = None
         self._load_task: Optional[asyncio.Task] = None
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -670,6 +669,14 @@ class R2CCoordinationHub:
             for event in self._confirmed_drones_by_map.get(map_id, {}).values()
         ]
 
+    def _forget_drone_confirmation_locked(self, map_id: str, remote_id: str):
+        if not map_id or not remote_id:
+            return
+        confirmations = self._confirmed_drones_by_map.get(map_id, {})
+        confirmations.pop(remote_id, None)
+        if not confirmations:
+            self._confirmed_drones_by_map.pop(map_id, None)
+
     def _forget_drone_confirmations_for_zone_locked(self, map_id: str, guid: str, zone_id: str):
         if not map_id:
             return
@@ -695,11 +702,12 @@ class R2CCoordinationHub:
 
     async def _send_drone_confirmation_to_zone(self, zone: R2CZoneConnection, event: dict):
         remote_id = str(event.get("remoteId", "") or "")
-        if not remote_id or remote_id in zone.sent_confirmed_remote_ids or zone.websocket is None:
+        event_key = f"{remote_id}:{event.get('confirmationEventId') or int(event.get('confirmedAtMs', 0) or 0)}"
+        if not remote_id or event_key in zone.sent_confirmed_event_keys or zone.websocket is None:
             return
         try:
             await zone.websocket.send_text(json.dumps(event))
-            zone.sent_confirmed_remote_ids.add(remote_id)
+            zone.sent_confirmed_event_keys.add(event_key)
         except Exception as e:
             logger.warning("drone_confirmed send failed for %s/%s: %s", event.get("mapId", ""), zone.zone_id, e)
 
@@ -1117,6 +1125,7 @@ class R2CCoordinationHub:
             map_id, zone_id, guid = self._message_context(websocket, payload)
             if not map_id or not remote_id:
                 return
+            self._confirmation_event_seq += 1
             event = {
                 "type": "drone_confirmed",
                 "mapId": map_id,
@@ -1124,12 +1133,13 @@ class R2CCoordinationHub:
                 "zoneId": zone_id,
                 "guid": guid,
                 "confirmedByGuid": guid,
-                "flightStartMsec": int(payload.get("flightStartMsec", 0) or 0),
                 "mappedId": payload.get("mappedId", "") or "",
                 "trackLabel": payload.get("trackLabel", "") or payload.get("mappedId", "") or "",
                 "org": payload.get("org", "") or "",
                 "model": payload.get("model", "") or "",
                 "ownerName": payload.get("ownerName", "") or "",
+                "confirmedAtMs": now_ms,
+                "confirmationEventId": self._confirmation_event_seq,
             }
             self._remember_drone_confirmation_locked(map_id, event, now_ms)
         await self._upsert_confirmation_state(map_id, event, now_ms)
@@ -1152,6 +1162,7 @@ class R2CCoordinationHub:
             owner = self._owners.get((map_id, remote_id))
             if owner and owner.get("owner_zone_id") == zone_id:
                 self._owners.pop((map_id, remote_id), None)
+                self._forget_drone_confirmation_locked(map_id, remote_id)
                 expired = True
         if expired:
             logger.info(
@@ -1162,6 +1173,7 @@ class R2CCoordinationHub:
                 zone_id,
             )
             await self._delete_owner_state(map_id, remote_id)
+            await self._delete_confirmation_state(map_id, remote_id)
             await self.broadcast(
                 map_id,
                 {
@@ -1332,6 +1344,7 @@ class R2CCoordinationHub:
                 if int(owner.get("lease_expire_ms", 0) or 0) < now_ms:
                     expired_owners.append((map_id, remote_id, owner.get("owner_guid", "")))
                     self._owners.pop((map_id, remote_id), None)
+                    self._forget_drone_confirmation_locked(map_id, remote_id)
         for map_id in expired_maps:
             await self._delete_stale_zones(map_id, stale_cutoff_ms)
             await self.broadcast_zone_update(map_id)
@@ -1343,6 +1356,7 @@ class R2CCoordinationHub:
                 owner_guid,
             )
             await self._delete_owner_state(map_id, remote_id)
+            await self._delete_confirmation_state(map_id, remote_id)
             await self.broadcast(
                 map_id,
                 {
@@ -1457,7 +1471,6 @@ class R2CCoordinationHub:
             state.zone_id = event.get("zoneId", "") or ""
             state.guid = event.get("guid", "") or ""
             state.confirmed_by_guid = event.get("confirmedByGuid", "") or ""
-            state.flight_start_msec = int(event.get("flightStartMsec", 0) or 0)
             state.mapped_id = event.get("mappedId", "") or ""
             state.track_label = event.get("trackLabel", "") or ""
             state.org = event.get("org", "") or ""
@@ -1473,6 +1486,29 @@ class R2CCoordinationHub:
             for stale in result.scalars().all():
                 await session.delete(stale)
             await session.commit()
+
+    async def _delete_confirmation_state(self, map_id: str, remote_id: str):
+        if not map_id or not remote_id:
+            return
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(R2CDroneConfirmationState).where(
+                    R2CDroneConfirmationState.map_id == map_id,
+                    R2CDroneConfirmationState.remote_id == remote_id
+                )
+            )
+            deleted_count = 0
+            for state in result.scalars().all():
+                await session.delete(state)
+                deleted_count += 1
+            await session.commit()
+        if deleted_count:
+            logger.info(
+                "r2c cleared drone confirmation state for ended flight: map=%s remote_id=%s count=%s",
+                map_id,
+                remote_id,
+                deleted_count,
+            )
 
     async def _delete_confirmation_state_for_zone(self, map_id: str, guid: str, zone_id: str):
         if not map_id or (not guid and not zone_id):
@@ -1541,7 +1577,6 @@ class R2CCoordinationHub:
                     "zoneId": state.zone_id,
                     "guid": state.guid,
                     "confirmedByGuid": state.confirmed_by_guid,
-                    "flightStartMsec": int(state.flight_start_msec or 0),
                     "mappedId": state.mapped_id or "",
                     "trackLabel": state.track_label or state.mapped_id or "",
                     "org": state.org or "",

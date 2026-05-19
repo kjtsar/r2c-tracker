@@ -225,7 +225,6 @@ sends:
   "remoteId": "RID-123",
   "zoneId": "zone-alpha",
   "guid": "zone-alpha",
-  "flightStartMsec": 1710000001000,
   "mappedId": "1SAR7DJ",
   "org": "NCSSAR",
   "model": "Mavic 3",
@@ -235,9 +234,9 @@ sends:
 
 The tracker validates the sender is connected to the requested `mapId` and
 broadcasts the event to every online zone on that map, including the sender.
-Clients treat the `remoteId` as already handled for the rest of that app
-lifecycle, so they dismiss any matching active confirmation panel and do not
-queue future panels for that drone until restart.
+Clients treat the `remoteId` as already handled only for the current active
+tracker flight, so they dismiss any matching active confirmation panel without
+suppressing prompts for later flights.
 
 ## Ownership release and expiry
 

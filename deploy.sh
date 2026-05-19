@@ -130,6 +130,7 @@ echo "Wrote Cloud Run env vars file to ${ENV_VARS_FILE}."
 echo "Deploying ${SERVICE_NAME} version ${TRACKER_VERSION} to Cloud Run in ${REGION}..."
 
 WEB_REQUEST_TIMEOUT="${WEB_REQUEST_TIMEOUT:-3600s}"
+ACTIVATE_LATEST_REVISION="${ACTIVATE_LATEST_REVISION:-1}"
 
 run_gcloud run deploy "${SERVICE_NAME}" \
   --source . \
@@ -140,3 +141,13 @@ run_gcloud run deploy "${SERVICE_NAME}" \
   --max-instances 1 \
   --env-vars-file "${ENV_VARS_FILE}" \
   --set-secrets "SECRET_KEY=${SECRET_KEY_SECRET_NAME}:latest"
+
+if [ "${ACTIVATE_LATEST_REVISION}" = "1" ]; then
+  echo "Routing 100% of ${SERVICE_NAME} traffic to the latest ready revision..."
+  run_gcloud run services update-traffic "${SERVICE_NAME}" \
+    --region "${REGION}" \
+    --project "${GCLOUD_PROJECT}" \
+    --to-latest
+else
+  echo "Leaving Cloud Run traffic unchanged because ACTIVATE_LATEST_REVISION=${ACTIVATE_LATEST_REVISION}."
+fi

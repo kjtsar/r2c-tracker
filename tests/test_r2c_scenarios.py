@@ -83,6 +83,18 @@ class ScenarioHub(BaseHub):
         self.owner_deletes.append((args, kwargs))
         return
 
+    async def _upsert_confirmation_state(self, *args, **kwargs):
+        return
+
+    async def _delete_confirmation_state(self, *args, **kwargs):
+        return
+
+    async def _delete_confirmation_state_for_zone(self, *args, **kwargs):
+        return
+
+    async def _load_recent_confirmation_events(self, *args, **kwargs):
+        return []
+
     async def _record_sighting(self, *args, **kwargs):
         self.recorded_sightings.append((args, kwargs))
         return

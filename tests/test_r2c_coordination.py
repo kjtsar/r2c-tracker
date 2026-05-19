@@ -128,6 +128,9 @@ class TestHub(BaseHub):
         stored["confirmedAtMs"] = confirmed_at_ms
         self.confirmation_store[(map_id, event["remoteId"])] = stored
 
+    async def _delete_confirmation_state(self, map_id, remote_id):
+        self.confirmation_store.pop((map_id, remote_id), None)
+
     async def _delete_confirmation_state_for_zone(self, map_id, guid, zone_id):
         for (stored_map_id, remote_id), event in list(self.confirmation_store.items()):
             confirmed_by_guid = event.get("confirmedByGuid") or event.get("guid") or ""
@@ -387,7 +390,6 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
             "remoteId": "RID-CONFIRM",
             "zoneId": "zone-alpha",
             "guid": "zone-alpha",
-            "flightStartMsec": 1710000001000,
             "mappedId": "1SAR7DJ",
             "trackLabel": "1SAR7DJ",
             "org": "NCSSAR",
@@ -403,6 +405,32 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("1SAR7DJ", confirmed[0]["mappedId"])
             self.assertEqual("zone-alpha", confirmed[0]["confirmedByGuid"])
 
+    async def test_drone_confirmed_broadcasts_repeated_remote_id_as_new_event(self):
+        self.ws_alpha.sent_texts.clear()
+        self.ws_bravo.sent_texts.clear()
+
+        payload = {
+            "type": "drone_confirmed",
+            "mapId": "MAP1",
+            "remoteId": "RID-CONFIRM",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "mappedId": "1SAR7DJ",
+            "trackLabel": "1SAR7DJ",
+            "org": "NCSSAR",
+            "model": "Mavic 3",
+            "ownerName": "Pilot"
+        }
+
+        await self.hub.handle_message(self.ws_alpha, payload)
+        await self.hub.handle_message(self.ws_alpha, dict(payload, ownerName="Pilot 2"))
+
+        for ws in (self.ws_alpha, self.ws_bravo):
+            messages = [json.loads(text) for text in ws.sent_texts]
+            confirmed = [msg for msg in messages if msg.get("type") == "drone_confirmed"]
+            self.assertEqual(2, len(confirmed))
+            self.assertEqual(["Pilot", "Pilot 2"], [msg["ownerName"] for msg in confirmed])
+
     async def test_drone_confirmed_replays_to_late_zone_on_same_map(self):
         await self.hub.handle_message(self.ws_alpha, {
             "type": "drone_confirmed",
@@ -410,7 +438,6 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
             "remoteId": "RID-LATE",
             "zoneId": "zone-alpha",
             "guid": "zone-alpha",
-            "flightStartMsec": 1710000001000,
             "mappedId": "1SAR7DJ",
             "trackLabel": "1SAR7DJ",
             "org": "NCSSAR",
@@ -435,6 +462,62 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(confirmed))
         self.assertEqual("RID-LATE", confirmed[0]["remoteId"])
         self.assertEqual("1SAR7DJ", confirmed[0]["mappedId"])
+
+    async def test_drone_confirmed_does_not_replay_after_owner_drone_lost(self):
+        shared_confirmations = {}
+        hub = TestHub(shared_confirmations, {})
+        ws_alpha = FakeWebSocket()
+        ws_bravo = FakeWebSocket()
+        await hub.connect(ws_alpha)
+        await hub.connect(ws_bravo)
+        await hub.handle_message(ws_alpha, {
+            "type": "hello",
+            "mapId": "MAP1",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "name": "Alpha",
+            "lat": 39.1,
+            "lng": -121.1,
+        })
+        await hub.handle_message(ws_alpha, {
+            "type": "first_sighting",
+            "mapId": "MAP1",
+            "remoteId": "RID-ENDS",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "droneTs": 1710000001000,
+            "distanceFromZoneM": 10.0,
+        })
+        await hub.handle_message(ws_alpha, {
+            "type": "drone_confirmed",
+            "mapId": "MAP1",
+            "remoteId": "RID-ENDS",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "mappedId": "1SAR7DJ",
+            "trackLabel": "1SAR7DJ",
+        })
+        await hub.handle_message(ws_alpha, {
+            "type": "drone_lost",
+            "mapId": "MAP1",
+            "remoteId": "RID-ENDS",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+        })
+        await hub.handle_message(ws_bravo, {
+            "type": "hello",
+            "mapId": "MAP1",
+            "zoneId": "zone-bravo",
+            "guid": "zone-bravo",
+            "name": "Bravo",
+            "lat": 39.2,
+            "lng": -121.2,
+        })
+
+        messages = [json.loads(text) for text in ws_bravo.sent_texts]
+        confirmed = [msg for msg in messages if msg.get("type") == "drone_confirmed"]
+        self.assertEqual([], confirmed)
+        self.assertNotIn(("MAP1", "RID-ENDS"), shared_confirmations)
 
     async def test_drone_confirmed_replays_across_hub_instances_on_hello(self):
         shared_confirmations = {}
@@ -471,7 +554,6 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
             "remoteId": "RID-CROSS-INSTANCE",
             "zoneId": "zone-alpha",
             "guid": "zone-alpha",
-            "flightStartMsec": 1710000001000,
             "mappedId": "1SAR7DJ",
             "trackLabel": "1SAR7DJ",
             "org": "NCSSAR",
@@ -518,7 +600,6 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
             "remoteId": "RID-STALE-CONFIRMATION",
             "zoneId": "zone-alpha",
             "guid": "zone-alpha",
-            "flightStartMsec": 1710000001000,
             "mappedId": "1SAR7DJ",
             "trackLabel": "1SAR7DJ",
         })
@@ -562,7 +643,6 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
             "remoteId": "RID-REHOME",
             "zoneId": "zone-charlie",
             "guid": "zone-charlie",
-            "flightStartMsec": 1710000001000,
             "mappedId": "1SAR7DJ",
             "trackLabel": "1SAR7DJ",
             "org": "NCSSAR",
@@ -661,6 +741,17 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
             "mappedId": "1sar7Dj"
         })
 
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "drone_confirmed",
+            "mapId": "MAP1",
+            "remoteId": "DRONE3",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "mappedId": "1SAR7DJ",
+            "trackLabel": "1SAR7DJ",
+        })
+        self.assertIn("DRONE3", self.hub._confirmed_drones_by_map.get("MAP1", {}))
+
         owner = self.hub._owners[("MAP1", "DRONE3")]
         owner["lease_expire_ms"] = 1
         alpha_conn = self.hub._zones_by_map["MAP1"]["zone-alpha"]
@@ -670,6 +761,7 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
         await self.hub.expire_stale_entries()
 
         self.assertNotIn(("MAP1", "DRONE3"), self.hub._owners)
+        self.assertNotIn("DRONE3", self.hub._confirmed_drones_by_map.get("MAP1", {}))
 
     async def test_disconnect_marks_zone_offline_without_immediate_owner_expiry(self):
         await self.hub.handle_message(self.ws_alpha, {

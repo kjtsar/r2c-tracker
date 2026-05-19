@@ -99,6 +99,9 @@ class TestHub(BaseHub):
     async def _upsert_confirmation_state(self, *args, **kwargs):
         return
 
+    async def _delete_confirmation_state(self, *args, **kwargs):
+        return
+
     async def _delete_confirmation_state_for_zone(self, *args, **kwargs):
         return
 

@@ -9,15 +9,22 @@ if [ ! -f "$CHANGES_FILE" ]; then
     exit 1
 fi
 
-# First non-empty line must be "vX.Y.Z:"
-VERSION="$(grep -m1 '^v[0-9]' "$CHANGES_FILE" | sed 's/:$//')"
+# First version line must be "vX.Y.Z:", with optional trailing whitespace.
+VERSION="$(grep -m1 '^v[0-9]' "$CHANGES_FILE" | sed 's/[[:space:]]*$//' | sed 's/:$//')"
 if [ -z "$VERSION" ]; then
     echo "Error: could not find a version line (e.g. 'v1.3.0:') in $CHANGES_FILE." >&2
     exit 1
 fi
 
-# Collect bullet lines under the version header
-BULLETS="$(awk '/^'"$VERSION"':/{found=1; next} found && /^\*/{print} found && /^$/{next} found && !/^\*/{exit}' "$CHANGES_FILE")"
+# Collect the notes under the version header, preserving wrapped bullets.
+BULLETS="$(awk -v version="$VERSION" '
+    { line=$0; sub(/[[:space:]]*$/, "", line) }
+    line == version ":" { found=1; next }
+    found && line ~ /^v[0-9][^:]*:$/ { exit }
+    found && /^[[:space:]]*\*/ { saw_bullet=1; print; next }
+    found && saw_bullet { print; next }
+    found && /^[[:space:]]*$/ { next }
+' "$CHANGES_FILE")"
 if [ -z "$BULLETS" ]; then
     echo "Error: no bullet points found under $VERSION in $CHANGES_FILE." >&2
     exit 1
