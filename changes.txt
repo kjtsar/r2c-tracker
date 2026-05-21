@@ -1,6 +1,4 @@
-v1.4.15: 
-* Fixed tracker-coordinated Drone Confirmation so each Save broadcasts as a
-  new event, even for the same drone Remote ID, while Ignore remains the only
-  action that suppresses future prompts.
-* Removed flightStartMsec from key - silly Codex. Gotta keep closer tabs...
-* Missing from untagged v1.1.13: Persist per-ws r2c coordination - tracker can run in multiple processes.
+v1.4.16:
+* Confirmation events now authoritatively update and broadcast tracker
+  ownership for the active drone lease, with normal cleanup on lease
+  expiry, lost-drone, or confirming-zone disconnect.

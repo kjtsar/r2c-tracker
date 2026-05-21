@@ -126,6 +126,10 @@ Effects:
 - zone position and `lastSeenMs` are refreshed
 - if this zone currently owns any drones, their leases are extended
 - the heartbeat only extends leases for drones owned by this zone's `guid`
+- idle clients may intentionally park their websocket when they have no active
+  drones, no owner leases, and no queued confirmation events. Parked clients
+  reconnect immediately before sending a new `first_sighting`, `sighting`,
+  `drone_lost`, or `drone_confirmed`.
 
 ### 3. First sighting / owner claim
 
@@ -210,6 +214,12 @@ The tracker forwards the payload only to the current owner as:
 Notes:
 
 - the owner does not receive its own `sighting` echoed back
+- owner-originated `sighting` messages refresh that owner's lease, so active
+  owner telemetry can keep ownership alive without a separate heartbeat
+- non-owner `sighting` messages do not refresh the owner lease; they prove drone
+  activity, not owner app health
+- RID2Caltopo throttles non-owner `sighting` sends per drone, currently to one
+  update every three seconds by default
 - if the owner zone is currently disconnected, the relay is skipped
 - recent relay breadcrumbs are mirrored into SQL for troubleshooting
 
@@ -273,8 +283,10 @@ Important behavior:
 - only the current owner zone can release ownership with `drone_lost`
 - a websocket disconnect marks a zone offline immediately, but ownership is not
   dropped until the lease expires
-- the default lease window is 45 seconds and the default heartbeat interval is
-  15 seconds
+- the default lease window is 45 seconds
+- heartbeat is a backup lease signal while an owner is connected but not sending
+  accepted owner telemetry; standby clients should park instead of heartbeating
+  forever
 
 ## Zone status broadcasts
 
@@ -330,6 +342,8 @@ Verify that owner assignment is stable across:
 Verify:
 
 - owner heartbeat extends only that owner's leases
+- owner-originated `sighting` extends only that owner's lease
+- non-owner relayed `sighting` does not extend the owner lease
 - disconnect marks zone offline without immediate ownership loss
 - expired leases emit `owner_expired`
 - non-owner `drone_lost` does not clear ownership

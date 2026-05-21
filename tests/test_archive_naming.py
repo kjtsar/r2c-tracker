@@ -1,6 +1,8 @@
 import pathlib
 import unittest
-from datetime import UTC, datetime
+from datetime import datetime, timezone
+
+UTC = timezone.utc
 
 
 def load_archive_helpers():

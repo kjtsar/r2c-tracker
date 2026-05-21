@@ -5,8 +5,10 @@ import pathlib
 import re
 import types
 import unittest
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Optional
+
+UTC = timezone.utc
 
 
 def load_coordination_classes():

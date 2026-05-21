@@ -1,5 +1,6 @@
 import pathlib
 import unittest
+from typing import Optional
 
 
 def load_admin_batch_parser():
@@ -8,7 +9,9 @@ def load_admin_batch_parser():
     start = source.index("def parse_admin_batch_form(")
     end = source.index("\n\nTF = TimezoneFinder()")
     snippet = source[start:end]
-    namespace = {}
+    namespace = {
+        "Optional": Optional,
+    }
     exec(snippet, namespace)
     return namespace["parse_admin_batch_form"]
 

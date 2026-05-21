@@ -737,6 +737,7 @@ class R2CCoordinationHub:
             self._connections[websocket] = conn
 
     async def disconnect(self, websocket: WebSocket):
+        confirmed_owner_expirations: list[tuple[str, str, str]] = []
         async with self._lock:
             conn = self._connections.pop(websocket, None)
             if conn is None:
@@ -760,6 +761,15 @@ class R2CCoordinationHub:
                     should_mark_zone_offline = True
             if should_mark_zone_offline:
                 self._forget_drone_confirmations_for_zone_locked(map_id, zone_guid, zone_id)
+                for (owner_map_id, remote_id), owner in list(self._owners.items()):
+                    if owner_map_id != map_id or owner.get("source") != "confirmation":
+                        continue
+                    owner_guid = str(owner.get("owner_guid", "") or "")
+                    owner_zone_id = str(owner.get("owner_zone_id", "") or "")
+                    if (zone_guid and owner_guid == zone_guid) or (zone_id and owner_zone_id == zone_id):
+                        self._owners.pop((owner_map_id, remote_id), None)
+                        self._forget_drone_confirmation_locked(owner_map_id, remote_id)
+                        confirmed_owner_expirations.append((owner_map_id, remote_id, owner_guid))
             reported_map_id = conn.reported_map_id
             coordination_mode = conn.coordination_mode
         now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
@@ -787,6 +797,23 @@ class R2CCoordinationHub:
                 coordination_mode,
             )
             await self._delete_confirmation_state_for_zone(map_id, zone_guid, zone_id)
+        for owner_map_id, remote_id, owner_guid in confirmed_owner_expirations:
+            logger.info(
+                "r2c owner_expired: map=%s remote_id=%s reason=confirming_zone_disconnect prev_owner_guid=%s",
+                owner_map_id,
+                remote_id,
+                owner_guid,
+            )
+            await self._delete_owner_state(owner_map_id, remote_id)
+            await self._delete_confirmation_state(owner_map_id, remote_id)
+            await self.broadcast(
+                owner_map_id,
+                {
+                    "type": "owner_expired",
+                    "remoteId": remote_id,
+                    "prevOwnerGuid": owner_guid
+                }
+            )
         if map_id:
             await self.broadcast_zone_update(map_id)
 
@@ -1015,10 +1042,12 @@ class R2CCoordinationHub:
 
     async def _handle_first_sighting(self, websocket: WebSocket, payload: dict):
         remote_id = payload.get("remoteId", "")
+        should_persist_owner = True
         async with self._lock:
             map_id, zone_id, guid = self._message_context(websocket, payload)
             if not map_id or not remote_id or not zone_id:
                 return
+            now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
             existing = self._owners.get((map_id, remote_id))
             candidate = {
                 "owner_guid": guid,
@@ -1031,13 +1060,23 @@ class R2CCoordinationHub:
             decision_reason = "initial_claim"
             if existing is None:
                 owner = candidate
+            elif existing.get("source") == "confirmation":
+                if int(existing.get("lease_expire_ms", 0) or 0) >= now_ms:
+                    owner = existing
+                    decision_reason = "confirmed_owner_active"
+                    should_persist_owner = False
+                else:
+                    owner = candidate
+                    candidate["lease_seq"] = int(existing.get("lease_seq", 0)) + 1
+                    decision_reason = "confirmed_owner_expired"
             else:
                 owner = self._pick_owner(existing, candidate)
                 decision_reason = "candidate_better" if owner is candidate else "existing_better"
                 if owner is candidate:
                     candidate["lease_seq"] = int(existing.get("lease_seq", 0)) + 1
-            owner["lease_expire_ms"] = int(datetime.now(tz=UTC).timestamp() * 1000) + (R2C_LEASE_SEC * 1000)
-            self._owners[(map_id, remote_id)] = owner
+            if should_persist_owner:
+                owner["lease_expire_ms"] = now_ms + (R2C_LEASE_SEC * 1000)
+                self._owners[(map_id, remote_id)] = owner
         logger.info(
             "r2c owner_decision: map=%s remote_id=%s reason=%s prev_owner_guid=%s prev_zone_id=%s "
             "prev_drone_ts=%s prev_distance_m=%s prev_mapped_id=%s candidate_guid=%s candidate_zone_id=%s "
@@ -1061,21 +1100,23 @@ class R2CCoordinationHub:
             owner.get("lease_seq", 0),
             owner.get("lease_expire_ms", 0),
         )
-        await self._upsert_owner_state(map_id, remote_id, owner)
-        await self.broadcast(
-            map_id,
-            {
-                "type": "owner_assigned",
-                "remoteId": remote_id,
-                "ownerGuid": owner["owner_guid"],
-                "ownerZoneId": owner["owner_zone_id"],
-                "leaseSeq": owner["lease_seq"],
-                "leaseExpireTs": owner["lease_expire_ms"]
-            }
-        )
+        if should_persist_owner:
+            await self._upsert_owner_state(map_id, remote_id, owner)
+            await self.broadcast(
+                map_id,
+                {
+                    "type": "owner_assigned",
+                    "remoteId": remote_id,
+                    "ownerGuid": owner["owner_guid"],
+                    "ownerZoneId": owner["owner_zone_id"],
+                    "leaseSeq": owner["lease_seq"],
+                    "leaseExpireTs": owner["lease_expire_ms"]
+                }
+            )
 
     async def _handle_sighting(self, websocket: WebSocket, payload: dict):
         remote_id = payload.get("remoteId", "")
+        owner_refresh: Optional[tuple[str, str, dict]] = None
         async with self._lock:
             map_id, from_zone_id, guid = self._message_context(websocket, payload)
             if not map_id or not remote_id:
@@ -1085,9 +1126,24 @@ class R2CCoordinationHub:
                 return
             owner_zone_id = owner.get("owner_zone_id", "")
             if from_zone_id and owner_zone_id == from_zone_id:
-                return
-            zones = self._zones_by_map.get(map_id, {})
-            target = zones.get(owner_zone_id)
+                now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
+                owner["lease_expire_ms"] = now_ms + (R2C_LEASE_SEC * 1000)
+                owner_refresh = (map_id, remote_id, dict(owner))
+                logger.info(
+                    "r2c owner_sighting_refresh: map=%s remote_id=%s owner_zone_id=%s lease_expire_ts=%s",
+                    map_id,
+                    remote_id,
+                    owner_zone_id,
+                    owner["lease_expire_ms"],
+                )
+                target = None
+            else:
+                zones = self._zones_by_map.get(map_id, {})
+                target = zones.get(owner_zone_id)
+        if owner_refresh is not None:
+            owner_map_id, owner_remote_id, owner_state = owner_refresh
+            await self._upsert_owner_state(owner_map_id, owner_remote_id, owner_state)
+            return
         if target is None or target.websocket is None:
             logger.warning(
                 "relay_sighting skipped: owner unavailable map=%s remote_id=%s owner_zone_id=%s",
@@ -1141,8 +1197,21 @@ class R2CCoordinationHub:
                 "confirmedAtMs": now_ms,
                 "confirmationEventId": self._confirmation_event_seq,
             }
+            existing_owner = self._owners.get((map_id, remote_id))
+            owner = {
+                "owner_guid": event.get("confirmedByGuid", "") or event.get("guid", ""),
+                "owner_zone_id": zone_id,
+                "drone_ts": int((existing_owner or {}).get("drone_ts", 0) or 0),
+                "distance_m": float((existing_owner or {}).get("distance_m", 0.0) or 0.0),
+                "mapped_id": event["mappedId"],
+                "lease_seq": int((existing_owner or {}).get("lease_seq", 0) or 0) + 1,
+                "lease_expire_ms": now_ms + (R2C_LEASE_SEC * 1000),
+                "source": "confirmation",
+            }
             self._remember_drone_confirmation_locked(map_id, event, now_ms)
+            self._owners[(map_id, remote_id)] = owner
         await self._upsert_confirmation_state(map_id, event, now_ms)
+        await self._upsert_owner_state(map_id, remote_id, owner)
         logger.info(
             "r2c drone_confirmed: map=%s remote_id=%s confirmed_by=%s mapped_id=%s",
             map_id,
@@ -1151,6 +1220,17 @@ class R2CCoordinationHub:
             event["mappedId"],
         )
         await self._broadcast_drone_confirmation(map_id, event)
+        await self.broadcast(
+            map_id,
+            {
+                "type": "owner_assigned",
+                "remoteId": remote_id,
+                "ownerGuid": owner["owner_guid"],
+                "ownerZoneId": owner["owner_zone_id"],
+                "leaseSeq": owner["lease_seq"],
+                "leaseExpireTs": owner["lease_expire_ms"]
+            }
+        )
 
     async def _handle_drone_lost(self, websocket: WebSocket, payload: dict):
         remote_id = payload.get("remoteId", "")

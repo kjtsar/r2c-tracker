@@ -5,8 +5,10 @@ import pathlib
 import re
 import types
 import unittest
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Optional
+
+UTC = timezone.utc
 
 
 def load_coordination_classes():
@@ -82,6 +84,8 @@ class TestHub(BaseHub):
         super().__init__()
         self.zone_state_updates = []
         self.zone_state_deletes = []
+        self.owner_state_updates = []
+        self.owner_state_deletes = []
         self.persisted_mapped_map_id = None
         self.confirmation_store = confirmation_store if confirmation_store is not None else {}
         self.zone_store = zone_store if zone_store is not None else {}
@@ -118,9 +122,11 @@ class TestHub(BaseHub):
         return
 
     async def _upsert_owner_state(self, *args, **kwargs):
+        self.owner_state_updates.append((args, kwargs))
         return
 
     async def _delete_owner_state(self, *args, **kwargs):
+        self.owner_state_deletes.append((args, kwargs))
         return
 
     async def _upsert_confirmation_state(self, map_id, event, confirmed_at_ms):
@@ -404,6 +410,132 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("RID-CONFIRM", confirmed[0]["remoteId"])
             self.assertEqual("1SAR7DJ", confirmed[0]["mappedId"])
             self.assertEqual("zone-alpha", confirmed[0]["confirmedByGuid"])
+
+    async def test_drone_confirmed_assigns_owner(self):
+        self.ws_alpha.sent_texts.clear()
+        self.ws_bravo.sent_texts.clear()
+
+        await self.hub.handle_message(self.ws_bravo, {
+            "type": "drone_confirmed",
+            "mapId": "MAP1",
+            "remoteId": "RID-SAVE-OWNER",
+            "zoneId": "zone-bravo",
+            "guid": "zone-bravo",
+            "mappedId": "1SAR7DJ",
+            "trackLabel": "1SAR7DJ",
+        })
+
+        owner = self.hub._owners[("MAP1", "RID-SAVE-OWNER")]
+        self.assertEqual("zone-bravo", owner["owner_guid"])
+        self.assertEqual("zone-bravo", owner["owner_zone_id"])
+        self.assertEqual("1SAR7DJ", owner["mapped_id"])
+        self.assertEqual(1, owner["lease_seq"])
+
+        for ws in (self.ws_alpha, self.ws_bravo):
+            messages = [json.loads(text) for text in ws.sent_texts]
+            confirmed = [msg for msg in messages if msg.get("type") == "drone_confirmed"]
+            assigned = [msg for msg in messages if msg.get("type") == "owner_assigned"]
+            self.assertEqual(1, len(confirmed))
+            self.assertEqual(1, len(assigned))
+            self.assertEqual("RID-SAVE-OWNER", assigned[0]["remoteId"])
+            self.assertEqual("zone-bravo", assigned[0]["ownerGuid"])
+            self.assertEqual("zone-bravo", assigned[0]["ownerZoneId"])
+
+    async def test_drone_confirmed_overrides_first_sighting_owner(self):
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "first_sighting",
+            "mapId": "MAP1",
+            "remoteId": "RID-SAVE-OVERRIDE",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "droneTs": 1000,
+            "distanceFromZoneM": 10.0,
+            "mappedId": "",
+        })
+
+        await self.hub.handle_message(self.ws_bravo, {
+            "type": "drone_confirmed",
+            "mapId": "MAP1",
+            "remoteId": "RID-SAVE-OVERRIDE",
+            "zoneId": "zone-bravo",
+            "guid": "zone-bravo",
+            "mappedId": "1SAR7DJ",
+            "trackLabel": "1SAR7DJ",
+        })
+
+        owner = self.hub._owners[("MAP1", "RID-SAVE-OVERRIDE")]
+        self.assertEqual("zone-bravo", owner["owner_guid"])
+        self.assertEqual("zone-bravo", owner["owner_zone_id"])
+        self.assertEqual(2, owner["lease_seq"])
+
+    async def test_first_sighting_does_not_steal_confirmed_owner(self):
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "first_sighting",
+            "mapId": "MAP1",
+            "remoteId": "RID-SAVE-PROTECTED",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "droneTs": 2000,
+            "distanceFromZoneM": 50.0,
+            "mappedId": "",
+        })
+        await self.hub.handle_message(self.ws_bravo, {
+            "type": "drone_confirmed",
+            "mapId": "MAP1",
+            "remoteId": "RID-SAVE-PROTECTED",
+            "zoneId": "zone-bravo",
+            "guid": "zone-bravo",
+            "mappedId": "1SAR7DJ",
+            "trackLabel": "1SAR7DJ",
+        })
+        self.ws_alpha.sent_texts.clear()
+        self.ws_bravo.sent_texts.clear()
+
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "first_sighting",
+            "mapId": "MAP1",
+            "remoteId": "RID-SAVE-PROTECTED",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "droneTs": 1000,
+            "distanceFromZoneM": 1.0,
+            "mappedId": "1SAR7DJ",
+        })
+
+        owner = self.hub._owners[("MAP1", "RID-SAVE-PROTECTED")]
+        self.assertEqual("zone-bravo", owner["owner_guid"])
+        self.assertEqual("zone-bravo", owner["owner_zone_id"])
+        self.assertEqual(2, owner["lease_seq"])
+        for ws in (self.ws_alpha, self.ws_bravo):
+            messages = [json.loads(text) for text in ws.sent_texts]
+            assigned = [msg for msg in messages if msg.get("type") == "owner_assigned"]
+            self.assertEqual([], assigned)
+
+    async def test_drone_lost_clears_confirmed_owner(self):
+        await self.hub.handle_message(self.ws_bravo, {
+            "type": "drone_confirmed",
+            "mapId": "MAP1",
+            "remoteId": "RID-SAVE-LOST",
+            "zoneId": "zone-bravo",
+            "guid": "zone-bravo",
+            "mappedId": "1SAR7DJ",
+            "trackLabel": "1SAR7DJ",
+        })
+        self.assertIn("RID-SAVE-LOST", self.hub._confirmed_drones_by_map.get("MAP1", {}))
+
+        await self.hub.handle_message(self.ws_bravo, {
+            "type": "drone_lost",
+            "mapId": "MAP1",
+            "remoteId": "RID-SAVE-LOST",
+            "zoneId": "zone-bravo",
+            "guid": "zone-bravo",
+        })
+
+        self.assertNotIn(("MAP1", "RID-SAVE-LOST"), self.hub._owners)
+        self.assertNotIn("RID-SAVE-LOST", self.hub._confirmed_drones_by_map.get("MAP1", {}))
+        self.assertNotIn(("MAP1", "RID-SAVE-LOST"), self.hub.confirmation_store)
+        self.assertEqual("MAP1", self.hub.owner_state_deletes[-1][0][0])
+        self.assertEqual("RID-SAVE-LOST", self.hub.owner_state_deletes[-1][0][1])
 
     async def test_drone_confirmed_broadcasts_repeated_remote_id_as_new_event(self):
         self.ws_alpha.sent_texts.clear()
@@ -728,6 +860,67 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
         })
 
         self.assertFalse(any("relay_sighting" in text for text in self.ws_alpha.sent_texts[before:]))
+
+    async def test_sighting_from_owner_refreshes_owner_lease(self):
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "first_sighting",
+            "mapId": "MAP1",
+            "remoteId": "DRONE2",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "droneTs": 1000,
+            "distanceFromZoneM": 10.0,
+            "mappedId": "1sar7Dj"
+        })
+        owner = self.hub._owners[("MAP1", "DRONE2")]
+        owner["lease_expire_ms"] = 1
+        before_messages = len(self.ws_alpha.sent_texts)
+        before_updates = len(self.hub.owner_state_updates)
+
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "sighting",
+            "mapId": "MAP1",
+            "remoteId": "DRONE2",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "droneTs": 1234,
+            "lat": 39.3,
+            "lng": -121.3,
+            "altM": 120.0
+        })
+
+        self.assertGreater(owner["lease_expire_ms"], 1)
+        self.assertEqual(before_messages, len(self.ws_alpha.sent_texts))
+        self.assertEqual(before_updates + 1, len(self.hub.owner_state_updates))
+
+    async def test_sighting_from_non_owner_does_not_refresh_owner_lease(self):
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "first_sighting",
+            "mapId": "MAP1",
+            "remoteId": "DRONE2",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "droneTs": 1000,
+            "distanceFromZoneM": 10.0,
+            "mappedId": "1sar7Dj"
+        })
+        owner = self.hub._owners[("MAP1", "DRONE2")]
+        owner["lease_expire_ms"] = 1
+
+        await self.hub.handle_message(self.ws_bravo, {
+            "type": "sighting",
+            "mapId": "MAP1",
+            "remoteId": "DRONE2",
+            "zoneId": "zone-bravo",
+            "guid": "zone-bravo",
+            "droneTs": 1234,
+            "lat": 39.3,
+            "lng": -121.3,
+            "altM": 120.0
+        })
+
+        self.assertEqual(1, owner["lease_expire_ms"])
+        self.assertTrue(any("relay_sighting" in text for text in self.ws_alpha.sent_texts))
 
     async def test_expire_stale_entries_expires_owner_without_heartbeat(self):
         await self.hub.handle_message(self.ws_alpha, {
