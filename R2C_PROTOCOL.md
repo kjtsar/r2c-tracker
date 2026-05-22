@@ -1,50 +1,54 @@
 # RID2Caltopo Multi-Zone Coordination Protocol
 
-This document describes the coordination behavior implemented by
-`r2c-tracker` on `/ws/r2c`. The goal is to make RID detection and reporting
-predictable when several RID2Caltopo zones are watching the same Caltopo map.
+This document is the authoritative protocol guide for RID2Caltopo instances
+coordinating through `r2c-tracker`.
 
-This is the path that matters most for release confidence:
+There is only one R2C instance coordination protocol: the authenticated
+websocket at `/ws/r2c`. The separate `/ws` websocket is the web dashboard
+live-refresh channel; it is not used by RID2Caltopo clients for drone ownership,
+relay, or confirmation coordination.
 
-1. zones connect to the same `mapId`
-2. a zone claims first sighting of a drone (`remoteId`)
-3. the tracker assigns exactly one current owner for that `mapId + remoteId`
+The current implementation defaults to:
+
+- `R2C_HEARTBEAT_SEC=15`
+- `R2C_LEASE_SEC=45`
+
+## Purpose
+
+The tracker is a rendezvous and lease service. It makes RID detection and
+reporting predictable when several RID2Caltopo zones are watching the same
+CalTopo map, but it does not replace the owner-side RID2Caltopo logic that
+writes ordered track state into CalTopo.
+
+The release-critical flow is:
+
+1. zones connect to the same effective coordination map
+2. a zone reports the first sighting or confirmation of a drone
+3. the tracker assigns exactly one current owner for that map and `remoteId`
 4. non-owner zones relay sightings to the current owner
-5. the owner writes the canonical reporting output into Caltopo
-
-The tracker is a rendezvous/lease service. It does not replace the owner-side
-RID2Caltopo logic that actually writes ordered track state into Caltopo.
+5. the owner writes the canonical reporting output into CalTopo
 
 ## Scope and assumptions
 
-- Ownership is isolated by the tracker coordination key. For connected
-  RID2Caltopo instances, this is the real CalTopo `mapId`. For standalone
-  instances with no map configured, the tracker first looks for a nearby online
-  map-connected instance within two miles and adopts that real map coordination
-  key. If no nearby mapped instance is available, the tracker assigns a
-  `Standalone_<key>` coordination group by two-mile proximity.
-- Standalone grouping ignores incident, op-period, profile, and other local
-  RID2Caltopo configuration metadata. Two nearby standalone instances may share
-  drone ownership and waypoint updates even if their local incident/op-period
-  settings differ.
-- A mapped instance never changes coordination key because a standalone instance
-  is nearby. The proximity adoption only moves standalone instances into an
-  existing mapped group.
-- Standalone instances without a usable location are isolated into their own
-  `Standalone_<zone-or-guid>` coordination group.
-- The same `remoteId` can legitimately have a different owner on another
-  coordination key.
 - A "zone" is one RID2Caltopo client instance connected to `/ws/r2c`.
 - A zone should present a stable `guid` for its lifetime. Using the same value
-  as `zoneId` is acceptable and is the common case in this implementation.
-- The tracker expects a small active fleet. Your stated target of about 6 zones
-  with 2-4 drones per zone is well within the shape this protocol is designed
-  for.
+  as `zoneId` is acceptable and is the common case.
+- Ownership is isolated by the effective coordination key. For mapped clients,
+  this is the real CalTopo `mapId`. For standalone clients, the tracker either
+  adopts a nearby group or assigns a `Standalone_<key>` group.
+- Standalone grouping is proximity-based. It ignores incident, op-period,
+  profile, and other local RID2Caltopo configuration metadata.
+- A mapped instance never changes its coordination key because a standalone
+  instance is nearby. Proximity adoption only moves standalone instances.
+- The same `remoteId` can legitimately have a different owner on another
+  coordination key.
+- The target deployment size is small: roughly 2-6 zones and a few active drones
+  per zone.
 
 ## Authentication
 
-The websocket requires the `X-SAR-Token` header. The value must match the
-server's `TRACKER_API_KEY`.
+`/ws/r2c` requires the `X-SAR-Token` header. The value must match the server's
+`TRACKER_API_KEY`.
 
 Example request headers:
 
@@ -86,13 +90,32 @@ Server responds:
 
 Effects:
 
-- zone presence is registered under the effective coordination key. Connected
-  instances use the reported CalTopo `mapId`; standalone instances either adopt
-  a nearby mapped group or use a tracker-assigned `Standalone_<key>` group.
+- the zone is registered under the effective coordination map
 - zone state is mirrored into SQL
-- all connected zones on the map receive a `zone_update`
+- all connected zones on that effective map receive `zone_update`
+- the joining zone receives any recent, still-valid `drone_confirmed` events
 
-### 2. Zone heartbeats
+The `mapId` in `hello_ack` is the effective coordination key, which can differ
+from the reported `mapId` for standalone clients.
+
+### 2. Standalone coordination map resolution
+
+Mapped clients use their reported CalTopo `mapId`.
+
+Standalone clients are resolved as follows:
+
+1. if no usable client location is available, use `Standalone_<zone-or-guid>`
+2. if a nearby online mapped zone is within two miles, adopt that mapped key
+3. otherwise, if a nearby online standalone group is within two miles, join it
+4. otherwise, use `Standalone_<zone-or-guid>`
+
+Standalone clients can be rehomed on heartbeat. A parked or isolated standalone
+client may later adopt a nearby mapped group from live memory or recent
+persisted zone state. When this happens, the tracker moves that zone's state,
+replays relevant confirmations, and re-evaluates any owner state from the old
+group.
+
+### 3. Zone heartbeats
 
 Client sends:
 
@@ -123,15 +146,19 @@ Server responds:
 
 Effects:
 
-- zone position and `lastSeenMs` are refreshed
-- if this zone currently owns any drones, their leases are extended
-- the heartbeat only extends leases for drones owned by this zone's `guid`
-- idle clients may intentionally park their websocket when they have no active
-  drones, no owner leases, and no queued confirmation events. Parked clients
-  reconnect immediately before sending a new `first_sighting`, `sighting`,
-  `drone_lost`, or `drone_confirmed`.
+- zone position, CalTopo RTT, and `lastSeenMs` are refreshed
+- standalone zones may rehome to a better effective coordination map
+- leases are extended for drones owned by this zone's `guid`
+- `ownerLeaseExpireTs` reports the furthest lease expiry extended by this
+  heartbeat, or `0` if no owner lease was extended
+- all connected zones on affected maps receive `zone_update`
 
-### 3. First sighting / owner claim
+Idle clients may intentionally park their websocket when they have no active
+drones, no owner leases, and no queued confirmation events. Parked clients
+reconnect immediately before sending a new `first_sighting`, `sighting`,
+`drone_lost`, or `drone_confirmed`.
+
+### 4. First sighting / owner claim
 
 Client sends:
 
@@ -148,7 +175,7 @@ Client sends:
 }
 ```
 
-Server broadcasts:
+Server broadcasts when ownership is assigned or changed:
 
 ```json
 {
@@ -161,24 +188,25 @@ Server broadcasts:
 }
 ```
 
-Ownership is determined independently for each `mapId + remoteId`.
-
-## Owner selection rules
+Ownership is determined independently for each effective `mapId + remoteId`.
 
 When multiple zones claim the same drone, the tracker chooses the better owner
- using this ordering:
+using this ordering:
 
 1. earlier `droneTs`
 2. smaller `distanceFromZoneM`
 3. non-empty `mappedId`
 4. lexical `guid` tie-breaker
 
-That last step is important: if two zones are otherwise identical, ownership is
-still deterministic.
+That final tie-breaker keeps full ties deterministic.
 
-## Relay behavior
+If the current owner came from an unexpired `drone_confirmed` event,
+`first_sighting` does not steal ownership. Once that confirmation-sourced owner
+lease expires, a later `first_sighting` can assign a new owner.
 
-If a non-owner zone sees a drone that already has an owner, it sends:
+### 5. Sighting relay
+
+Client sends ongoing sighting messages:
 
 ```json
 {
@@ -194,7 +222,11 @@ If a non-owner zone sees a drone that already has an owner, it sends:
 }
 ```
 
-The tracker forwards the payload only to the current owner as:
+If the sender is the current owner, the tracker refreshes that owner's lease
+and does not echo the sighting.
+
+If the sender is not the current owner, the tracker forwards the payload only to
+the connected current owner as:
 
 ```json
 {
@@ -213,17 +245,14 @@ The tracker forwards the payload only to the current owner as:
 
 Notes:
 
-- the owner does not receive its own `sighting` echoed back
-- owner-originated `sighting` messages refresh that owner's lease, so active
-  owner telemetry can keep ownership alive without a separate heartbeat
 - non-owner `sighting` messages do not refresh the owner lease; they prove drone
   activity, not owner app health
 - RID2Caltopo throttles non-owner `sighting` sends per drone, currently to one
   update every three seconds by default
-- if the owner zone is currently disconnected, the relay is skipped
+- if the owner zone is disconnected, the relay is skipped
 - recent relay breadcrumbs are mirrored into SQL for troubleshooting
 
-## Drone confirmation broadcast
+### 6. Drone confirmation broadcast and ownership
 
 When an operator presses Save in the Drone Confirmation panel, the Android app
 sends:
@@ -236,25 +265,44 @@ sends:
   "zoneId": "zone-alpha",
   "guid": "zone-alpha",
   "mappedId": "1SAR7DJ",
+  "trackLabel": "1SAR7DJ",
   "org": "NCSSAR",
   "model": "Mavic 3",
   "ownerName": "Pilot"
 }
 ```
 
-The tracker validates the sender is connected to the requested `mapId` and
-broadcasts the event to every online zone on that map, including the sender.
+The tracker:
+
+- records and persists the confirmation event
+- broadcasts `drone_confirmed` to every online zone on that effective map,
+  including the sender
+- assigns the confirming zone as the owner
+- broadcasts `owner_assigned` for the confirmation-sourced owner
+
+The broadcast event includes tracker-populated fields such as
+`confirmedByGuid`, `confirmedAtMs`, and `confirmationEventId`.
+
 Clients treat the `remoteId` as already handled only for the current active
 tracker flight, so they dismiss any matching active confirmation panel without
 suppressing prompts for later flights.
 
-## Ownership release and expiry
+Confirmation events are retained for replay to late joiners, deduped by remote
+ID and event identity, and loaded from persisted state after tracker restart
+when the confirming zone is still active. They are forgotten when the owner
+sends `drone_lost`, when the confirming zone disconnects, or when the retention
+window expires.
 
-There are three ways an owner stops owning a drone:
+### 7. Ownership release and expiry
+
+There are four ways an owner stops owning a drone:
 
 1. the owner sends `drone_lost`
-2. the owner stops heartbeating and the lease expires
+2. the owner stops sending heartbeat or owner-originated sighting updates and
+   the lease expires
 3. another zone later wins a fresh `first_sighting` comparison
+4. a confirmation-sourced owner disconnects, which clears that confirmation and
+   emits owner expiry immediately
 
 Explicit release:
 
@@ -281,9 +329,10 @@ Server broadcast:
 Important behavior:
 
 - only the current owner zone can release ownership with `drone_lost`
-- a websocket disconnect marks a zone offline immediately, but ownership is not
-  dropped until the lease expires
-- the default lease window is 45 seconds
+- a websocket disconnect marks a zone offline immediately
+- normal first-sighting owners are retained until the lease expires
+- confirmation-sourced owners are cleared immediately when the confirming zone
+  disconnects
 - heartbeat is a backup lease signal while an owner is connected but not sending
   accepted owner telemetry; standby clients should park instead of heartbeating
   forever
@@ -316,16 +365,20 @@ This is the server's current view of map membership, not a durable audit log.
 
 The tracker mirrors live coordination state into SQL:
 
-- `r2c_zone_state`: active/recent zone presence
+- `r2c_zone_state`: active/recent zone presence, reported map, and coordination
+  mode
 - `r2c_drone_owner_state`: active owner leases
+- `r2c_drone_confirmation_state`: recent Drone Confirmation Save events for
+  replay and restart continuity
 - `r2c_recent_sighting`: recent relayed sightings for debugging
 
-Live routing still happens in memory. Persisted state is there so a process
-restart does not fully erase recent coordination context.
+Live routing still happens in memory. Persisted state exists so a process
+restart does not fully erase recent coordination context and so `/r2c` can show
+recent state.
 
-## Suggested robustness test matrix
+## Robustness test matrix
 
-To keep future releases honest, treat the flow as three separable slices.
+To keep releases honest, treat the flow as four separable slices.
 
 ### 1. Deterministic ownership
 
@@ -336,6 +389,7 @@ Verify that owner assignment is stable across:
 - equal timestamp and distance but only one zone has `mappedId`
 - full ties resolved by lexical `guid`
 - same `remoteId` claimed on different maps
+- active confirmation-sourced owner resisting a later `first_sighting`
 
 ### 2. Lease continuity
 
@@ -344,8 +398,9 @@ Verify:
 - owner heartbeat extends only that owner's leases
 - owner-originated `sighting` extends only that owner's lease
 - non-owner relayed `sighting` does not extend the owner lease
-- disconnect marks zone offline without immediate ownership loss
-- expired leases emit `owner_expired`
+- disconnect marks zone offline
+- normal first-sighting owners expire by lease timeout
+- confirmation-sourced owners expire on confirming-zone disconnect
 - non-owner `drone_lost` does not clear ownership
 
 ### 3. Relay correctness
@@ -357,16 +412,27 @@ Verify:
 - relay is skipped if the owner is disconnected
 - recent sightings are recorded for diagnostics
 
+### 4. Confirmation replay
+
+Verify:
+
+- `drone_confirmed` broadcasts to all online zones on the effective map
+- Save-driven confirmation also broadcasts `owner_assigned`
+- late joiners receive recent confirmations
+- confirmation replay does not cross maps except through standalone rehome
+- `drone_lost` and confirming-zone disconnect clear replay state
+
 ## Operational guidance for 2-6 zones
 
-For the deployment size you described, the main failure modes to protect against
-are not raw throughput problems. They are consistency problems:
+For the deployment size this protocol targets, the main failure modes to protect
+against are consistency problems:
 
 - two zones claiming the same drone differently
 - a stale owner holding a lease after disconnect
-- a non-owner accidentally writing to Caltopo
-- reconnect churn causing ownership flaps
+- a non-owner accidentally writing to CalTopo
+- parked or reconnected clients missing a confirmation
+- standalone clients unintentionally sharing or failing to share a coordination
+  group
 
-The best release gate is a compact, deterministic test suite around those cases
-plus one operator-readable protocol document. That combination makes regressions
-visible before field use and easier to diagnose when something unusual happens.
+The best release gate is a compact deterministic test suite around those cases
+plus this single operator-readable protocol document.

@@ -1,4 +1,11 @@
-v1.4.16:
-* Confirmation events now authoritatively update and broadcast tracker
-  ownership for the active drone lease, with normal cleanup on lease
-  expiry, lost-drone, or confirming-zone disconnect.
+v1.4.17:
+* Reduced idle coordination overhead on the tracker by throttling heartbeat-
+  triggered zone_update broadcasts to once per minute by default, while
+  preserving immediate delivery for owner changes, owner expiry, Drone
+  Confirmation Save events, disconnects, and initial joins.
+* Lowered noisy /ws/r2c lifecycle and heartbeat logging from routine idle/
+  reconnect traffic, keeping abnormal or longer-lived closes visible for
+  diagnostics.
+* Added regression coverage to verify heartbeat acknowledgements are still
+  sent every time even when idle zone-update fanout is throttled.
+

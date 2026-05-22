@@ -21,6 +21,7 @@ def load_coordination_classes():
 
     logger = types.SimpleNamespace(
         info=lambda *args, **kwargs: None,
+        debug=lambda *args, **kwargs: None,
         warning=lambda *args, **kwargs: None,
     )
 
@@ -41,6 +42,7 @@ def load_coordination_classes():
         "manager": manager,
         "R2C_HEARTBEAT_SEC": 15,
         "R2C_LEASE_SEC": 45,
+        "R2C_HEARTBEAT_ZONE_UPDATE_SEC": 60,
         "R2C_SWEEP_SEC": 15,
     }
     exec(snippet, namespace)
@@ -1054,6 +1056,35 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("zone-alpha", ack["guid"])
         self.assertEqual(7, ack["clientSeq"])
         self.assertGreater(ack["ownerLeaseExpireTs"], ack["serverTime"])
+
+    async def test_idle_heartbeats_throttle_zone_update_broadcasts(self):
+        self.ws_alpha.sent_texts.clear()
+        self.ws_bravo.sent_texts.clear()
+
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "heartbeat",
+            "seq": 1,
+            "lat": 39.11,
+            "lng": -121.11,
+            "caltopoRttMs": 55,
+        })
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "heartbeat",
+            "seq": 2,
+            "lat": 39.12,
+            "lng": -121.12,
+            "caltopoRttMs": 56,
+        })
+
+        alpha_messages = [json.loads(text) for text in self.ws_alpha.sent_texts]
+        bravo_messages = [json.loads(text) for text in self.ws_bravo.sent_texts]
+        self.assertEqual([1, 2], [
+            message["clientSeq"]
+            for message in alpha_messages
+            if message.get("type") == "heartbeat_ack"
+        ])
+        self.assertEqual(1, sum(1 for message in alpha_messages if message.get("type") == "zone_update"))
+        self.assertEqual(1, sum(1 for message in bravo_messages if message.get("type") == "zone_update"))
 
     async def test_coordination_updates_do_not_trigger_generic_page_refresh(self):
         await self.hub.handle_message(self.ws_alpha, {

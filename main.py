@@ -79,6 +79,7 @@ BASE_LOG_DIRECTORY = '/flightlogs-vol'
 R2C_HEARTBEAT_SEC = int(os.environ.get("R2C_HEARTBEAT_SEC", "15"))
 R2C_LEASE_SEC = int(os.environ.get("R2C_LEASE_SEC", "45"))
 R2C_DB_CLEANUP_SEC = int(os.environ.get("R2C_DB_CLEANUP_SEC", "86400"))
+R2C_HEARTBEAT_ZONE_UPDATE_SEC = int(os.environ.get("R2C_HEARTBEAT_ZONE_UPDATE_SEC", "60"))
 R2C_COORDINATION_MODE_MAP = "map"
 R2C_COORDINATION_MODE_STANDALONE = "standalone"
 
@@ -466,6 +467,7 @@ class R2CCoordinationHub:
         self._owners: dict[tuple[str, str], dict] = {}
         self._confirmed_drones_by_map: dict[str, dict[str, dict]] = {}
         self._confirmation_event_seq: int = 0
+        self._last_heartbeat_zone_update_ms_by_map: dict[str, int] = {}
         self._sweep_task: Optional[asyncio.Task] = None
         self._load_task: Optional[asyncio.Task] = None
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -1014,7 +1016,7 @@ class R2CCoordinationHub:
             await self._upsert_owner_state(owner_map_id, remote_id, owner)
         for owner_map_id, remote_id in owner_deletes:
             await self._delete_owner_state(owner_map_id, remote_id)
-        logger.info(
+        logger.debug(
             "r2c heartbeat_ack: map=%s zone=%s guid=%s client_seq=%s owner_lease_expire_ts=%s",
             map_id,
             zone_id,
@@ -1033,7 +1035,7 @@ class R2CCoordinationHub:
             "clientSeq": payload.get("seq"),
         }))
         if map_id:
-            await self.broadcast_zone_update(map_id)
+            await self.broadcast_zone_update(map_id, force=False)
         if old_map_id_for_update and old_map_id_for_update != map_id:
             await self.broadcast_zone_update(old_map_id_for_update)
         for event in confirmation_replays:
@@ -1263,8 +1265,17 @@ class R2CCoordinationHub:
                 }
             )
 
-    async def broadcast_zone_update(self, map_id: str):
+    async def broadcast_zone_update(self, map_id: str, force: bool = True):
+        now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
         async with self._lock:
+            if not force:
+                if R2C_HEARTBEAT_ZONE_UPDATE_SEC <= 0:
+                    return
+                last_update_ms = self._last_heartbeat_zone_update_ms_by_map.get(map_id, 0)
+                min_gap_ms = R2C_HEARTBEAT_ZONE_UPDATE_SEC * 1000
+                if last_update_ms > 0 and now_ms - last_update_ms < min_gap_ms:
+                    return
+                self._last_heartbeat_zone_update_ms_by_map[map_id] = now_ms
             zones = list(self._zones_by_map.get(map_id, {}).values())
         await self.broadcast(
             map_id,
@@ -3399,7 +3410,7 @@ async def r2c_websocket_endpoint(websocket: WebSocket):
         return
     client_host = websocket.client.host if websocket.client else "unknown"
     await r2c_hub.connect(websocket)
-    logger.info(
+    logger.debug(
         "r2c websocket connected: client=%s user_agent=%s",
         client_host,
         websocket.headers.get("user-agent", ""),
@@ -3411,11 +3422,18 @@ async def r2c_websocket_endpoint(websocket: WebSocket):
                 await r2c_hub.handle_message(websocket, payload)
     except WebSocketDisconnect as e:
         conn_info = await r2c_hub.get_connection_debug_info(websocket)
-        logger.info(
+        close_code = getattr(e, "code", "")
+        close_reason = getattr(e, "reason", "")
+        close_logger = logger.debug if (
+            close_code == 1000
+            and close_reason == "client-stop"
+            and int(conn_info.get("conn_age_ms", 0) or 0) < 5000
+        ) else logger.info
+        close_logger(
             "r2c websocket closed: client=%s code=%s reason=%s map=%s zone=%s guid=%s conn_age_ms=%s hello_age_ms=%s last_seen_age_ms=%s",
             client_host,
-            getattr(e, "code", ""),
-            getattr(e, "reason", ""),
+            close_code,
+            close_reason,
             conn_info.get("map_id", ""),
             conn_info.get("zone_id", ""),
             conn_info.get("guid", ""),

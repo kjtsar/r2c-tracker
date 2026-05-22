@@ -26,6 +26,7 @@ def load_coordination_classes():
         log_messages.append((level, message))
 
     logger = types.SimpleNamespace(
+        debug=lambda message, *args, **kwargs: _record("debug", message, *args),
         info=lambda message, *args, **kwargs: _record("info", message, *args),
         warning=lambda message, *args, **kwargs: _record("warning", message, *args),
     )
@@ -43,6 +44,7 @@ def load_coordination_classes():
         "manager": manager,
         "R2C_HEARTBEAT_SEC": 15,
         "R2C_LEASE_SEC": 45,
+        "R2C_HEARTBEAT_ZONE_UPDATE_SEC": 60,
         "R2C_DB_CLEANUP_SEC": 86400,
         "R2C_SWEEP_SEC": 15,
     }

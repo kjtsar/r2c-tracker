@@ -19,6 +19,7 @@ def load_coordination_classes():
     snippet = source[start:end]
 
     logger = types.SimpleNamespace(
+        debug=lambda *args, **kwargs: None,
         info=lambda *args, **kwargs: None,
         warning=lambda *args, **kwargs: None,
     )
@@ -36,6 +37,7 @@ def load_coordination_classes():
         "manager": manager,
         "R2C_HEARTBEAT_SEC": 15,
         "R2C_LEASE_SEC": 45,
+        "R2C_HEARTBEAT_ZONE_UPDATE_SEC": 60,
         "R2C_SWEEP_SEC": 15,
     }
     exec(snippet, namespace)
