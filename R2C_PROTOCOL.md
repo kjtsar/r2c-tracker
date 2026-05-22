@@ -84,7 +84,9 @@ Server responds:
   "serverTime": 1710000000000,
   "mapId": "MAP1",
   "heartbeatSec": 15,
-  "leaseSec": 45
+  "leaseSec": 45,
+  "idleRecommended": true,
+  "idleParkSec": 120
 }
 ```
 
@@ -94,6 +96,8 @@ Effects:
 - zone state is mirrored into SQL
 - all connected zones on that effective map receive `zone_update`
 - the joining zone receives any recent, still-valid `drone_confirmed` events
+- `idleRecommended` and `idleParkSec` are advisory; older clients can ignore
+  them and newer clients can use them to park without keeping Cloud Run active
 
 The `mapId` in `hello_ack` is the effective coordination key, which can differ
 from the reported `mapId` for standalone clients.
@@ -157,6 +161,25 @@ Idle clients may intentionally park their websocket when they have no active
 drones, no owner leases, and no queued confirmation events. Parked clients
 reconnect immediately before sending a new `first_sighting`, `sighting`,
 `drone_lost`, or `drone_confirmed`.
+
+Before closing an idle websocket, newer clients may send:
+
+```json
+{
+  "type": "idle",
+  "reason": "no_active_drones"
+}
+```
+
+Effects:
+
+- the tracker records the zone as `idle` instead of `online`
+- `/r2c` can show an `IDLE` badge while the parked zone state remains recent
+- the client may then close the websocket to let Cloud Run stop servicing an
+  active request
+
+The `idle` message is backwards-compatible. Older trackers ignore the unknown
+message type, and older clients ignore the new `hello_ack` advisory fields.
 
 ### 4. First sighting / owner claim
 

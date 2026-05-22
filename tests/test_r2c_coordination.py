@@ -43,6 +43,7 @@ def load_coordination_classes():
         "R2C_HEARTBEAT_SEC": 15,
         "R2C_LEASE_SEC": 45,
         "R2C_HEARTBEAT_ZONE_UPDATE_SEC": 60,
+        "R2C_IDLE_PARK_SEC": 120,
         "R2C_SWEEP_SEC": 15,
     }
     exec(snippet, namespace)
@@ -99,6 +100,7 @@ class TestHub(BaseHub):
         self.zone_state_updates.append((args, kwargs))
         if len(args) >= 11:
             map_id, zone_id, guid, name, lat, lng, caltopo_rtt_ms, online, last_seen_ms, reported_map_id, coordination_mode = args[:11]
+            connection_state = args[11] if len(args) >= 12 else ("online" if online else "disconnected")
             self.zone_store[(map_id, zone_id)] = {
                 "mapId": map_id,
                 "zoneId": zone_id,
@@ -111,6 +113,7 @@ class TestHub(BaseHub):
                 "lastSeenMs": last_seen_ms,
                 "reportedMapId": reported_map_id,
                 "coordinationMode": coordination_mode,
+                "connectionState": connection_state,
             }
         return
 
@@ -1027,6 +1030,8 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("hello_ack", ack["type"])
         self.assertEqual(15, ack["heartbeatSec"])
         self.assertEqual(45, ack["leaseSec"])
+        self.assertTrue(ack["idleRecommended"])
+        self.assertEqual(120, ack["idleParkSec"])
 
     async def test_heartbeat_sends_ack_and_echoes_client_seq(self):
         await self.hub.handle_message(self.ws_alpha, {
@@ -1085,6 +1090,51 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(1, sum(1 for message in alpha_messages if message.get("type") == "zone_update"))
         self.assertEqual(1, sum(1 for message in bravo_messages if message.get("type") == "zone_update"))
+
+    async def test_idle_message_marks_zone_idle_without_owner_activity(self):
+        self.ws_alpha.sent_texts.clear()
+        self.ws_bravo.sent_texts.clear()
+
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "idle",
+            "reason": "no_active_drones",
+        })
+
+        state = self.hub.zone_store[("MAP1", "zone-alpha")]
+        self.assertFalse(state["online"])
+        self.assertEqual("idle", state["connectionState"])
+
+        bravo_messages = [json.loads(text) for text in self.ws_bravo.sent_texts]
+        zone_updates = [message for message in bravo_messages if message.get("type") == "zone_update"]
+        self.assertEqual(1, len(zone_updates))
+        alpha_zone = next(zone for zone in zone_updates[0]["zones"] if zone["zoneId"] == "zone-alpha")
+        self.assertFalse(alpha_zone["online"])
+        self.assertEqual("idle", alpha_zone["connectionState"])
+
+    async def test_idle_message_is_ignored_while_zone_owns_active_drone(self):
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "first_sighting",
+            "mapId": "MAP1",
+            "remoteId": "DRONE-IDLE-GUARD",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "droneTs": 1000,
+            "distanceFromZoneM": 10.0,
+            "mappedId": "1sar7Dj"
+        })
+        self.ws_alpha.sent_texts.clear()
+        self.ws_bravo.sent_texts.clear()
+
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "idle",
+            "reason": "no_active_drones",
+        })
+
+        state = self.hub.zone_store[("MAP1", "zone-alpha")]
+        self.assertTrue(state["online"])
+        self.assertEqual("online", state["connectionState"])
+        bravo_messages = [json.loads(text) for text in self.ws_bravo.sent_texts]
+        self.assertFalse(any(message.get("type") == "zone_update" for message in bravo_messages))
 
     async def test_coordination_updates_do_not_trigger_generic_page_refresh(self):
         await self.hub.handle_message(self.ws_alpha, {

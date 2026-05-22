@@ -107,6 +107,30 @@ class SnapshotHelpersTest(unittest.TestCase):
 
         self.assertEqual("disconnected", snapshot["maps"][0]["zones"][0]["status"])
 
+    def test_build_r2c_snapshot_marks_parked_zone_idle(self):
+        now_ms = 1_000_000
+        zones = [
+            types.SimpleNamespace(
+                map_id="MAP1",
+                zone_id="zone-a",
+                guid="guid-a",
+                name="Alpha",
+                lat=39.1,
+                lng=-121.1,
+                caltopo_rtt_ms=1200,
+                online=False,
+                connection_state="idle",
+                last_seen_ms=999_995,
+            ),
+        ]
+
+        snapshot = build_r2c_snapshot(zones, [], now_ms)
+
+        zone = snapshot["maps"][0]["zones"][0]
+        self.assertEqual("idle", zone["status"])
+        self.assertEqual("idle", zone["connection_state"])
+        self.assertFalse(zone["online"])
+
     def test_build_r2c_snapshot_preserves_standalone_coordination_group(self):
         now_ms = 1_000_000
         zones = [
@@ -150,6 +174,8 @@ class SnapshotTemplateTest(unittest.TestCase):
         self.assertIn('document.body.dataset.autoReloadIdleTimeoutMs = "300000";', template)
         self.assertIn("scheduleIdleAutoReloadStop", template)
         self.assertIn("stopAutoReload();", template)
+        self.assertIn("data-connection-state", template)
+        self.assertIn("status === 'IDLE'", template)
         self.assertIn("document.visibilityState === 'hidden'", template)
         self.assertIn("document.addEventListener('visibilitychange', syncAutoReloadWithVisibility);", template)
 

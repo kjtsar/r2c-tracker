@@ -190,6 +190,11 @@
     color: var(--warn);
   }
 
+  .badge.idle {
+    background: #e7edf5;
+    color: #4f5f73;
+  }
+
   .badge.disconnected {
     background: var(--danger-soft);
     color: var(--danger);
@@ -277,12 +282,16 @@
       });
       statusElements.forEach((el) => {
         const isConnected = el.dataset.online === 'true';
+        const connectionState = el.dataset.connectionState || '';
         const lastSeenMs = Number(el.dataset.lastSeenMs || 0);
         const elapsedMs = Math.max(snapshotNowMs - lastSeenMs, 0);
-        const status = !isConnected ? 'DISCONNECTED' : (elapsedMs <= quietAfterMs ? 'ONLINE' : 'QUIET');
+        const status = connectionState === 'idle'
+          ? 'IDLE'
+          : (!isConnected ? 'DISCONNECTED' : (elapsedMs <= quietAfterMs ? 'ONLINE' : 'QUIET'));
         el.textContent = status;
         el.classList.toggle('online', status === 'ONLINE');
         el.classList.toggle('quiet', status === 'QUIET');
+        el.classList.toggle('idle', status === 'IDLE');
         el.classList.toggle('disconnected', status === 'DISCONNECTED');
       });
       leaseElements.forEach((el) => {
@@ -361,7 +370,7 @@
   <div class="meta">
     Snapshot generated at
     <strong>{{ generated_at.strftime('%Y-%m-%d %H:%M:%S UTC') }}</strong>.
-    Instances that have not checked in for more than about {{ heartbeat_sec * 2 }} seconds are marked quiet.
+    Instances that have not checked in for more than about {{ heartbeat_sec * 2 }} seconds are marked quiet. Parked instances are marked idle.
   </div>
   <a class="reload-link" href="/r2c">Reload Now</a>
 </section>
@@ -400,7 +409,7 @@
           <div>
             <h3 class="instance-name">{{ zone.name }}</h3>
           </div>
-          <span class="badge {{ zone.status }}" data-status-badge data-last-seen-ms="{{ zone.last_seen_ms }}" data-online="{{ 'true' if zone.online else 'false' }}">{{ zone.status|upper }}</span>
+          <span class="badge {{ zone.status }}" data-status-badge data-last-seen-ms="{{ zone.last_seen_ms }}" data-online="{{ 'true' if zone.online else 'false' }}" data-connection-state="{{ zone.connection_state }}">{{ zone.status|upper }}</span>
         </div>
 
         <div class="detail-list">

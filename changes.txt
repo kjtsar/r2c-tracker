@@ -1,11 +1,9 @@
-v1.4.17:
-* Reduced idle coordination overhead on the tracker by throttling heartbeat-
-  triggered zone_update broadcasts to once per minute by default, while
-  preserving immediate delivery for owner changes, owner expiry, Drone
-  Confirmation Save events, disconnects, and initial joins.
-* Lowered noisy /ws/r2c lifecycle and heartbeat logging from routine idle/
-  reconnect traffic, keeping abnormal or longer-lived closes visible for
-  diagnostics.
-* Added regression coverage to verify heartbeat acknowledgements are still
-  sent every time even when idle zone-update fanout is throttled.
+v1.4.18:
+* Added optional tracker idle-state support for parked R2C clients. The
+  tracker now advertises idle parking guidance in hello_ack, accepts a
+  backwards-compatible idle message before clients close /ws/r2c, and
+  shows parked instances as IDLE on /r2c.
+* Idle requests are ignored while the client still owns an active drone
+  lease, preserving owner/relay behavior during live flights.
+
 

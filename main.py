@@ -80,6 +80,7 @@ R2C_HEARTBEAT_SEC = int(os.environ.get("R2C_HEARTBEAT_SEC", "15"))
 R2C_LEASE_SEC = int(os.environ.get("R2C_LEASE_SEC", "45"))
 R2C_DB_CLEANUP_SEC = int(os.environ.get("R2C_DB_CLEANUP_SEC", "86400"))
 R2C_HEARTBEAT_ZONE_UPDATE_SEC = int(os.environ.get("R2C_HEARTBEAT_ZONE_UPDATE_SEC", "60"))
+R2C_IDLE_PARK_SEC = int(os.environ.get("R2C_IDLE_PARK_SEC", "120"))
 R2C_COORDINATION_MODE_MAP = "map"
 R2C_COORDINATION_MODE_STANDALONE = "standalone"
 
@@ -239,6 +240,7 @@ class R2CZoneState(Base):
     lng = Column(Float, default=0.0)
     caltopo_rtt_ms = Column(Integer, default=0)
     online = Column(Boolean, default=True)
+    connection_state = Column(String, default="online")
     last_seen_ms = Column(BigInteger, default=0)
 
 
@@ -343,6 +345,8 @@ async def migrate_r2c_coordination_schema():
                 await conn.execute(text(
                     f"ALTER TABLE r2c_zone_state ADD COLUMN coordination_mode VARCHAR DEFAULT '{R2C_COORDINATION_MODE_MAP}'"
                 ))
+            if "connection_state" not in columns:
+                await conn.execute(text("ALTER TABLE r2c_zone_state ADD COLUMN connection_state VARCHAR DEFAULT 'online'"))
         elif dialect == "sqlite":
             result = await conn.execute(text("PRAGMA table_info(r2c_zone_state)"))
             columns = {row[1] for row in result.fetchall()}
@@ -352,6 +356,8 @@ async def migrate_r2c_coordination_schema():
                 await conn.execute(text(
                     f"ALTER TABLE r2c_zone_state ADD COLUMN coordination_mode TEXT DEFAULT '{R2C_COORDINATION_MODE_MAP}'"
                 ))
+            if "connection_state" not in columns:
+                await conn.execute(text("ALTER TABLE r2c_zone_state ADD COLUMN connection_state TEXT DEFAULT 'online'"))
 
 
 async def migrate_flight_archive_schema():
@@ -447,6 +453,7 @@ class R2CZoneConnection:
         self.lat: float = 0.0
         self.lng: float = 0.0
         self.caltopo_rtt_ms: int = 0
+        self.connection_state: str = "online"
         self.connected_at_ms: int = 0
         self.hello_received_at_ms: int = 0
         self.last_seen_ms: int = 0
@@ -751,6 +758,7 @@ class R2CCoordinationHub:
             lat = conn.lat
             lng = conn.lng
             caltopo_rtt_ms = conn.caltopo_rtt_ms
+            connection_state = "idle" if conn.connection_state == "idle" else "disconnected"
             connected_at_ms = conn.connected_at_ms
             hello_received_at_ms = conn.hello_received_at_ms
             last_seen_ms = conn.last_seen_ms
@@ -797,6 +805,7 @@ class R2CCoordinationHub:
                 last_seen_ms,
                 reported_map_id,
                 coordination_mode,
+                connection_state,
             )
             await self._delete_confirmation_state_for_zone(map_id, zone_guid, zone_id)
         for owner_map_id, remote_id, owner_guid in confirmed_owner_expirations:
@@ -833,6 +842,8 @@ class R2CCoordinationHub:
             await self._handle_drone_lost(websocket, payload)
         elif mtype == "drone_confirmed":
             await self._handle_drone_confirmed(websocket, payload)
+        elif mtype == "idle":
+            await self._handle_idle(websocket, payload)
 
     async def _handle_hello(self, websocket: WebSocket, payload: dict):
         reported_map_id = (payload.get("mapId", "") or "").strip()
@@ -866,6 +877,7 @@ class R2CCoordinationHub:
             conn.lat = lat
             conn.lng = lng
             conn.caltopo_rtt_ms = self._parse_caltopo_rtt_ms(payload.get("caltopoRttMs"))
+            conn.connection_state = "online"
             conn.hello_received_at_ms = now_ms
             conn.last_seen_ms = now_ms
             zones = self._zones_by_map.setdefault(map_id, {})
@@ -891,16 +903,77 @@ class R2CCoordinationHub:
             now_ms,
             reported_map_id,
             coordination_mode,
+            "online",
         )
         await websocket.send_text(json.dumps({
             "type": "hello_ack",
             "serverTime": now_ms,
             "mapId": map_id,
             "heartbeatSec": R2C_HEARTBEAT_SEC,
-            "leaseSec": R2C_LEASE_SEC
+            "leaseSec": R2C_LEASE_SEC,
+            "idleRecommended": True,
+            "idleParkSec": R2C_IDLE_PARK_SEC
         }))
         await self.broadcast_zone_update(map_id)
         await self._send_recent_drone_confirmations(websocket, map_id, now_ms)
+
+    async def _handle_idle(self, websocket: WebSocket, payload: dict):
+        now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
+        async with self._lock:
+            conn = self._connections.get(websocket)
+            if conn is None:
+                return
+            map_id, zone_id, guid = self._message_context(websocket, payload)
+            if not map_id or not zone_id:
+                return
+            active_owner_remote_ids = [
+                remote_id
+                for (owner_map_id, remote_id), owner in self._owners.items()
+                if owner_map_id == map_id
+                and int(owner.get("lease_expire_ms", 0) or 0) >= now_ms
+                and (
+                    (guid and owner.get("owner_guid") == guid)
+                    or (zone_id and owner.get("owner_zone_id") == zone_id)
+                )
+            ]
+            if active_owner_remote_ids:
+                logger.warning(
+                    "r2c zone_idle ignored while owner leases active: map=%s zone=%s guid=%s remote_ids=%s",
+                    map_id,
+                    zone_id,
+                    guid,
+                    ",".join(active_owner_remote_ids),
+                )
+                return
+            conn.connection_state = "idle"
+            conn.last_seen_ms = now_ms
+            name = conn.name
+            lat = conn.lat
+            lng = conn.lng
+            caltopo_rtt_ms = conn.caltopo_rtt_ms
+            reported_map_id = conn.reported_map_id
+            coordination_mode = conn.coordination_mode
+        logger.info(
+            "r2c zone_idle: map=%s zone=%s guid=%s",
+            map_id,
+            zone_id,
+            guid,
+        )
+        await self._upsert_zone_state(
+            map_id,
+            zone_id,
+            guid or zone_id,
+            name,
+            lat,
+            lng,
+            caltopo_rtt_ms,
+            False,
+            now_ms,
+            reported_map_id,
+            coordination_mode,
+            "idle",
+        )
+        await self.broadcast_zone_update(map_id)
 
     async def _handle_heartbeat(self, websocket: WebSocket, payload: dict):
         now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
@@ -1009,6 +1082,7 @@ class R2CCoordinationHub:
                 now_ms,
                 reported_map_id,
                 coordination_mode,
+                "online",
             )
         if old_map_id_for_update and zone_id:
             await self._delete_zone_state(old_map_id_for_update, zone_id)
@@ -1290,7 +1364,8 @@ class R2CCoordinationHub:
                         "lng": zone.lng,
                         "caltopoRttMs": zone.caltopo_rtt_ms,
                         "lastSeenMs": zone.last_seen_ms,
-                        "online": zone.websocket is not None
+                        "online": zone.websocket is not None and zone.connection_state == "online",
+                        "connectionState": zone.connection_state
                     }
                     for zone in zones if zone.zone_id
                 ]
@@ -1316,6 +1391,7 @@ class R2CCoordinationHub:
             owners = owner_result.scalars().all()
             for zone in zones:
                 zone.online = False
+                zone.connection_state = "disconnected"
             await session.commit()
         async with self._lock:
             self._zones_by_map.clear()
@@ -1330,6 +1406,7 @@ class R2CCoordinationHub:
                 conn.lat = zone.lat
                 conn.lng = zone.lng
                 conn.caltopo_rtt_ms = zone.caltopo_rtt_ms
+                conn.connection_state = getattr(zone, "connection_state", "") or "disconnected"
                 conn.last_seen_ms = zone.last_seen_ms
                 self._zones_by_map.setdefault(zone.map_id, {})[zone.zone_id] = conn
             self._owners = {
@@ -1461,7 +1538,8 @@ class R2CCoordinationHub:
                                  lat: float, lng: float, caltopo_rtt_ms: int,
                                  online: bool, last_seen_ms: int,
                                  reported_map_id: str = "",
-                                 coordination_mode: str = "map"):
+                                 coordination_mode: str = "map",
+                                 connection_state: str = ""):
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(R2CZoneState).where(
@@ -1481,6 +1559,7 @@ class R2CCoordinationHub:
             state.lng = lng
             state.caltopo_rtt_ms = caltopo_rtt_ms
             state.online = online
+            state.connection_state = connection_state or ("online" if online else "disconnected")
             state.last_seen_ms = last_seen_ms
             await session.commit()
 
@@ -2275,7 +2354,11 @@ def build_r2c_snapshot(zones, owners, now_ms: int):
     for zone in zones:
         elapsed_ms = max(now_ms - int(zone.last_seen_ms or 0), 0)
         is_online = bool(getattr(zone, "online", True))
-        if not is_online:
+        connection_state = (getattr(zone, "connection_state", "") or "").strip().lower()
+        if connection_state == "idle":
+            zone_status = "idle"
+            is_online = False
+        elif connection_state == "disconnected" or not is_online:
             zone_status = "disconnected"
         elif elapsed_ms <= (R2C_HEARTBEAT_SEC * 1000 * 2):
             zone_status = "online"
@@ -2300,6 +2383,7 @@ def build_r2c_snapshot(zones, owners, now_ms: int):
             "lng": zone.lng,
             "caltopo_rtt_ms": zone.caltopo_rtt_ms,
             "online": is_online,
+            "connection_state": connection_state or zone_status,
             "last_seen_ms": zone.last_seen_ms,
             "last_seen_age_ms": elapsed_ms,
             "last_seen_age_label": format_elapsed_ms(elapsed_ms),
@@ -2627,6 +2711,7 @@ async def public_r2c_snapshot(
         or_(
             R2CZoneState.online == True,
             R2CZoneState.last_seen_ms >= recent_zone_cutoff_ms,
+            R2CZoneState.connection_state == "idle",
         )
     ).order_by(R2CZoneState.map_id, R2CZoneState.name, R2CZoneState.zone_id)
     owner_stmt = select(R2CDroneOwnerState).where(R2CDroneOwnerState.lease_expire_ms >= now_ms)
@@ -2637,7 +2722,8 @@ async def public_r2c_snapshot(
     zones = zone_result.scalars().all()
     owners = owner_result.scalars().all()
     for zone in zones:
-        if int(zone.last_seen_ms or 0) >= recent_zone_cutoff_ms:
+        connection_state = (getattr(zone, "connection_state", "") or "").strip().lower()
+        if connection_state not in {"idle", "disconnected"} and int(zone.last_seen_ms or 0) >= recent_zone_cutoff_ms:
             zone.online = True
     snapshot = build_r2c_snapshot(zones, owners, now_ms)
     logger.info(

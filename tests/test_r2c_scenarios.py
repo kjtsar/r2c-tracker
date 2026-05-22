@@ -38,6 +38,7 @@ def load_coordination_classes():
         "R2C_HEARTBEAT_SEC": 15,
         "R2C_LEASE_SEC": 45,
         "R2C_HEARTBEAT_ZONE_UPDATE_SEC": 60,
+        "R2C_IDLE_PARK_SEC": 120,
         "R2C_SWEEP_SEC": 15,
     }
     exec(snippet, namespace)
