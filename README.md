@@ -3,14 +3,16 @@
 A FastAPI-based flight log aggregator for SAR operations.
 
 ## Setup
-1. `pip install -r requirements.txt`
-2. `uvicorn main:app --reload --port $TRACKER_PORT`
+1. `python3 -m venv .venv`
+2. `.venv/bin/python -m pip install -r requirements.txt`
+3. `source .env`
+4. `.venv/bin/python -m uvicorn main:app --reload --host 127.0.0.1 --port $TRACKER_PORT`
 
 ## Environment Variables
 - `TRACKER_PORT`: unrestricted port number (i.e. 8080)
 - `TRACKER_API_KEY`: Key required for /upload
 - `TRACKER_ADMIN_PASS`: Password for the /admin portal
-- `DB_URL`: URL for the postgress database - omit to use local filesystem instead.
+- `DATABASE_URL`: URL for the postgres database - omit to use local SQLite instead (`sqlite+aiosqlite:///./test.db`).
 - define everything in .env file and pull into shell via .env prior to start.
 
 ## Features
@@ -54,3 +56,13 @@ behavior, and owner-release edge cases for the multi-zone coordination path.
 For higher-confidence release checks, `tests/test_r2c_scenarios.py` simulates
 multi-zone timelines with overlapping drone sightings, disconnect/expiry
 handoffs, and deterministic ownership assertions.
+
+## Release Verification
+Run the local release gate before deploying:
+
+`./release_check.sh`
+
+The release check uses an isolated temporary SQLite database, runs the full
+Python unit suite, starts a local tracker on `127.0.0.1:18080`, verifies `/`,
+`/r2c`, and `/versions`, then performs an authenticated `/ws/r2c` hello smoke
+test. Override `TRACKER_RELEASE_CHECK_PORT` if that port is already in use.

@@ -44,6 +44,8 @@ def load_coordination_classes():
         "R2C_LEASE_SEC": 45,
         "R2C_HEARTBEAT_ZONE_UPDATE_SEC": 60,
         "R2C_IDLE_PARK_SEC": 120,
+        "R2C_RECOMMENDED_APP_VERSION_CODE": 77,
+        "R2C_UPDATE_URL": "https://example.org/r2c",
         "R2C_SWEEP_SEC": 15,
     }
     exec(snippet, namespace)
@@ -101,11 +103,15 @@ class TestHub(BaseHub):
         if len(args) >= 11:
             map_id, zone_id, guid, name, lat, lng, caltopo_rtt_ms, online, last_seen_ms, reported_map_id, coordination_mode = args[:11]
             connection_state = args[11] if len(args) >= 12 else ("online" if online else "disconnected")
+            app_version = args[12] if len(args) >= 13 else ""
+            app_version_code = args[13] if len(args) >= 14 else 0
             self.zone_store[(map_id, zone_id)] = {
                 "mapId": map_id,
                 "zoneId": zone_id,
                 "guid": guid,
                 "name": name,
+                "appVersion": app_version,
+                "appVersionCode": app_version_code,
                 "lat": lat,
                 "lng": lng,
                 "caltopoRttMs": caltopo_rtt_ms,
@@ -195,6 +201,8 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
             "zoneId": "zone-alpha",
             "guid": "zone-alpha",
             "name": "Alpha",
+            "appVersion": "1.5.5(77)",
+            "appVersionCode": 77,
             "lat": 39.1,
             "lng": -121.1
         })
@@ -204,6 +212,8 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
             "zoneId": "zone-bravo",
             "guid": "zone-bravo",
             "name": "Bravo",
+            "appVersion": "1.5.4(76)",
+            "appVersionCode": 76,
             "lat": 39.2,
             "lng": -121.2
         })
@@ -980,6 +990,37 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("MAP1", "DRONE4"), self.hub._owners)
         self.assertTrue(any(call[0][7] is False for call in self.hub.zone_state_updates if len(call[0]) >= 8))
 
+    async def test_disconnected_owner_lease_survives_until_expiry_sweep(self):
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "first_sighting",
+            "mapId": "MAP1",
+            "remoteId": "RID-DISCONNECT-LEASE",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "droneTs": 1000,
+            "distanceFromZoneM": 10.0,
+            "mappedId": "1sar7Dj"
+        })
+        original_owner = dict(self.hub._owners[("MAP1", "RID-DISCONNECT-LEASE")])
+
+        await self.hub.disconnect(self.ws_alpha)
+        await self.hub.expire_stale_entries()
+
+        self.assertEqual(original_owner, self.hub._owners[("MAP1", "RID-DISCONNECT-LEASE")])
+        self.assertEqual([], [
+            call for call in self.hub.owner_state_deletes
+            if call[0][:2] == ("MAP1", "RID-DISCONNECT-LEASE")
+        ])
+
+        self.hub._owners[("MAP1", "RID-DISCONNECT-LEASE")]["lease_expire_ms"] = 1
+        await self.hub.expire_stale_entries()
+
+        self.assertNotIn(("MAP1", "RID-DISCONNECT-LEASE"), self.hub._owners)
+        self.assertTrue(any(
+            call[0][:2] == ("MAP1", "RID-DISCONNECT-LEASE")
+            for call in self.hub.owner_state_deletes
+        ))
+
     async def test_sighting_to_disconnected_owner_is_not_relayed(self):
         await self.hub.handle_message(self.ws_alpha, {
             "type": "first_sighting",
@@ -1008,6 +1049,76 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(before, len(self.ws_alpha.sent_texts))
 
+    async def test_non_owner_heartbeat_does_not_extend_disconnected_owner_lease(self):
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "first_sighting",
+            "mapId": "MAP1",
+            "remoteId": "RID-NONOWNER-HEARTBEAT",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "droneTs": 1000,
+            "distanceFromZoneM": 10.0,
+            "mappedId": "1sar7Dj"
+        })
+        owner = self.hub._owners[("MAP1", "RID-NONOWNER-HEARTBEAT")]
+        original_expire_ms = owner["lease_expire_ms"]
+        await self.hub.disconnect(self.ws_alpha)
+
+        before = len(self.ws_bravo.sent_texts)
+        await self.hub.handle_message(self.ws_bravo, {
+            "type": "heartbeat",
+            "seq": 77,
+            "lat": 39.22,
+            "lng": -121.22,
+        })
+
+        self.assertEqual(original_expire_ms, owner["lease_expire_ms"])
+        ack = json.loads(self.ws_bravo.sent_texts[before])
+        self.assertEqual("heartbeat_ack", ack["type"])
+        self.assertEqual(0, ack["ownerLeaseExpireTs"])
+
+    async def test_reconnect_replays_active_confirmation_but_not_expired_owner(self):
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "drone_confirmed",
+            "mapId": "MAP1",
+            "remoteId": "RID-VALID-REPLAY",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "mappedId": "1SAR7DJ",
+            "trackLabel": "1SAR7DJ",
+        })
+        await self.hub.handle_message(self.ws_alpha, {
+            "type": "drone_confirmed",
+            "mapId": "MAP1",
+            "remoteId": "RID-EXPIRED-REPLAY",
+            "zoneId": "zone-alpha",
+            "guid": "zone-alpha",
+            "mappedId": "1SAR8DJ",
+            "trackLabel": "1SAR8DJ",
+        })
+        self.hub._owners[("MAP1", "RID-EXPIRED-REPLAY")]["lease_expire_ms"] = 1
+        await self.hub.expire_stale_entries()
+
+        ws_alpha_reconnect = FakeWebSocket()
+        await self.hub.connect(ws_alpha_reconnect)
+        await self.hub.handle_message(ws_alpha_reconnect, {
+            "type": "hello",
+            "mapId": "MAP1",
+            "zoneId": "zone-alpha-reconnect",
+            "guid": "zone-alpha-reconnect",
+            "name": "Alpha Reconnect",
+            "lat": 39.1,
+            "lng": -121.1,
+        })
+
+        messages = [json.loads(text) for text in ws_alpha_reconnect.sent_texts]
+        confirmed_remote_ids = [
+            message["remoteId"]
+            for message in messages
+            if message.get("type") == "drone_confirmed"
+        ]
+        self.assertEqual(["RID-VALID-REPLAY"], confirmed_remote_ids)
+
     async def test_missing_caltopo_rtt_defaults_to_unknown_value(self):
         ws_charlie = FakeWebSocket()
         await self.hub.connect(ws_charlie)
@@ -1032,6 +1143,27 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(45, ack["leaseSec"])
         self.assertTrue(ack["idleRecommended"])
         self.assertEqual(120, ack["idleParkSec"])
+        self.assertEqual(77, ack["recommendedAppVersionCode"])
+        self.assertEqual("https://example.org/r2c", ack["updateUrl"])
+
+    async def test_hello_persists_and_broadcasts_app_version(self):
+        state = self.hub.zone_store[("MAP1", "zone-alpha")]
+        self.assertEqual("1.5.5(77)", state["appVersion"])
+        self.assertEqual(77, state["appVersionCode"])
+
+        zone_updates = [
+            json.loads(message)
+            for message in self.ws_bravo.sent_texts
+            if json.loads(message).get("type") == "zone_update"
+        ]
+        alpha = next(
+            zone
+            for update in zone_updates
+            for zone in update["zones"]
+            if zone["zoneId"] == "zone-alpha"
+        )
+        self.assertEqual("1.5.5(77)", alpha["appVersion"])
+        self.assertEqual(77, alpha["appVersionCode"])
 
     async def test_heartbeat_sends_ack_and_echoes_client_seq(self):
         await self.hub.handle_message(self.ws_alpha, {

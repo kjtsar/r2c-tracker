@@ -43,7 +43,7 @@ from suncalc import get_times
 from google.cloud.sql.connector import Connector, IPTypes
 
 # --- CONFIGURATION & DATABASE SETUP ---
-DB_URL = os.environ.get("DATABASE_URL", "sqlite:///./test.db") # Defaults to local file if no Cloud SQL
+DB_URL = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./test.db") # Defaults to local file if no Cloud SQL
 DB_USER = os.environ.get("DB_USER", "undefined")
 DB_PASS = os.environ.get("DB_PASS", "undefined")
 DB_NAME = os.environ.get("DB_NAME", "undefined")
@@ -81,6 +81,8 @@ R2C_LEASE_SEC = int(os.environ.get("R2C_LEASE_SEC", "45"))
 R2C_DB_CLEANUP_SEC = int(os.environ.get("R2C_DB_CLEANUP_SEC", "86400"))
 R2C_HEARTBEAT_ZONE_UPDATE_SEC = int(os.environ.get("R2C_HEARTBEAT_ZONE_UPDATE_SEC", "60"))
 R2C_IDLE_PARK_SEC = int(os.environ.get("R2C_IDLE_PARK_SEC", "120"))
+R2C_RECOMMENDED_APP_VERSION_CODE = int(os.environ.get("R2C_RECOMMENDED_APP_VERSION_CODE", "0") or "0")
+R2C_UPDATE_URL = os.environ.get("R2C_UPDATE_URL", "").strip()
 R2C_COORDINATION_MODE_MAP = "map"
 R2C_COORDINATION_MODE_STANDALONE = "standalone"
 
@@ -236,6 +238,8 @@ class R2CZoneState(Base):
     zone_id = Column(String, index=True, nullable=False)
     guid = Column(String, index=True, nullable=False)
     name = Column(String, default="")
+    app_version = Column(String, default="")
+    app_version_code = Column(Integer, default=0)
     lat = Column(Float, default=0.0)
     lng = Column(Float, default=0.0)
     caltopo_rtt_ms = Column(Integer, default=0)
@@ -347,6 +351,10 @@ async def migrate_r2c_coordination_schema():
                 ))
             if "connection_state" not in columns:
                 await conn.execute(text("ALTER TABLE r2c_zone_state ADD COLUMN connection_state VARCHAR DEFAULT 'online'"))
+            if "app_version" not in columns:
+                await conn.execute(text("ALTER TABLE r2c_zone_state ADD COLUMN app_version VARCHAR DEFAULT ''"))
+            if "app_version_code" not in columns:
+                await conn.execute(text("ALTER TABLE r2c_zone_state ADD COLUMN app_version_code INTEGER DEFAULT 0"))
         elif dialect == "sqlite":
             result = await conn.execute(text("PRAGMA table_info(r2c_zone_state)"))
             columns = {row[1] for row in result.fetchall()}
@@ -358,6 +366,10 @@ async def migrate_r2c_coordination_schema():
                 ))
             if "connection_state" not in columns:
                 await conn.execute(text("ALTER TABLE r2c_zone_state ADD COLUMN connection_state TEXT DEFAULT 'online'"))
+            if "app_version" not in columns:
+                await conn.execute(text("ALTER TABLE r2c_zone_state ADD COLUMN app_version TEXT DEFAULT ''"))
+            if "app_version_code" not in columns:
+                await conn.execute(text("ALTER TABLE r2c_zone_state ADD COLUMN app_version_code INTEGER DEFAULT 0"))
 
 
 async def migrate_flight_archive_schema():
@@ -371,6 +383,12 @@ async def migrate_flight_archive_schema():
                   AND table_name = 'flights'
             """))
             columns = {row[0] for row in result.fetchall()}
+            if "start_lat" not in columns:
+                await conn.execute(text("ALTER TABLE flights ADD COLUMN start_lat DOUBLE PRECISION DEFAULT 0.0"))
+            if "start_lng" not in columns:
+                await conn.execute(text("ALTER TABLE flights ADD COLUMN start_lng DOUBLE PRECISION DEFAULT 0.0"))
+            if "timeofday" not in columns:
+                await conn.execute(text("ALTER TABLE flights ADD COLUMN timeofday VARCHAR DEFAULT 'day'"))
             if "archive_relpath" not in columns:
                 await conn.execute(text("ALTER TABLE flights ADD COLUMN archive_relpath VARCHAR DEFAULT ''"))
             if "remote_id" not in columns:
@@ -379,6 +397,12 @@ async def migrate_flight_archive_schema():
         elif dialect == "sqlite":
             result = await conn.execute(text("PRAGMA table_info(flights)"))
             columns = {row[1] for row in result.fetchall()}
+            if "start_lat" not in columns:
+                await conn.execute(text("ALTER TABLE flights ADD COLUMN start_lat FLOAT DEFAULT 0.0"))
+            if "start_lng" not in columns:
+                await conn.execute(text("ALTER TABLE flights ADD COLUMN start_lng FLOAT DEFAULT 0.0"))
+            if "timeofday" not in columns:
+                await conn.execute(text("ALTER TABLE flights ADD COLUMN timeofday TEXT DEFAULT 'day'"))
             if "archive_relpath" not in columns:
                 await conn.execute(text("ALTER TABLE flights ADD COLUMN archive_relpath TEXT DEFAULT ''"))
             if "remote_id" not in columns:
@@ -450,6 +474,8 @@ class R2CZoneConnection:
         self.zone_id: Optional[str] = None
         self.guid: Optional[str] = None
         self.name: str = ""
+        self.app_version: str = ""
+        self.app_version_code: int = 0
         self.lat: float = 0.0
         self.lng: float = 0.0
         self.caltopo_rtt_ms: int = 0
@@ -758,6 +784,8 @@ class R2CCoordinationHub:
             lat = conn.lat
             lng = conn.lng
             caltopo_rtt_ms = conn.caltopo_rtt_ms
+            app_version = conn.app_version
+            app_version_code = conn.app_version_code
             connection_state = "idle" if conn.connection_state == "idle" else "disconnected"
             connected_at_ms = conn.connected_at_ms
             hello_received_at_ms = conn.hello_received_at_ms
@@ -806,6 +834,8 @@ class R2CCoordinationHub:
                 reported_map_id,
                 coordination_mode,
                 connection_state,
+                app_version,
+                app_version_code,
             )
             await self._delete_confirmation_state_for_zone(map_id, zone_guid, zone_id)
         for owner_map_id, remote_id, owner_guid in confirmed_owner_expirations:
@@ -874,6 +904,8 @@ class R2CCoordinationHub:
             conn.zone_id = zone_id
             conn.guid = payload.get("guid", zone_id)
             conn.name = payload.get("name", zone_id)
+            conn.app_version = str(payload.get("appVersion", "") or "")
+            conn.app_version_code = self._parse_nonnegative_int(payload.get("appVersionCode"))
             conn.lat = lat
             conn.lng = lng
             conn.caltopo_rtt_ms = self._parse_caltopo_rtt_ms(payload.get("caltopoRttMs"))
@@ -904,8 +936,10 @@ class R2CCoordinationHub:
             reported_map_id,
             coordination_mode,
             "online",
+            conn.app_version,
+            conn.app_version_code,
         )
-        await websocket.send_text(json.dumps({
+        hello_ack = {
             "type": "hello_ack",
             "serverTime": now_ms,
             "mapId": map_id,
@@ -913,7 +947,12 @@ class R2CCoordinationHub:
             "leaseSec": R2C_LEASE_SEC,
             "idleRecommended": True,
             "idleParkSec": R2C_IDLE_PARK_SEC
-        }))
+        }
+        if R2C_RECOMMENDED_APP_VERSION_CODE > 0:
+            hello_ack["recommendedAppVersionCode"] = R2C_RECOMMENDED_APP_VERSION_CODE
+        if R2C_UPDATE_URL:
+            hello_ack["updateUrl"] = R2C_UPDATE_URL
+        await websocket.send_text(json.dumps(hello_ack))
         await self.broadcast_zone_update(map_id)
         await self._send_recent_drone_confirmations(websocket, map_id, now_ms)
 
@@ -951,6 +990,8 @@ class R2CCoordinationHub:
             lat = conn.lat
             lng = conn.lng
             caltopo_rtt_ms = conn.caltopo_rtt_ms
+            app_version = conn.app_version
+            app_version_code = conn.app_version_code
             reported_map_id = conn.reported_map_id
             coordination_mode = conn.coordination_mode
         logger.info(
@@ -972,6 +1013,8 @@ class R2CCoordinationHub:
             reported_map_id,
             coordination_mode,
             "idle",
+            app_version,
+            app_version_code,
         )
         await self.broadcast_zone_update(map_id)
 
@@ -1061,6 +1104,8 @@ class R2CCoordinationHub:
             lat = conn.lat
             lng = conn.lng
             caltopo_rtt_ms = conn.caltopo_rtt_ms
+            app_version = conn.app_version
+            app_version_code = conn.app_version_code
             reported_map_id = conn.reported_map_id
             coordination_mode = conn.coordination_mode
             if guid:
@@ -1083,6 +1128,8 @@ class R2CCoordinationHub:
                 reported_map_id,
                 coordination_mode,
                 "online",
+                app_version,
+                app_version_code,
             )
         if old_map_id_for_update and zone_id:
             await self._delete_zone_state(old_map_id_for_update, zone_id)
@@ -1360,6 +1407,8 @@ class R2CCoordinationHub:
                         "zoneId": zone.zone_id,
                         "guid": zone.guid,
                         "name": zone.name,
+                        "appVersion": zone.app_version,
+                        "appVersionCode": zone.app_version_code,
                         "lat": zone.lat,
                         "lng": zone.lng,
                         "caltopoRttMs": zone.caltopo_rtt_ms,
@@ -1403,6 +1452,8 @@ class R2CCoordinationHub:
                 conn.zone_id = zone.zone_id
                 conn.guid = zone.guid
                 conn.name = zone.name
+                conn.app_version = getattr(zone, "app_version", "") or ""
+                conn.app_version_code = int(getattr(zone, "app_version_code", 0) or 0)
                 conn.lat = zone.lat
                 conn.lng = zone.lng
                 conn.caltopo_rtt_ms = zone.caltopo_rtt_ms
@@ -1539,7 +1590,9 @@ class R2CCoordinationHub:
                                  online: bool, last_seen_ms: int,
                                  reported_map_id: str = "",
                                  coordination_mode: str = "map",
-                                 connection_state: str = ""):
+                                 connection_state: str = "",
+                                 app_version: str = "",
+                                 app_version_code: int = 0):
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(R2CZoneState).where(
@@ -1555,6 +1608,8 @@ class R2CCoordinationHub:
             state.coordination_mode = coordination_mode
             state.guid = guid
             state.name = name
+            state.app_version = app_version
+            state.app_version_code = app_version_code
             state.lat = lat
             state.lng = lng
             state.caltopo_rtt_ms = caltopo_rtt_ms
@@ -1804,6 +1859,14 @@ class R2CCoordinationHub:
         except (TypeError, ValueError):
             return 0
         return parsed if parsed > 0 else 0
+
+    @staticmethod
+    def _parse_nonnegative_int(value) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return parsed if parsed >= 0 else 0
 
     async def get_connection_debug_info(self, websocket: WebSocket) -> dict:
         now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
@@ -2284,6 +2347,18 @@ def format_datetime(value):
         return ""
     return value.strftime('%d%b%y@%H:%M:%S-%Z')
 
+def format_duration_hours(value: Optional[float]) -> str:
+    if value is None:
+        return "00:00:00"
+    try:
+        total_seconds = round(float(value) * 3600)
+    except (TypeError, ValueError):
+        return "00:00:00"
+    total_seconds = max(int(total_seconds), 0)
+    hours, rem = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
 def datetime_from_format(fmtstr):
     return datetime.strptime(fmtstr, '%d%b%y@%H:%M:%S-%Z')
 
@@ -2379,6 +2454,8 @@ def build_r2c_snapshot(zones, owners, now_ms: int):
             "zone_id": zone.zone_id,
             "guid": zone.guid,
             "name": zone.name or zone.zone_id,
+            "app_version": getattr(zone, "app_version", "") or "",
+            "app_version_code": int(getattr(zone, "app_version_code", 0) or 0),
             "lat": zone.lat,
             "lng": zone.lng,
             "caltopo_rtt_ms": zone.caltopo_rtt_ms,
@@ -2391,6 +2468,15 @@ def build_r2c_snapshot(zones, owners, now_ms: int):
             "owned_drones": owned_drones,
             "owned_drone_count": len(owned_drones),
         }
+        if R2C_RECOMMENDED_APP_VERSION_CODE > 0:
+            if zone_entry["app_version_code"] <= 0:
+                zone_entry["app_version_status"] = "unknown"
+            elif zone_entry["app_version_code"] < R2C_RECOMMENDED_APP_VERSION_CODE:
+                zone_entry["app_version_status"] = "stale"
+            else:
+                zone_entry["app_version_status"] = "ok"
+        else:
+            zone_entry["app_version_status"] = "unknown" if zone_entry["app_version_code"] <= 0 else "ok"
         maps.setdefault(zone.map_id, []).append(zone_entry)
 
     snapshot_maps = []
@@ -2585,6 +2671,7 @@ async def find_overlap(db, start_time, end_time, remote_id: Optional[str] = None
 
 templates.env.filters["localize_flight_time"] = localize_flight_time
 templates.env.filters["fmt_datetime"] = format_datetime
+templates.env.filters["duration_hms"] = format_duration_hours
 
 # --- ROUTES ---
 @app.put("/upload")

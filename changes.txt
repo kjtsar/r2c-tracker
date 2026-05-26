@@ -1,9 +1,20 @@
-v1.4.18:
-* Added optional tracker idle-state support for parked R2C clients. The
-  tracker now advertises idle parking guidance in hello_ack, accepts a
-  backwards-compatible idle message before clients close /ws/r2c, and
-  shows parked instances as IDLE on /r2c.
-* Idle requests are ignored while the client still owns an active drone
-  lease, preserving owner/relay behavior during live flights.
+v1.4.19:
+* Added RID2Caltopo app-version visibility and upgrade advisory support. The
+  /r2c status page now shows each instance’s reported app version and
+  highlights stale or unknown versions, while deploys now require the
+  recommended R2C versionCode used in websocket upgrade advisories.
+* Added a local pre-release verification gate for r2c-tracker that runs the
+  Python test suite, starts an isolated local tracker, verifies key HTTP
+  pages, and performs an authenticated /ws/r2c protocol smoke test before
+  deployment.
+* Improved /ws/r2c coordination coverage for delayed and out-of-order client
+  messages.
+* Added validation that slower clients can still win ownership when their
+  earlier drone detection arrives late.
+* Added coverage for sightings arriving before owner claims, without creating
+  incorrect owners.
+* Added coverage for delayed drone confirmations overriding prior first-
+  sighting ownership.
+* Added websocket heartbeat acknowledgement to the local release smoke test.
 
 

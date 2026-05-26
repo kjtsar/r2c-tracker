@@ -86,7 +86,9 @@ Server responds:
   "heartbeatSec": 15,
   "leaseSec": 45,
   "idleRecommended": true,
-  "idleParkSec": 120
+  "idleParkSec": 120,
+  "recommendedAppVersionCode": 77,
+  "updateUrl": "https://example.org/r2c-update"
 }
 ```
 
@@ -98,6 +100,8 @@ Effects:
 - the joining zone receives any recent, still-valid `drone_confirmed` events
 - `idleRecommended` and `idleParkSec` are advisory; older clients can ignore
   them and newer clients can use them to park without keeping Cloud Run active
+- `recommendedAppVersionCode` and `updateUrl` are optional upgrade advisories;
+  clients compare only their numeric app `versionCode`
 
 The `mapId` in `hello_ack` is the effective coordination key, which can differ
 from the reported `mapId` for standalone clients.

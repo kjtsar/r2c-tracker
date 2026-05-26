@@ -39,6 +39,8 @@ def load_coordination_classes():
         "R2C_LEASE_SEC": 45,
         "R2C_HEARTBEAT_ZONE_UPDATE_SEC": 60,
         "R2C_IDLE_PARK_SEC": 120,
+        "R2C_RECOMMENDED_APP_VERSION_CODE": 0,
+        "R2C_UPDATE_URL": "",
         "R2C_SWEEP_SEC": 15,
     }
     exec(snippet, namespace)
@@ -191,6 +193,109 @@ class R2CScenarioSimulationTest(unittest.IsolatedAsyncioTestCase):
         owner_events = self.runner.messages_for("zone-alpha", "owner_assigned")
         self.assertEqual("zone-alpha", owner_events[-1]["ownerGuid"])
         self.assertEqual(3, owner_events[-1]["leaseSeq"])
+
+    async def test_delayed_starlink_claim_can_reassign_from_faster_later_claim(self):
+        for zone_id in ("zone-cell", "zone-starlink"):
+            await self.runner.register_zone(zone_id)
+
+        await self.runner.send("zone-cell", {
+            "type": "first_sighting",
+            "mapId": "MAP1",
+            "remoteId": "RID-ASYNC-CLAIM",
+            "droneTs": 5000,
+            "distanceFromZoneM": 12.0,
+            "mappedId": "CELL",
+        })
+        self.assertEqual("zone-cell", self.runner.owner_guid("MAP1", "RID-ASYNC-CLAIM"))
+
+        await self.runner.send("zone-starlink", {
+            "type": "first_sighting",
+            "mapId": "MAP1",
+            "remoteId": "RID-ASYNC-CLAIM",
+            "droneTs": 3000,
+            "distanceFromZoneM": 90.0,
+            "mappedId": "STARLINK",
+        })
+
+        self.assertEqual("zone-starlink", self.runner.owner_guid("MAP1", "RID-ASYNC-CLAIM"))
+        owner_events = self.runner.messages_for("zone-cell", "owner_assigned")
+        self.assertEqual("zone-starlink", owner_events[-1]["ownerGuid"])
+        self.assertEqual(2, owner_events[-1]["leaseSeq"])
+
+    async def test_late_sighting_before_delayed_first_sighting_does_not_create_owner(self):
+        for zone_id in ("zone-cell", "zone-starlink"):
+            await self.runner.register_zone(zone_id)
+
+        await self.runner.send("zone-cell", {
+            "type": "sighting",
+            "mapId": "MAP1",
+            "remoteId": "RID-SIGHTING-FIRST",
+            "droneTs": 5000,
+            "lat": 39.1,
+            "lng": -121.1,
+            "altM": 100.0,
+        })
+        self.assertNotIn(("MAP1", "RID-SIGHTING-FIRST"), self.hub._owners)
+
+        await self.runner.send("zone-starlink", {
+            "type": "first_sighting",
+            "mapId": "MAP1",
+            "remoteId": "RID-SIGHTING-FIRST",
+            "droneTs": 3000,
+            "distanceFromZoneM": 50.0,
+            "mappedId": "STARLINK",
+        })
+        self.assertEqual("zone-starlink", self.runner.owner_guid("MAP1", "RID-SIGHTING-FIRST"))
+
+        before = len(self.runner.messages_for("zone-starlink", "relay_sighting"))
+        await self.runner.send("zone-cell", {
+            "type": "sighting",
+            "mapId": "MAP1",
+            "remoteId": "RID-SIGHTING-FIRST",
+            "droneTs": 6000,
+            "lat": 39.2,
+            "lng": -121.2,
+            "altM": 101.0,
+        })
+        after = len(self.runner.messages_for("zone-starlink", "relay_sighting"))
+        self.assertEqual(before + 1, after)
+
+    async def test_delayed_confirmation_overrides_faster_first_sighting_and_blocks_later_claims(self):
+        for zone_id in ("zone-cell", "zone-starlink", "zone-backup"):
+            await self.runner.register_zone(zone_id)
+
+        await self.runner.send("zone-cell", {
+            "type": "first_sighting",
+            "mapId": "MAP1",
+            "remoteId": "RID-CONFIRM-ORDER",
+            "droneTs": 5000,
+            "distanceFromZoneM": 12.0,
+            "mappedId": "CELL",
+        })
+        self.assertEqual("zone-cell", self.runner.owner_guid("MAP1", "RID-CONFIRM-ORDER"))
+
+        await self.runner.send("zone-starlink", {
+            "type": "drone_confirmed",
+            "mapId": "MAP1",
+            "remoteId": "RID-CONFIRM-ORDER",
+            "mappedId": "STARLINK",
+            "trackLabel": "STARLINK",
+            "ownerName": "Delayed Confirmation",
+        })
+        self.assertEqual("zone-starlink", self.runner.owner_guid("MAP1", "RID-CONFIRM-ORDER"))
+
+        await self.runner.send("zone-backup", {
+            "type": "first_sighting",
+            "mapId": "MAP1",
+            "remoteId": "RID-CONFIRM-ORDER",
+            "droneTs": 1000,
+            "distanceFromZoneM": 5.0,
+            "mappedId": "BACKUP",
+        })
+
+        self.assertEqual("zone-starlink", self.runner.owner_guid("MAP1", "RID-CONFIRM-ORDER"))
+        owner_events = self.runner.messages_for("zone-backup", "owner_assigned")
+        self.assertEqual("zone-starlink", owner_events[-1]["ownerGuid"])
 
     async def test_disconnect_then_expiry_allows_next_zone_to_take_over(self):
         for zone_id in ("zone-alpha", "zone-bravo"):

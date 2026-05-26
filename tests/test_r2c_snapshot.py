@@ -12,6 +12,7 @@ def load_snapshot_helpers():
     namespace = {
         "Optional": __import__("typing").Optional,
         "R2C_HEARTBEAT_SEC": 15,
+        "R2C_RECOMMENDED_APP_VERSION_CODE": 77,
     }
     exec(snippet, namespace)
     return namespace["format_elapsed_ms"], namespace["build_r2c_snapshot"]
@@ -46,6 +47,8 @@ class SnapshotHelpersTest(unittest.TestCase):
                 zone_id="zone-a",
                 guid="guid-a",
                 name="Alpha",
+                app_version="1.5.5(77)",
+                app_version_code=77,
                 lat=39.1,
                 lng=-121.1,
                 caltopo_rtt_ms=1200,
@@ -83,6 +86,8 @@ class SnapshotHelpersTest(unittest.TestCase):
         self.assertEqual(2, snapshot["owned_drone_count"])
         self.assertEqual("MAP1", snapshot["maps"][0]["map_id"])
         self.assertEqual("quiet", snapshot["maps"][0]["zones"][0]["status"])
+        self.assertEqual("1.5.5(77)", snapshot["maps"][0]["zones"][0]["app_version"])
+        self.assertEqual("ok", snapshot["maps"][0]["zones"][0]["app_version_status"])
         self.assertEqual("1SAR7DJ", snapshot["maps"][0]["zones"][0]["owned_drones"][0]["mapped_id"])
         self.assertEqual("RID-1", snapshot["maps"][0]["zones"][0]["owned_drones"][1]["remote_id"])
         self.assertEqual("online", snapshot["maps"][1]["zones"][0]["status"])
@@ -131,6 +136,41 @@ class SnapshotHelpersTest(unittest.TestCase):
         self.assertEqual("idle", zone["connection_state"])
         self.assertFalse(zone["online"])
 
+    def test_build_r2c_snapshot_marks_stale_and_unknown_app_versions(self):
+        now_ms = 1_000_000
+        zones = [
+            types.SimpleNamespace(
+                map_id="MAP1",
+                zone_id="zone-a",
+                guid="guid-a",
+                name="Alpha",
+                app_version="1.5.4(76)",
+                app_version_code=76,
+                lat=39.1,
+                lng=-121.1,
+                caltopo_rtt_ms=1200,
+                online=True,
+                last_seen_ms=999_995,
+            ),
+            types.SimpleNamespace(
+                map_id="MAP1",
+                zone_id="zone-b",
+                guid="guid-b",
+                name="Bravo",
+                lat=39.2,
+                lng=-121.2,
+                caltopo_rtt_ms=1200,
+                online=True,
+                last_seen_ms=999_995,
+            ),
+        ]
+
+        snapshot = build_r2c_snapshot(zones, [], now_ms)
+        by_zone = {zone["zone_id"]: zone for zone in snapshot["maps"][0]["zones"]}
+
+        self.assertEqual("stale", by_zone["zone-a"]["app_version_status"])
+        self.assertEqual("unknown", by_zone["zone-b"]["app_version_status"])
+
     def test_build_r2c_snapshot_preserves_standalone_coordination_group(self):
         now_ms = 1_000_000
         zones = [
@@ -175,6 +215,8 @@ class SnapshotTemplateTest(unittest.TestCase):
         self.assertIn("scheduleIdleAutoReloadStop", template)
         self.assertIn("stopAutoReload();", template)
         self.assertIn("data-connection-state", template)
+        self.assertIn("app-version", template)
+        self.assertIn("unknown version", template)
         self.assertIn("status === 'IDLE'", template)
         self.assertIn("document.visibilityState === 'hidden'", template)
         self.assertIn("document.addEventListener('visibilitychange', syncAutoReloadWithVisibility);", template)

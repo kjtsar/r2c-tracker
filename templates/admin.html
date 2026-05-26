@@ -225,7 +225,7 @@
                   data-dirty-input>
               </td>
               <td class="meta-col">{{ flight.start_time | localize_flight_time(flight.start_lat, flight.start_lng) | fmt_datetime }}</td>
-              <td class="meta-col">{{ "%.2f"|format(flight.hours or 0) }} hr</td>
+              <td class="meta-col">{{ flight.hours | duration_hms }}</td>
               <td class="meta-col">{{ "%.2f"|format(flight.distance_mi or 0) }} mi</td>
             </tr>
             {% endfor %}

@@ -172,6 +172,20 @@
     color: var(--muted);
   }
 
+  .app-version {
+    font-size: 0.88rem;
+    font-weight: 700;
+  }
+
+  .app-version.ok {
+    color: var(--accent);
+  }
+
+  .app-version.stale,
+  .app-version.unknown {
+    color: var(--danger);
+  }
+
   .badge {
     border-radius: 999px;
     padding: 6px 10px;
@@ -408,6 +422,7 @@
         <div class="instance-top">
           <div>
             <h3 class="instance-name">{{ zone.name }}</h3>
+            <div class="app-version {{ zone.app_version_status }}">{{ zone.app_version if zone.app_version else 'unknown version' }}</div>
           </div>
           <span class="badge {{ zone.status }}" data-status-badge data-last-seen-ms="{{ zone.last_seen_ms }}" data-online="{{ 'true' if zone.online else 'false' }}" data-connection-state="{{ zone.connection_state }}">{{ zone.status|upper }}</span>
         </div>

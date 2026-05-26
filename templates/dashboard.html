@@ -68,7 +68,7 @@
             <th>Callsign</th>
             <th>Flight Date</th>
             <th>UAS</th>
-            <th>Duration (Hrs)</th>
+            <th>Duration</th>
             <th>Distance (mi)</th>
             <th>Time Of Day</th>
             <th>Temp (F)</th>
@@ -89,7 +89,7 @@
                 {{ flight.start_time | localize_flight_time(flight.start_lat, flight.start_lng) | fmt_datetime }}
 	    </td>
 	    <td>{{ flight.uas }}</td>
-            <td>{{ flight.hours }}</td>
+            <td>{{ flight.hours | duration_hms }}</td>
             <td>{{ flight.distance_mi }}</td>
 	    <td>{{ flight.timeofday }}</td>
             <td>{{ flight.temp_f }}</td>

@@ -1,6 +1,35 @@
 #!/bin/sh
 set -eu
 
+usage() {
+  echo "Usage: $0 R2C_RECOMMENDED_APP_VERSION_CODE [R2C_UPDATE_URL]" >&2
+  echo "Example: $0 77" >&2
+}
+
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+  usage
+  exit 2
+fi
+
+case "$1" in
+  ""|*[!0-9]*)
+    usage
+    echo "R2C_RECOMMENDED_APP_VERSION_CODE must be a positive integer." >&2
+    exit 2
+    ;;
+esac
+
+if [ "$1" -le 0 ]; then
+  usage
+  echo "R2C_RECOMMENDED_APP_VERSION_CODE must be a positive integer." >&2
+  exit 2
+fi
+
+R2C_RECOMMENDED_APP_VERSION_CODE="$1"
+R2C_UPDATE_URL="${2:-}"
+export R2C_RECOMMENDED_APP_VERSION_CODE
+export R2C_UPDATE_URL
+
 : "${DATABASE_URL:?DATABASE_URL must be set in the environment}"
 : "${TRACKER_ADMIN_PASS:?TRACKER_ADMIN_PASS must be set in the environment}"
 : "${TRACKER_API_KEY:?TRACKER_API_KEY must be set in the environment}"
@@ -83,6 +112,12 @@ export TRACKER_RECENT_VERSIONS
 echo "Using gcloud account: ${GCLOUD_ACCOUNT}"
 echo "Using gcloud project: ${GCLOUD_PROJECT}"
 echo "Resolved tracker version: ${TRACKER_VERSION}"
+echo "Recommended RID2Caltopo versionCode: ${R2C_RECOMMENDED_APP_VERSION_CODE}"
+if [ -n "${R2C_UPDATE_URL}" ]; then
+  echo "RID2Caltopo update URL configured."
+else
+  echo "RID2Caltopo update URL not configured."
+fi
 
 run_gcloud() {
   CLOUDSDK_CORE_DISABLE_PROMPTS=1 gcloud --quiet "$@"
@@ -123,6 +158,8 @@ print(json.dumps({
     "TRACKER_API_KEY": os.environ["TRACKER_API_KEY"],
     "TRACKER_VERSION": os.environ["TRACKER_VERSION"],
     "TRACKER_RECENT_VERSIONS": os.environ["TRACKER_RECENT_VERSIONS"],
+    "R2C_RECOMMENDED_APP_VERSION_CODE": os.environ["R2C_RECOMMENDED_APP_VERSION_CODE"],
+    "R2C_UPDATE_URL": os.environ["R2C_UPDATE_URL"],
 }))
 PY
 
