@@ -4,7 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}R2C Flight Tracker{% endblock %}</title>
+    {% if include_leaflet | default(True) %}
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    {% endif %}
     <style>
       .site-home {
           display: inline-flex;
@@ -72,6 +74,23 @@
       .alert.alert-info    { background:#9747c9; color: white; }
       .alert.alert-success { background:#07de27; color: black; }
       .alert.alert-warning { background:#e30b8d; color: white; }
+      .organization-identity {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          margin: 0 0 16px;
+          border: 1px solid #c8d6e2;
+          border-radius: 9px;
+          padding: 8px 12px;
+          background: #f4f8fb;
+          color: #29445d;
+          font-size: 0.92rem;
+      }
+      .organization-identity strong {
+          color: #183153;
+          letter-spacing: 0.04em;
+      }
     </style>
     {% block extra_head %}{% endblock %}
     <link rel="icon" type="image/png" href="/static/favicon-96x96.png" sizes="96x96" />
@@ -79,11 +98,18 @@
     <link rel="shortcut icon" href="/static/favicon.ico" />
   </head>
 
+  {% set navigation = template_navigation(request, organization_page_designator | default(None)) %}
   <main>
-    <a class="site-home" href="/">
+    <a class="site-home" href="{{ navigation.home_url }}">
       <img src="/static/favicon-96x96.png" alt="R2C Tracker icon">
       <span>R2C Tracker</span>
     </a>
+    {% if organization_page_designator is defined %}
+    <div class="organization-identity" aria-label="Current organization user">
+      <strong>{{ organization_page_designator }}</strong>
+      <span>User: {{ organization_identity_name | default("Guest") }}</span>
+    </div>
+    {% endif %}
     {% for msg in get_flashed_messages(request) %}
     <div class="alert alert-{{ msg.category }}">
       {{ msg.message }}
@@ -197,6 +223,7 @@
   })();
 </script>
 {% endif %}
+{% if include_datetime_script | default(True) %}
 <script>
   document.addEventListener("DOMContentLoaded", function() {
       const timeElements = document.querySelectorAll('.local-datetime');
@@ -215,16 +242,32 @@
       });
   });
 </script>
+{% endif %}
 
 
 
 
 
     <footer style="margin-top: 50px; text-align: center; border-top: 1px solid #ddd; padding-top: 20px;">
+      {% if navigation.scope == "organization" %}
+      <p><a href="/{{ navigation.designator }}" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Organization Dashboard</a></p>
+      <p><a href="/{{ navigation.designator }}/admin/flights" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Flight Records</a></p>
+      <p><a href="/{{ navigation.designator }}/admin" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Organization Admin</a></p>
+      <p><a href="/{{ navigation.designator }}/admin/flights/export" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Export as CSV</a></p>
+      <p style="color: #7f8c8d; font-size: 0.8em;">Tracker Version {{ tracker_version }}</p>
+      {% elif navigation.scope == "platform_admin" %}
+      <p><a href="/platform-admin/organizations" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Platform Administration</a></p>
+      <p><a href="/platform-admin/account" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Platform Account</a></p>
+      <p><a href="/" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Organization Directory</a></p>
+      <p><a href="/versions" style="color: #7f8c8d; text-decoration: none; font-size: 0.8em;">Tracker Version {{ tracker_version }}</a></p>
+      {% elif navigation.scope == "public" %}
+      <p><a href="/versions" style="color: #7f8c8d; text-decoration: none; font-size: 0.8em;">Tracker Version {{ tracker_version }}</a></p>
+      {% else %}
       <p><a href="/r2c" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">R2C Instance Status</a></p>
       <p><a href="/flightlogs/list" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Admin Flight Logs</a></p>
       <p><a href="/admin" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Admin Access</a></p>
       <p><a href="/export" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Export as CSV</a></p>
       <p><a href="/docs" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Docs</a></p>
       <p><a href="/versions" style="color: #7f8c8d; text-decoration: none; font-size: 0.8em;">Tracker Version {{ tracker_version }}</a></p>
+      {% endif %}
     </footer>

@@ -1,0 +1,722 @@
+{% extends "base.html" %}
+
+{% block title %}Platform Costs & Organizations{% endblock %}
+
+{% block extra_head %}
+<style>
+  :root {
+      color-scheme: light;
+      --platform-navy: #17324d;
+      --platform-blue: #236a9f;
+      --platform-sky: #eaf4fb;
+      --platform-ink: #20303d;
+      --platform-muted: #667784;
+      --platform-line: #d8e1e7;
+      --platform-success: #1f7a4d;
+      --platform-warning: #9a5b00;
+      --platform-danger: #a33a32;
+  }
+  body {
+      margin: 0;
+      background:
+          radial-gradient(circle at top right, rgba(35, 106, 159, 0.12), transparent 34rem),
+          #f4f7f9;
+      color: var(--platform-ink);
+  }
+  main {
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 24px;
+  }
+  footer {
+      display: none;
+  }
+  .site-home {
+      margin-bottom: 12px;
+  }
+  .platform-shell {
+      display: grid;
+      gap: 22px;
+  }
+  .platform-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      gap: 24px;
+      padding: 26px 28px;
+      border-radius: 16px;
+      color: white;
+      background: linear-gradient(118deg, var(--platform-navy), #225d80);
+      box-shadow: 0 16px 34px rgba(20, 49, 70, 0.15);
+  }
+  .platform-header h1 {
+      margin: 0 0 8px;
+      font-size: clamp(1.7rem, 3vw, 2.45rem);
+      line-height: 1.05;
+  }
+  .platform-header p {
+      max-width: 700px;
+      margin: 0;
+      color: #dcebf4;
+      line-height: 1.5;
+  }
+  .platform-header-meta {
+      flex: 0 0 auto;
+      text-align: right;
+      font-size: 0.86rem;
+      line-height: 1.55;
+      color: #dcebf4;
+  }
+  .platform-header-meta a,
+  .platform-header-meta button {
+      color: white;
+      font: inherit;
+      font-weight: 700;
+  }
+  .platform-header-meta form { margin: 4px 0 0; }
+  .platform-header-meta button {
+      padding: 4px 9px;
+      border: 1px solid rgba(255, 255, 255, 0.55);
+      border-radius: 6px;
+      background: transparent;
+      cursor: pointer;
+  }
+  .prototype-banner {
+      padding: 14px 18px;
+      border: 1px solid #efcd88;
+      border-radius: 10px;
+      background: #fff7e5;
+      color: #6b4800;
+      line-height: 1.45;
+  }
+  .activation-banner {
+      overflow-wrap: anywhere;
+  }
+  .activation-banner a {
+      color: inherit;
+      font-weight: 700;
+  }
+  .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(145px, 1fr));
+      gap: 14px;
+  }
+  .metric-card {
+      min-height: 116px;
+      padding: 18px;
+      border: 1px solid var(--platform-line);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.96);
+      box-shadow: 0 5px 18px rgba(22, 47, 65, 0.06);
+      text-align: left;
+  }
+  .metric-label {
+      min-height: 34px;
+      color: var(--platform-muted);
+      font-size: 0.8rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+  }
+  .metric-value {
+      margin-top: 9px;
+      color: var(--platform-navy);
+      font-size: 1.62rem;
+      font-weight: 750;
+  }
+  .metric-note {
+      margin-top: 5px;
+      color: var(--platform-muted);
+      font-size: 0.78rem;
+  }
+  .platform-panel {
+      overflow: hidden;
+      border: 1px solid var(--platform-line);
+      border-radius: 14px;
+      background: white;
+      box-shadow: 0 8px 24px rgba(22, 47, 65, 0.07);
+  }
+  .panel-heading {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 18px;
+      padding: 20px 22px;
+      border-bottom: 1px solid var(--platform-line);
+  }
+  .panel-heading h2 {
+      margin: 0;
+      font-size: 1.2rem;
+  }
+  .panel-heading p {
+      margin: 5px 0 0;
+      color: var(--platform-muted);
+      font-size: 0.88rem;
+  }
+  .primary-action {
+      display: inline-flex;
+      align-items: center;
+      padding: 10px 15px;
+      border: 0;
+      border-radius: 8px;
+      background: var(--platform-blue);
+      color: white;
+      font-weight: 700;
+      text-decoration: none;
+      cursor: not-allowed;
+      opacity: 0.58;
+  }
+  .organization-table-scroll {
+      overflow-x: auto;
+  }
+  .organization-table {
+      min-width: 1180px;
+      box-shadow: none;
+  }
+  .organization-table th,
+  .organization-table td {
+      white-space: normal;
+  }
+  .organization-table th {
+      padding: 11px 14px;
+      background: #f3f7fa;
+      color: #546673;
+      font-size: 0.75rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+  }
+  .organization-table td {
+      padding: 15px 14px;
+      color: var(--platform-ink);
+      vertical-align: top;
+  }
+  .organization-table tbody tr:hover {
+      background: #f8fbfd;
+  }
+  .onboarding-form {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      margin: 18px 0 24px;
+      padding: 18px;
+      border: 1px solid var(--platform-line);
+      border-radius: 12px;
+      background: #f8fbfd;
+  }
+  .onboarding-form label {
+      display: grid;
+      gap: 6px;
+      color: var(--platform-muted);
+      font-size: 0.82rem;
+      font-weight: 700;
+  }
+  .onboarding-form input,
+  .onboarding-form textarea {
+      box-sizing: border-box;
+      width: 100%;
+      padding: 10px 11px;
+      border: 1px solid #b8c7d1;
+      border-radius: 7px;
+      background: white;
+      color: var(--platform-ink);
+      font: inherit;
+  }
+  .onboarding-form textarea {
+      min-height: 84px;
+      resize: vertical;
+  }
+  .form-span {
+      grid-column: 1 / -1;
+  }
+  .form-actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+  }
+  .org-name {
+      font-weight: 750;
+      color: var(--platform-navy);
+  }
+  .org-hostname,
+  .secondary-text {
+      margin-top: 4px;
+      color: var(--platform-muted);
+      font-size: 0.82rem;
+  }
+  .postal-address {
+      white-space: pre-line;
+  }
+  .status-badge {
+      display: inline-flex;
+      padding: 5px 9px;
+      border-radius: 999px;
+      background: #edf2f5;
+      color: #405360;
+      font-size: 0.76rem;
+      font-weight: 750;
+      text-transform: capitalize;
+      white-space: nowrap;
+  }
+  .status-badge.active,
+  .status-badge.ready {
+      background: #e5f4ec;
+      color: var(--platform-success);
+  }
+  .status-badge.trial {
+      background: #e8f2fa;
+      color: #215f8b;
+  }
+  .status-badge.pending,
+  .status-badge.activation-pending {
+      background: #fff2dc;
+      color: var(--platform-warning);
+  }
+  .cost-total {
+      color: var(--platform-navy);
+      font-weight: 750;
+  }
+  .credit-form {
+      display: grid;
+      gap: 5px;
+      margin-top: 8px;
+  }
+  .credit-form input {
+      width: 90px;
+      padding: 6px;
+      border: 1px solid #b8c7d1;
+      border-radius: 6px;
+  }
+  .credit-form button {
+      padding: 6px 8px;
+      border: 0;
+      border-radius: 6px;
+      background: #e9b33f;
+      color: #3d310d;
+      font-weight: 750;
+      cursor: pointer;
+  }
+  .cost-breakdown {
+      display: grid;
+      grid-template-columns: repeat(2, auto);
+      gap: 3px 13px;
+      margin-top: 5px;
+      color: var(--platform-muted);
+      font-size: 0.75rem;
+  }
+  .privacy-note {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 12px;
+      padding: 18px 20px;
+      border-top: 1px solid var(--platform-line);
+      background: var(--platform-sky);
+      color: #355164;
+      font-size: 0.88rem;
+      line-height: 1.45;
+  }
+  .control-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 18px;
+  }
+  .control-list {
+      display: grid;
+      gap: 10px;
+      margin-top: 14px;
+  }
+  .control-item {
+      padding: 13px;
+      border: 1px solid var(--platform-line);
+      border-radius: 9px;
+      background: #f8fbfd;
+      color: var(--platform-muted);
+      line-height: 1.45;
+  }
+  .control-item strong {
+      color: var(--platform-navy);
+  }
+  .table-scroll-hint {
+      display: none;
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--platform-line);
+      background: #f8fbfd;
+      color: var(--platform-muted);
+      font-size: 0.8rem;
+  }
+  .privacy-mark {
+      display: grid;
+      width: 30px;
+      height: 30px;
+      place-items: center;
+      border-radius: 50%;
+      background: var(--platform-navy);
+      color: white;
+      font-weight: 800;
+  }
+  @media (max-width: 1100px) {
+      .metric-grid {
+          grid-template-columns: repeat(3, 1fr);
+      }
+  }
+  @media (max-width: 680px) {
+      main {
+          padding: 14px;
+      }
+      .platform-header {
+          align-items: flex-start;
+          flex-direction: column;
+          padding: 22px;
+      }
+      .platform-header-meta {
+          text-align: left;
+      }
+      .metric-grid {
+          grid-template-columns: repeat(2, 1fr);
+      }
+      .panel-heading {
+          align-items: flex-start;
+          flex-direction: column;
+      }
+      .onboarding-form {
+          grid-template-columns: 1fr;
+      }
+      .control-grid {
+          grid-template-columns: 1fr;
+      }
+      .form-span {
+          grid-column: auto;
+      }
+      .table-scroll-hint {
+          display: block;
+      }
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+{% set snapshot = platform_snapshot %}
+<div class="platform-shell">
+  <header class="platform-header">
+    <div>
+      <h1>Costs &amp; Organizations</h1>
+      <p>
+        Commercial control plane for aggregate Google Cloud costs, organization
+        provisioning, trials, subscriptions, and prepaid service balances.
+      </p>
+    </div>
+    <div class="platform-header-meta">
+      <div>Billing data through</div>
+      <strong>{{ snapshot.billing_data_through.strftime("%d %b %Y %H:%M UTC") }}</strong>
+      <div>{{ platform_admin.email }}</div>
+      <a href="/platform-admin/account">Account</a>
+      <form method="post" action="/platform-admin/logout">
+        <input type="hidden" name="form_token" value="{{ account_csrf_token }}">
+        <button type="submit">Sign out</button>
+      </form>
+    </div>
+  </header>
+
+  {% if snapshot.is_illustrative %}
+  <div class="prototype-banner" role="status">
+    <strong>Design prototype:</strong>
+    Billing costs and balances shown here are illustrative.
+    {% if snapshot.organizations_are_illustrative %}
+    Organization and contact records are also illustrative.
+    {% else %}
+    Organization and contact records come from the separate control-plane database.
+    {% endif %}
+  </div>
+  {% elif snapshot.source_status == "ready" %}
+  <div class="prototype-banner" role="status">
+    <strong>{{ snapshot.source_name }}:</strong>
+    {{ snapshot.source_message }}
+  </div>
+  {% else %}
+  <div class="prototype-banner" role="status">
+    <strong>{{ snapshot.source_name }} — {{ snapshot.source_status }}:</strong>
+    {{ snapshot.source_message }}
+  </div>
+  {% endif %}
+
+  {% if activation_url %}
+  <div class="prototype-banner activation-banner" role="status">
+    <strong>Simulation activation link:</strong>
+    <a href="{{ activation_url }}">{{ activation_url }}</a>
+    This is shown only because outbound email is disabled in simulation mode.
+  </div>
+  {% endif %}
+
+  {% if control_plane_simulation and not live_provisioning_ready %}
+  <div class="prototype-banner" role="status">
+    <strong>Live provisioning remains safely disabled:</strong>
+    {% if not email_delivery_configured %}
+    outbound STARTTLS administrator email is not configured.
+    {% else %}
+    one or more HTTPS control-plane prerequisites are unavailable.
+    {% endif %}
+    Pilot organizations may still be created and tested in simulation mode.
+  </div>
+  {% endif %}
+
+  <section class="metric-grid" aria-label="Platform billing summary">
+    <article class="metric-card">
+      <div class="metric-label">
+        {% if snapshot.billing_period_is_current %}Actual GCP cost MTD{% else %}Latest available GCP cost{% endif %}
+      </div>
+      <div class="metric-value">${{ "%.2f"|format(snapshot.actual_cost_mtd) }}</div>
+      <div class="metric-note">
+        Invoice period {{ snapshot.billing_period or "pending" }}
+        {% if snapshot.billing_data_stale %} · stale{% endif %}
+      </div>
+    </article>
+    <article class="metric-card">
+      <div class="metric-label">Attributed to organizations</div>
+      <div class="metric-value">${{ "%.2f"|format(snapshot.attributed_cost_mtd) }}</div>
+      <div class="metric-note">Direct plus allocated usage</div>
+    </article>
+    <article class="metric-card">
+      <div class="metric-label">Unallocated platform cost</div>
+      <div class="metric-value">${{ "%.2f"|format(snapshot.unallocated_cost_mtd) }}</div>
+      <div class="metric-note">Shared services and overhead</div>
+    </article>
+    <article class="metric-card">
+      <div class="metric-label">
+        {{ "Forecast month end" if snapshot.billing_period_is_current else "Latest period total" }}
+      </div>
+      <div class="metric-value">${{ "%.2f"|format(snapshot.forecast_cost) }}</div>
+      <div class="metric-note">
+        {{ "Estimate, not an invoice" if snapshot.billing_period_is_current else "Completed or delayed invoice period" }}
+      </div>
+    </article>
+    <article class="metric-card">
+      <div class="metric-label">Collected MTD</div>
+      <div class="metric-value">${{ "%.2f"|format(snapshot.collected_mtd) }}</div>
+      <div class="metric-note">Settled payments only</div>
+    </article>
+    <article class="metric-card">
+      <div class="metric-label">Organizations</div>
+      <div class="metric-value">{{ snapshot.organizations|length }}</div>
+      <div class="metric-note">All account states</div>
+    </article>
+  </section>
+
+  <section class="platform-panel">
+    <div class="panel-heading">
+      <div>
+        <h2>Organizations</h2>
+        <p>Commercial metadata and monthly aggregate resource usage only.</p>
+      </div>
+      <button class="primary-action" type="button" disabled title="Available after provisioning workflow is implemented">
+        {{ "Simulation mode" if control_plane_simulation else "Live provisioning" }}
+      </button>
+    </div>
+
+    {% if control_plane_enabled %}
+    <form class="onboarding-form" method="post" action="/platform-admin/organizations">
+      <input type="hidden" name="form_token" value="{{ csrf_token }}">
+      <label>
+        Official organization name
+        <input name="legal_name" maxlength="200" required autocomplete="organization">
+      </label>
+      <label>
+        Preferred designator
+        <input name="designator" maxlength="16" required placeholder="NCSSAR"
+               pattern="[A-Za-z][A-Za-z0-9]{1,15}">
+      </label>
+      <label>
+        Primary site administrator
+        <input name="admin_name" maxlength="160" required autocomplete="name">
+      </label>
+      <label>
+        Administrator email
+        <input name="admin_email" type="email" maxlength="320" required autocomplete="email">
+      </label>
+      <label class="form-span">
+        Postal address
+        <textarea name="postal_address" maxlength="2000" autocomplete="street-address"></textarea>
+      </label>
+      <label class="form-span">
+        <input name="pilot_acknowledged" type="checkbox" value="yes" required>
+        The organization understands this is an unpriced pilot with evolving
+        features, retention, metering, and availability.
+      </label>
+      <div class="form-actions form-span">
+        <span>
+          A 30-day trial and restricted flight-record visibility are applied by default.
+        </span>
+        <button class="primary-action" type="submit">Create organization</button>
+      </div>
+    </form>
+    {% else %}
+    <div class="prototype-banner" role="status">
+      Organization creation remains disabled until
+      <code>CONTROL_PLANE_DATABASE_URL</code> and
+      <code>CONTROL_PLANE_SIGNING_KEY</code> are configured.
+    </div>
+    {% endif %}
+
+    <div class="table-scroll-hint">Swipe horizontally to see billing and usage details.</div>
+    <div class="organization-table-scroll" tabindex="0">
+      <table class="organization-table">
+        <thead>
+          <tr>
+            <th>Organization</th>
+            <th>Primary administrator</th>
+            <th>Account</th>
+            <th>Provisioning</th>
+            <th>Billing</th>
+            <th>Credit</th>
+            <th>Usage cost MTD</th>
+            <th>Aggregate usage MTD</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for organization in snapshot.organizations %}
+          <tr>
+            <td>
+              <div class="org-name">{{ organization.designator }} · {{ organization.legal_name }}</div>
+              <div class="org-hostname">{{ organization.hostname }}</div>
+            </td>
+            <td>
+              <div>{{ organization.primary_admin_name }}</div>
+              <div class="secondary-text">{{ organization.primary_admin_email }}</div>
+              {% if organization.primary_admin_postal_address %}
+              <div class="secondary-text postal-address">{{ organization.primary_admin_postal_address }}</div>
+              {% endif %}
+            </td>
+            <td>
+              <span class="status-badge {{ organization.account_status|replace(' ', '-') }}">
+                {{ organization.account_status }}
+              </span>
+              {% if organization.trial_ends_at %}
+              <div class="secondary-text">
+                Trial ends {{ organization.trial_ends_at.strftime("%d %b %Y") }}
+              </div>
+              {% endif %}
+            </td>
+            <td>
+              <span class="status-badge {{ organization.provisioning_status|replace(' ', '-') }}">
+                {{ organization.provisioning_status }}
+              </span>
+              {% if not control_plane_simulation and organization.provisioning_status != "ready" %}
+              <form method="post"
+                    action="/platform-admin/organizations/{{ organization.designator|lower }}/send-invitation">
+                <input type="hidden" name="form_token" value="{{ csrf_token }}">
+                <button type="submit">Send activation</button>
+              </form>
+              {% endif %}
+            </td>
+            <td>
+              <div>{{ organization.billing_mode }}</div>
+            </td>
+            <td>
+              <div class="cost-total">${{ "%.2f"|format(organization.credit_balance) }}</div>
+              {% if control_plane_simulation %}
+              <form class="credit-form" method="post"
+                    action="/platform-admin/organizations/{{ organization.designator|lower }}/credit">
+                <input type="hidden" name="form_token" value="{{ csrf_token }}">
+                <input type="hidden" name="idempotency_key"
+                       value="{{ ledger_nonces[organization.designator] }}">
+                <input type="number" name="amount" min="0.01" max="100000"
+                       step="0.01" value="10.00" aria-label="Simulation credit amount for {{ organization.designator }}">
+                <button type="submit">Add test credit</button>
+              </form>
+              {% endif %}
+            </td>
+            <td>
+              <div class="cost-total">${{ "%.2f"|format(organization.month_to_date_cost.total) }}</div>
+              <div class="cost-breakdown">
+                <span>Compute</span><span>${{ "%.2f"|format(organization.month_to_date_cost.compute) }}</span>
+                <span>Network</span><span>${{ "%.2f"|format(organization.month_to_date_cost.network) }}</span>
+                <span>Storage</span><span>${{ "%.2f"|format(organization.month_to_date_cost.storage) }}</span>
+                <span>Database</span><span>${{ "%.2f"|format(organization.month_to_date_cost.database) }}</span>
+                <span>Other</span><span>${{ "%.2f"|format(organization.month_to_date_cost.other) }}</span>
+              </div>
+            </td>
+            <td>
+              <div class="cost-breakdown">
+                <span>FAA requests</span><span>{{ organization.aggregate_usage.requests }}</span>
+                <span>Network</span><span>{{ organization.aggregate_usage.network_bytes }} B</span>
+                <span>TURN relay</span><span>{{ organization.aggregate_usage.turn_relay_bytes }} B</span>
+                <span>Storage</span><span>{{ organization.aggregate_usage.storage_byte_days }} byte-days</span>
+                <span>Compute</span><span>{{ organization.aggregate_usage.compute_units }}</span>
+                <span>Database</span><span>{{ organization.aggregate_usage.database_units }}</span>
+              </div>
+            </td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="8">
+              {% if control_plane_enabled %}
+              No organization accounts exist yet. Use the onboarding form above
+              to create the first simulated account.
+              {% else %}
+              Organization commercial records are not connected yet. Google
+              Cloud costs remain unallocated until aggregate application usage
+              meters and the control-plane database are implemented.
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="privacy-note">
+      <div class="privacy-mark" aria-hidden="true">P</div>
+      <div>
+        <strong>Tenant privacy boundary:</strong>
+        this control plane receives aggregate billing and provisioning metadata.
+        It has no application route to flight records, flight logs, incident
+        details, aircraft identifiers, or organization user activity.
+      </div>
+    </div>
+  </section>
+
+  {% if control_plane_enabled %}
+  <div class="control-grid">
+    <section class="platform-panel">
+      <div class="panel-heading">
+        <div>
+          <h2>Provisioning jobs</h2>
+          <p>Commercial/infrastructure workflow only; no tenant content.</p>
+        </div>
+      </div>
+      <div class="control-list">
+      {% for job in provisioning_jobs %}
+        <div class="control-item">
+          <strong>{{ job.designator }} · {{ job.state }}</strong><br>
+          {{ job.current_step }}<br>
+          {{ "Simulation" if job.simulation else "Live" }} ·
+          {{ job.created_at.strftime("%d %b %Y %H:%M UTC") }}
+        </div>
+      {% else %}
+        <div class="control-item">No provisioning jobs.</div>
+      {% endfor %}
+      </div>
+    </section>
+
+    <section class="platform-panel">
+      <div class="panel-heading">
+        <div>
+          <h2>Control-plane audit</h2>
+          <p>Commercial and policy changes; credentials are never recorded.</p>
+        </div>
+      </div>
+      <div class="control-list">
+      {% for event in audit_events %}
+        <div class="control-item">
+          <strong>{{ event.designator or "Platform" }} · {{ event.event_type }}</strong><br>
+          {{ event.actor_type }} ·
+          {{ event.created_at.strftime("%d %b %Y %H:%M UTC") }}
+        </div>
+      {% else %}
+        <div class="control-item">No control-plane audit events.</div>
+      {% endfor %}
+      </div>
+    </section>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

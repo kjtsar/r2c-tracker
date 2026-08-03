@@ -10,7 +10,11 @@ jinja2
 psycopg2-binary
 python-multipart
 cloud-sql-python-connector[pg8000]
+google-cloud-bigquery
+google-cloud-secret-manager
+httpx
 pg8000
+qrcode
 websockets
 timezonefinder
 itsdangerous

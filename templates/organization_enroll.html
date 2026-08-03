@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}R2C Tracker Device Enrollment{% endblock %}
+{% block extra_head %}
+<style>
+  .enroll-shell {
+      max-width: 620px;
+      margin: 48px auto;
+      padding: 28px;
+      border: 1px solid #ccd8df;
+      border-radius: 14px;
+      background: white;
+      box-shadow: 0 10px 30px rgba(22, 47, 65, 0.08);
+  }
+  .enroll-shell h1 { margin-top: 0; color: #12344d; }
+  .enroll-shell p { color: #5f717d; line-height: 1.55; }
+  .enroll-status {
+      padding: 14px;
+      border-radius: 9px;
+      background: #fff6dc;
+      color: #674800;
+  }
+  .enroll-error {
+      padding: 14px;
+      border-radius: 9px;
+      background: #fff0f0;
+      color: #8b1f1f;
+  }
+</style>
+{% endblock %}
+{% block content %}
+<section class="enroll-shell">
+  <h1>R2C Tracker device enrollment</h1>
+  {% if enrollment_error %}
+  <div class="enroll-error" role="alert">{{ enrollment_error }}</div>
+  {% else %}
+  <p>
+    This enrollment belongs to
+    <strong>{{ organization.designator }} · {{ organization.legal_name }}</strong>.
+  </p>
+  <div class="enroll-status" role="status">
+    {% if device_credential_issuance_enabled %}
+    Open this enrollment code with RID2Caltopo. The app will exchange it once
+    for a revocable device credential; the credential is never embedded in the
+    QR image.
+    {% elif simulation %}
+    The signed enrollment locator is valid. Tenant-scoped upload and FAA proxy
+    credentials are deliberately not issued while provisioning is in simulation mode.
+    {% else %}
+    Open this link with the RID2Caltopo app to continue secure configuration.
+    {% endif %}
+  </div>
+  <p>
+    Enrollment: {{ campaign.label }}<br>
+    Expires: {{ campaign.expires_at.strftime("%d %b %Y %H:%M UTC") }}
+  </p>
+  {% endif %}
+</section>
+{% endblock %}

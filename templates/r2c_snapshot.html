@@ -280,11 +280,19 @@
     const quietAfterMs = Number(document.body.dataset.quietAfterMs || 0);
     const autoReloadMs = Number(document.body.dataset.autoReloadMs || 0);
     const autoReloadIdleTimeoutMs = Number(document.body.dataset.autoReloadIdleTimeoutMs || 0);
+    const hasActiveInstances = document.body.dataset.hasActiveInstances === 'true';
     const ageElements = document.querySelectorAll('[data-last-seen-ms]');
     const statusElements = document.querySelectorAll('[data-status-badge]');
     const leaseElements = document.querySelectorAll('[data-lease-expire-ms]');
     let reloadIntervalId = null;
+    let ageIntervalId = null;
     let idleTimeoutId = null;
+    let wasSuspended = false;
+    let windowFocused = document.hasFocus();
+
+    function pageHasFocus() {
+      return document.visibilityState === 'visible' && windowFocused;
+    }
 
     function refreshAges() {
       const browserNowMs = Date.now();
@@ -322,8 +330,31 @@
       }
     }
 
+    function stopAgeRefresh() {
+      if (ageIntervalId !== null) {
+        window.clearInterval(ageIntervalId);
+        ageIntervalId = null;
+      }
+    }
+
+    function stopPageWork() {
+      stopAutoReload();
+      stopAgeRefresh();
+      if (idleTimeoutId !== null) {
+        window.clearTimeout(idleTimeoutId);
+        idleTimeoutId = null;
+      }
+    }
+
+    function startAgeRefresh() {
+      if (!hasActiveInstances || !pageHasFocus() || ageIntervalId !== null) {
+        return;
+      }
+      ageIntervalId = window.setInterval(refreshAges, 1000);
+    }
+
     function startAutoReload() {
-      if (autoReloadMs <= 0 || reloadIntervalId !== null || document.visibilityState === 'hidden') {
+      if (autoReloadMs <= 0 || !hasActiveInstances || reloadIntervalId !== null || !pageHasFocus()) {
         return;
       }
       reloadIntervalId = window.setInterval(function() {
@@ -344,26 +375,53 @@
     }
 
     function noteUserActivity() {
+      if (!pageHasFocus()) {
+        stopPageWork();
+        wasSuspended = true;
+        return;
+      }
+      if (!hasActiveInstances) {
+        stopPageWork();
+        return;
+      }
+      startAgeRefresh();
       startAutoReload();
       scheduleIdleAutoReloadStop();
     }
 
-    function syncAutoReloadWithVisibility() {
-      if (document.visibilityState === 'hidden') {
-        stopAutoReload();
+    function syncPageActivity() {
+      if (!pageHasFocus()) {
+        stopPageWork();
+        wasSuspended = true;
+        return;
+      }
+      if (wasSuspended) {
+        window.location.reload();
         return;
       }
       noteUserActivity();
     }
 
+    function handleFocus() {
+      windowFocused = true;
+      syncPageActivity();
+    }
+
+    function handleBlur() {
+      windowFocused = false;
+      syncPageActivity();
+    }
+
     const browserNowMsAtLoad = Date.now();
     refreshAges();
-    window.setInterval(refreshAges, 1000);
-    syncAutoReloadWithVisibility();
-    ['pointerdown', 'keydown', 'scroll', 'touchstart', 'focus'].forEach((eventName) => {
+    syncPageActivity();
+    ['pointerdown', 'keydown', 'scroll', 'touchstart'].forEach((eventName) => {
       window.addEventListener(eventName, noteUserActivity, { passive: true });
     });
-    document.addEventListener('visibilitychange', syncAutoReloadWithVisibility);
+    window.addEventListener('focus', handleFocus);
+    window.addEventListener('blur', handleBlur);
+    window.addEventListener('pageshow', syncPageActivity);
+    document.addEventListener('visibilitychange', syncPageActivity);
   });
 </script>
 {% endblock %}
@@ -374,10 +432,11 @@
   document.body.dataset.quietAfterMs = "{{ heartbeat_sec * 2000 }}";
   document.body.dataset.autoReloadMs = "30000";
   document.body.dataset.autoReloadIdleTimeoutMs = "300000";
+  document.body.dataset.hasActiveInstances = "{{ 'true' if snapshot.active_zone_count else 'false' }}";
 </script>
 <section class="hero">
   <h1>R2C Instance Status</h1>
-  <p>This page shows a live snapshot of currently registered R2C instances and the drones they currently own. Relative ages update live in the browser, and the page falls back to a full reload about every 30 seconds while it remains active and visible. Automatic reloads pause after five minutes without interaction.</p>
+  <p>This page shows a live snapshot of currently registered R2C instances and the drones they currently own. Relative ages and periodic reloads run only while an R2C instance is online and this page has focus. Refresh work stops when the page loses focus, all instances become dormant, or five minutes pass without interaction.</p>
 </section>
 
 <section class="toolbar">

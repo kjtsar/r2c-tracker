@@ -41,7 +41,7 @@ export TRACKER_PORT="${PORT}"
 export PORT="${PORT}"
 
 echo "==> Python syntax check"
-"${PYTHON}" -m py_compile main.py
+"${PYTHON}" -m py_compile main.py faa_proxy.py platform_admin_identity.py platform_admin_auth.py
 
 echo "==> Unit tests"
 "${PYTHON}" -m unittest discover -s tests -p "test_*.py"
@@ -74,6 +74,12 @@ echo "==> HTTP smoke tests"
 curl -fsS -o /dev/null "http://${HOST}:${PORT}/"
 curl -fsS -o /dev/null "http://${HOST}:${PORT}/r2c"
 curl -fsS -o /dev/null "http://${HOST}:${PORT}/versions"
+FAA_UNAUTH_STATUS="$(curl -sS -o /dev/null -w '%{http_code}' \
+  "http://${HOST}:${PORT}/faa/notams?latitude=39.1&longitude=-121.1&radius=2")"
+if [ "${FAA_UNAUTH_STATUS}" != "403" ]; then
+  echo "Expected unauthenticated FAA proxy request to return 403; received ${FAA_UNAUTH_STATUS}." >&2
+  exit 1
+fi
 
 echo "==> /ws/r2c protocol smoke test"
 "${PYTHON}" - "${HOST}" "${PORT}" "${API_KEY}" <<'PY'

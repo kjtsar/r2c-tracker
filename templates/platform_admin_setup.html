@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Set R2C Administrator Password{% endblock %}
+{% block extra_head %}
+<style>
+  .auth-shell {
+      max-width: 460px;
+      margin: 48px auto;
+      padding: 28px;
+      border: 1px solid #ccd8df;
+      border-radius: 14px;
+      background: white;
+      box-shadow: 0 10px 30px rgba(22, 47, 65, 0.08);
+  }
+  .auth-form { display: grid; gap: 16px; }
+  .auth-form label { display: grid; gap: 6px; font-weight: 700; }
+  .auth-form input { padding: 11px; border: 1px solid #aebdc7; border-radius: 7px; }
+  .auth-form button {
+      padding: 11px 16px;
+      border: 0;
+      border-radius: 7px;
+      background: #17324d;
+      color: white;
+      font: inherit;
+      font-weight: 800;
+  }
+</style>
+{% endblock %}
+{% block content %}
+<section class="auth-shell">
+  <h1>Set administrator password</h1>
+  <p>This single-use setup link expires five minutes after it was issued.</p>
+  <form class="auth-form" method="post" action="/platform-admin/setup">
+    <input type="hidden" name="form_token" value="{{ csrf_token }}">
+    <input id="platform-admin-setup-token" type="hidden" name="setup_token"
+           value="{{ setup_token }}">
+    <label>
+      New password
+      <input type="password" name="new_password" required minlength="12"
+             autocomplete="new-password" autofocus>
+    </label>
+    <label>
+      Confirm new password
+      <input type="password" name="new_password_confirm" required minlength="12"
+             autocomplete="new-password">
+    </label>
+    <button type="submit">Save password</button>
+  </form>
+  <script src="/static/platform_admin_setup.js"></script>
+</section>
+{% endblock %}

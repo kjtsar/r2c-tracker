@@ -6,6 +6,11 @@ This is a practical setup guide for standing up the current
 This repo's deployment flow is built around Google Cloud Run and a SQL database 
 referenced by `DATABASE_URL`.
 
+For the isolated `r2c-tracker.com` pilot, see
+[PILOT_SETUP.md](PILOT_SETUP.md). Its named local configuration and guarded
+deployment wrapper leave the legacy `tracker.kjt.us` project configuration
+unchanged.
+
 ## What this deployment needs
 
 - a Google Cloud project
@@ -13,6 +18,7 @@ referenced by `DATABASE_URL`.
 - a SQL database reachable by SQLAlchemy via `DATABASE_URL`
 - a shared tracker token for uploads and `/ws/r2c`
 - an admin password for the tracker web UI
+- FAA NMS OAuth credentials held by the tracker for `/faa/notams`
 
 ## Runtime architecture
 
@@ -25,6 +31,9 @@ The repo currently deploys:
   `TRACKER_API_KEY`
 
 `deploy.sh` handles the Cloud Run deployment and the Secret Manager bootstrap.
+It also supports optional Secret Manager mappings for `DATABASE_URL`,
+`TRACKER_ADMIN_PASS`, and `TRACKER_API_KEY`, a Cloud SQL attachment, and a
+Cloud Storage volume mounted at `/flightlogs-vol`.
 
 ## 1. Create or choose a Google Cloud project
 
@@ -75,6 +84,8 @@ You need three values before deployment:
 export DATABASE_URL='postgresql+asyncpg://...'
 export TRACKER_ADMIN_PASS='choose-a-strong-admin-password'
 export TRACKER_API_KEY='choose-a-shared-r2c-token'
+export FAA_NOTAM_CLIENT_ID='your-faa-client-id'
+export FAA_NOTAM_CLIENT_SECRET='your-faa-client-secret'
 ```
 
 What they do:
@@ -82,6 +93,8 @@ What they do:
 - `DATABASE_URL`: application database connection
 - `TRACKER_ADMIN_PASS`: password for `/admin`
 - `TRACKER_API_KEY`: required for uploads and `/ws/r2c` via `X-SAR-Token`
+- `FAA_NOTAM_CLIENT_ID` and `FAA_NOTAM_CLIENT_SECRET`: stored in Secret Manager
+  and used only by the tracker FAA proxy; required for initial secret creation
 
 Optional but useful:
 

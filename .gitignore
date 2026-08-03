@@ -4,5 +4,11 @@ test.db
 *.json
 .DS_Store
 .env
+.env.*.local
 test
 trackerLog.txt
+
+# Local editor lock and backup files
+*~
+\#*\#
+.#*

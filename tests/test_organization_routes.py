@@ -1,0 +1,1460 @@
+import asyncio
+import csv
+import html
+import io
+import json
+import logging
+import re
+import tarfile
+import tempfile
+import unittest
+from contextlib import ExitStack
+from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+from urllib.parse import parse_qs, urlparse
+
+from fastapi.testclient import TestClient
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from starlette.websockets import WebSocketDisconnect
+
+import main
+from control_plane import ControlPlaneStore, DeviceCredentialRecord, VideoPreflightExchange
+from enrollment import ControlPlaneTokenService
+from platform_admin_identity import PlatformAdminIdentity
+from platform_admin_auth import GoogleIdentity
+
+
+class StaticPlatformAdminIdentityProvider:
+    async def get_current(self):
+        return PlatformAdminIdentity(
+            email="platform@example.test",
+            display_name="Platform Administrator",
+            generation="1",
+        )
+
+
+class FakeGoogleOidcClient:
+    is_configured = True
+
+    def __init__(self, email="admin@ncssar.example"):
+        self.email = email
+
+    def authorization_request(self, redirect_uri):
+        return (
+            "https://accounts.google.test/auth?state=organization-state",
+            {
+                "state": "organization-state",
+                "nonce": "organization-nonce",
+                "verifier": "organization-verifier",
+            },
+        )
+
+    def exchange_code(self, **_kwargs):
+        return GoogleIdentity(
+            subject="organization-google-subject",
+            email=self.email,
+            name="Primary Administrator",
+        )
+
+
+HIDDEN_TOKEN_RE = re.compile(r'name="form_token" value="([^"]+)"')
+ACTIVATION_LINK_RE = re.compile(
+    r'href="(https://r2c-tracker\.com/ncssar/activate\?token=[^"]+)"'
+)
+QR_SRC_RE = re.compile(r'src="([^"]+/qr\.svg)"')
+IDEMPOTENCY_RE = re.compile(r'name="idempotency_key"\s+value="([^"]+)"')
+PLATFORM_FORM_TOKEN_RE = re.compile(
+    r'<form class="onboarding-form".*?name="form_token" value="([^"]+)"',
+    re.DOTALL,
+)
+STREAM_REQUEST_TOKEN_RE = re.compile(
+    r'action="/ncssar/streams/[^"]+/request".*?'
+    r'name="form_token" value="([^"]+)"',
+    re.DOTALL,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+class OrganizationRouteFlowTest(unittest.TestCase):
+    def test_scoped_upload_route_is_registered(self):
+        paths = {route.path for route in main.app.routes}
+        self.assertIn("/{designator}/upload", paths)
+
+    def test_scoped_upload_rejects_cross_organization_credential(self):
+        credential = DeviceCredentialRecord(
+            id="credential-1",
+            organization_id="organization-1",
+            designator="OTHER",
+            device_name="Tablet",
+            platform="ios",
+            expires_at=datetime.now(),
+        )
+        with self.assertRaises(main.HTTPException) as raised:
+            main.require_scoped_upload_credential("ncssar", credential)
+        self.assertEqual(403, raised.exception.status_code)
+
+    def test_scoped_upload_accepts_matching_credential(self):
+        credential = DeviceCredentialRecord(
+            id="credential-1",
+            organization_id="organization-1",
+            designator="NCSSAR",
+            device_name="Tablet",
+            platform="ios",
+            expires_at=datetime.now(),
+        )
+        self.assertIs(
+            credential,
+            main.require_scoped_upload_credential("ncssar", credential),
+        )
+
+    def test_scoped_upload_reaches_archive_handler(self):
+        credential = DeviceCredentialRecord(
+            id="credential-1",
+            organization_id="organization-1",
+            designator="NCSSAR",
+            device_name="Tablet",
+            platform="ios",
+            expires_at=datetime.now(),
+        )
+
+        async def matching_credential():
+            return credential
+
+        main.app.dependency_overrides[main.get_api_key] = matching_credential
+        try:
+            # An empty payload is rejected by the archive handler with 400;
+            # the former missing organization route returned 404.
+            response = self.client.put("/ncssar/upload", json={})
+        finally:
+            main.app.dependency_overrides.pop(main.get_api_key, None)
+        self.assertEqual(400, response.status_code)
+
+
+    def test_stream_event_socket_yields_to_form_navigation(self):
+        script = Path("static/organization_streams_live.js").read_text()
+        submit_listener = (
+            'document.addEventListener("submit", stopForNavigation, true)'
+        )
+        self.assertIn(submit_listener, script)
+        self.assertIn("stopped = true", script)
+        self.assertLess(script.index(submit_listener), script.index("connect();"))
+
+    def test_stream_event_socket_stops_without_focus(self):
+        script = Path("static/organization_streams_live.js").read_text()
+
+        self.assertIn("document.hasFocus()", script)
+        self.assertIn('window.addEventListener("blur", handleBlur)', script)
+        self.assertIn('window.addEventListener("focus", handleFocus)', script)
+        self.assertIn("windowFocused = true", script)
+        self.assertIn("function suspend()", script)
+        self.assertIn("if (socket !== connectedSocket) return", script)
+
+    def test_stream_event_socket_listens_while_focused_without_active_stream(self):
+        script = Path("static/organization_streams_live.js").read_text()
+
+        self.assertNotIn('state.dataset.active !== "true"', script)
+        self.assertIn("readyStateDiffers(message)", script)
+        self.assertIn("message.revision !== renderedRevision", script)
+        self.assertIn("pendingReload = true", script)
+
+    def test_video_start_marker_retries_until_the_server_acknowledges_it(self):
+        script = Path("static/video_media.js").read_text()
+
+        self.assertIn("if (!response.ok) throw new Error", script)
+        self.assertIn("startedReported = true", script)
+        self.assertIn("if (!startedReported) {", script)
+        self.assertLess(
+            script.index("if (!response.ok) throw new Error"),
+            script.index("startedReported = true"),
+        )
+
+    def test_video_decoder_stall_keeps_live_packet_flow_connected(self):
+        script = Path("static/video_media.js").read_text()
+
+        self.assertIn("videoBytesReceived > lastVideoBytes", script)
+        self.assertIn("waiting for decoder recovery", script)
+        self.assertIn("now - lastPacketProgressAt >= 15000", script)
+        self.assertNotIn("now - lastFrameProgressAt >= 6000", script)
+
+    def test_passive_stream_refresh_requires_an_advertised_r2c_stream(self):
+        lingering_request = SimpleNamespace(
+            id="request-1",
+            device_name="Tablet 1",
+            state="pending",
+            route_kind="unknown",
+            estimated_uplink_bps=0,
+            selected_width=None,
+            selected_height=None,
+            selected_fps=None,
+            selected_bitrate_bps=None,
+            expires_at=datetime.now(),
+        )
+
+        status = main.organization_stream_status([], [lingering_request])
+
+        self.assertFalse(status["active"])
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        database_path = Path(self.temp_dir.name) / "control-plane.db"
+        self.store = ControlPlaneStore(
+            f"sqlite+aiosqlite:///{database_path}"
+        )
+        asyncio.run(self.store.init())
+        flight_database_path = Path(self.temp_dir.name) / "flights.db"
+        self.flight_engine = create_async_engine(
+            f"sqlite+aiosqlite:///{flight_database_path}"
+        )
+        self.flight_sessions = async_sessionmaker(
+            bind=self.flight_engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        asyncio.run(self.create_flight_schema())
+
+        async def test_get_db():
+            async with self.flight_sessions() as session:
+                yield session
+
+        main.app.dependency_overrides[main.get_db] = test_get_db
+        self.tokens = ControlPlaneTokenService(
+            "route-test-signing-key-that-is-longer-than-thirty-two-characters",
+            "https://r2c-tracker.com",
+        )
+        self.patches = ExitStack()
+        self.patches.enter_context(
+            patch.object(main, "control_plane_store", self.store)
+        )
+        self.patches.enter_context(
+            patch.object(main, "control_plane_tokens", self.tokens)
+        )
+        self.patches.enter_context(
+            patch.object(
+                main,
+                "platform_admin_identity_provider",
+                StaticPlatformAdminIdentityProvider(),
+            )
+        )
+        self.patches.enter_context(patch.object(main, "CONTROL_PLANE_SIMULATION", True))
+        self.patches.enter_context(patch.object(main, "SECRET_KEY", "route-test-secret"))
+        asyncio.run(
+            self.store.ensure_platform_admin(
+                email="platform@example.test",
+                display_name="Platform Administrator",
+                bootstrap_password="platform secret phrase",
+            )
+        )
+        self.client = TestClient(main.app)
+        login_page = self.client.get("/platform-admin/login")
+        login = self.client.post(
+            "/platform-admin/login",
+            data={
+                "form_token": self.form_token(login_page),
+                "email": "platform@example.test",
+                "password": "platform secret phrase",
+                "next": "/platform-admin/organizations",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(303, login.status_code)
+
+    def tearDown(self):
+        self.client.close()
+        main.app.dependency_overrides.pop(main.get_db, None)
+        self.patches.close()
+        asyncio.run(self.store.dispose())
+        asyncio.run(self.flight_engine.dispose())
+        self.temp_dir.cleanup()
+
+    async def create_flight_schema(self):
+        async with self.flight_engine.begin() as connection:
+            await connection.run_sync(main.Base.metadata.create_all)
+
+    async def add_flight(self, organization_id, sar_id):
+        async with self.flight_sessions() as session:
+            flight = main.Flight(
+                organization_id=organization_id,
+                sar_id=sar_id,
+                uas="m3t",
+                start_time=datetime(2026, 7, 1, 12, 0),
+                end_time=datetime(2026, 7, 1, 12, 10),
+                start_lat=39.0,
+                start_lng=-121.0,
+                hours=1 / 6,
+                distance_mi=1.0,
+            )
+            session.add(flight)
+            await session.commit()
+            return flight.id
+
+    async def all_flights(self):
+        async with self.flight_sessions() as session:
+            result = await session.execute(select(main.Flight).order_by(main.Flight.id))
+            return result.scalars().all()
+
+    @staticmethod
+    def form_token(response):
+        match = HIDDEN_TOKEN_RE.search(response.text)
+        if match is None:
+            raise AssertionError("Form token not found")
+        return html.unescape(match.group(1))
+
+    @staticmethod
+    def platform_form_token(response):
+        match = PLATFORM_FORM_TOKEN_RE.search(response.text)
+        if match is None:
+            raise AssertionError("Platform organization form token not found")
+        return html.unescape(match.group(1))
+
+    def test_organization_pages_show_guest_or_authenticated_member(self):
+        organization = asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Primary Administrator",
+                admin_email="admin@ncssar.example",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        guest_page = self.client.get("/ncssar/login")
+        self.assertEqual(200, guest_page.status_code)
+        self.assertIn("User: Guest", guest_page.text)
+        self.assertIn('href="/ncssar/admin"', guest_page.text)
+        self.assertNotIn('href="/admin"', guest_page.text)
+        self.assertIn('class="site-home" href="/ncssar"', guest_page.text)
+        self.assertNotIn('href="/r2c"', guest_page.text)
+        self.assertNotIn('href="/docs"', guest_page.text)
+
+        directory_page = self.client.get("/")
+        self.assertNotIn('href="/r2c"', directory_page.text)
+        self.assertNotIn('href="/admin"', directory_page.text)
+        self.assertNotIn('href="/flightlogs/list"', directory_page.text)
+        self.assertNotIn('href="/export"', directory_page.text)
+        self.assertNotIn('href="/docs"', directory_page.text)
+
+        versions_page = self.client.get("/versions")
+        self.assertNotIn('href="/r2c"', versions_page.text)
+        self.assertNotIn('href="/admin"', versions_page.text)
+
+        asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+            )
+        )
+        login_page = self.client.get("/ncssar/login")
+        login = self.client.post(
+            "/ncssar/login",
+            data={
+                "form_token": self.form_token(login_page),
+                "email": organization.primary_admin_email,
+                "password": "correct horse battery staple",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(303, login.status_code)
+
+        authenticated_login_page = self.client.get("/ncssar/login")
+        self.assertIn(
+            "User: Primary Administrator",
+            authenticated_login_page.text,
+        )
+        admin_page = self.client.get("/ncssar/admin")
+        self.assertIn("User: Primary Administrator", admin_page.text)
+        self.assertIn('href="/ncssar/admin"', admin_page.text)
+        self.assertIn('href="/ncssar/admin/flights"', admin_page.text)
+
+    def test_platform_navigation_does_not_expose_legacy_admin_links(self):
+        self.client.cookies.clear()
+        page = self.client.get("/platform-admin/login")
+        self.assertEqual(200, page.status_code)
+        self.assertIn(
+            'class="site-home" href="/platform-admin/organizations"',
+            page.text,
+        )
+        self.assertIn('href="/platform-admin/account"', page.text)
+        self.assertNotIn('href="/r2c"', page.text)
+        self.assertNotIn('href="/admin"', page.text)
+        self.assertNotIn('href="/flightlogs/list"', page.text)
+        self.assertNotIn('href="/export"', page.text)
+        self.assertNotIn('href="/docs"', page.text)
+
+        legacy_page = self.client.get("/r2c")
+        self.assertEqual(200, legacy_page.status_code)
+        self.assertIn('href="/admin"', legacy_page.text)
+        self.assertIn('href="/flightlogs/list"', legacy_page.text)
+
+    def test_records_admin_is_tenant_scoped_and_imports_namespaced_archive(self):
+        ncssar = asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Primary Administrator",
+                admin_email="admin@ncssar.example",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        exsar = asyncio.run(
+            self.store.create_organization(
+                legal_name="Example Search and Rescue",
+                designator="EXSAR",
+                admin_name="Other Administrator",
+                admin_email="admin@exsar.example",
+                postal_address="200 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        asyncio.run(
+            self.store.activate_owner(
+                ncssar.designator,
+                ncssar.primary_admin_email,
+                "correct horse battery staple",
+            )
+        )
+        login_page = self.client.get("/ncssar/login")
+        login = self.client.post(
+            "/ncssar/login",
+            data={
+                "form_token": self.form_token(login_page),
+                "email": ncssar.primary_admin_email,
+                "password": "correct horse battery staple",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(303, login.status_code)
+
+        ncssar_flight_id = asyncio.run(self.add_flight(ncssar.id, "NCSSAR-FLIGHT"))
+        exsar_flight_id = asyncio.run(self.add_flight(exsar.id, "EXSAR-FLIGHT"))
+        legacy_flight_id = asyncio.run(self.add_flight(None, "LEGACY-FLIGHT"))
+
+        page = self.client.get("/ncssar/admin/flights")
+        self.assertEqual(200, page.status_code)
+        self.assertIn("NCSSAR-FLIGHT", page.text)
+        self.assertNotIn("EXSAR-FLIGHT", page.text)
+        self.assertNotIn("LEGACY-FLIGHT", page.text)
+        self.assertIn('action="/ncssar/admin/flights/import-archive"', page.text)
+        self.assertIn('href="/ncssar/admin/flights/export"', page.text)
+        self.assertIn('href="/ncssar/admin/flights/archive"', page.text)
+
+        exported = self.client.get("/ncssar/admin/flights/export")
+        self.assertEqual(200, exported.status_code)
+        self.assertIn("NCSSAR-FLIGHT", exported.text)
+        self.assertNotIn("EXSAR-FLIGHT", exported.text)
+        self.assertNotIn("LEGACY-FLIGHT", exported.text)
+
+        token = self.form_token(page)
+        missing_csrf = self.client.post(
+            "/ncssar/admin/flights/delete",
+            data={},
+            follow_redirects=False,
+        )
+        self.assertEqual(403, missing_csrf.status_code)
+        deleted = self.client.post(
+            "/ncssar/admin/flights/batch",
+            data={
+                "form_token": token,
+                "action": "delete_selected",
+                "flight_ids": [str(ncssar_flight_id), str(exsar_flight_id)],
+                "delete_ids": [str(ncssar_flight_id), str(exsar_flight_id)],
+                f"sar_id_{ncssar_flight_id}": "NCSSAR-FLIGHT",
+                f"uas_{ncssar_flight_id}": "m3t",
+                f"sar_id_{exsar_flight_id}": "EXSAR-FLIGHT",
+                f"uas_{exsar_flight_id}": "m3t",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(303, deleted.status_code)
+        remaining_ids = {flight.id for flight in asyncio.run(self.all_flights())}
+        self.assertNotIn(ncssar_flight_id, remaining_ids)
+        self.assertIn(exsar_flight_id, remaining_ids)
+        self.assertIn(legacy_flight_id, remaining_ids)
+
+        start_ms = int(datetime(2026, 7, 2, 12, 0).timestamp() * 1000)
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "properties": {"title": "1SAR7m3t_track"},
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [
+                        [-121.0, 39.0, 100.0, start_ms],
+                        [-120.99, 39.01, 100.0, start_ms + 120_000],
+                    ],
+                },
+            }],
+        }
+        archive_bytes = io.BytesIO()
+        payload = json.dumps(geojson).encode("utf-8")
+        with tarfile.open(fileobj=archive_bytes, mode="w:gz") as archive:
+            member = tarfile.TarInfo("2026/07/flightlog_1_ncssar.json")
+            member.size = len(payload)
+            archive.addfile(member, io.BytesIO(payload))
+        archive_bytes.seek(0)
+
+        archive_root = Path(self.temp_dir.name) / "flightlogs"
+        with patch.object(main, "BASE_LOG_DIRECTORY", str(archive_root)):
+            imported = self.client.post(
+                "/ncssar/admin/flights/import-archive",
+                data={"form_token": token},
+                files={
+                    "file": (
+                        "legacy-flightlogs.tgz",
+                        archive_bytes.getvalue(),
+                        "application/gzip",
+                    )
+                },
+                follow_redirects=False,
+            )
+
+        self.assertEqual(303, imported.status_code)
+        flights = asyncio.run(self.all_flights())
+        imported_flights = [
+            flight for flight in flights if flight.organization_id == ncssar.id
+        ]
+        self.assertEqual(1, len(imported_flights))
+        self.assertTrue(
+            imported_flights[0].archive_relpath.startswith(
+                "organizations/ncssar/2026/07/"
+            )
+        )
+        self.assertEqual(
+            {exsar_flight_id, legacy_flight_id},
+            {
+                flight.id for flight in flights
+                if flight.organization_id != ncssar.id
+            },
+        )
+
+        exported_after_import = self.client.get(
+            "/ncssar/admin/flights/export"
+        )
+        exported_rows = list(
+            csv.DictReader(io.StringIO(exported_after_import.text))
+        )
+        self.assertEqual(1, len(exported_rows))
+        exported_rows[0]["Incident"] = "Restored Incident"
+        exported_rows[0]["Temp (F)"] = "72.5"
+        backfill_csv = io.StringIO()
+        writer = csv.DictWriter(
+            backfill_csv,
+            fieldnames=list(exported_rows[0].keys()),
+        )
+        writer.writeheader()
+        writer.writerows(exported_rows)
+        backfilled = self.client.post(
+            "/ncssar/admin/flights/backfill-csv",
+            data={"form_token": token},
+            files={
+                "file": (
+                    "legacy-admin.csv",
+                    backfill_csv.getvalue().encode("utf-8"),
+                    "text/csv",
+                )
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(303, backfilled.status_code)
+        flights = asyncio.run(self.all_flights())
+        restored = next(
+            flight for flight in flights if flight.organization_id == ncssar.id
+        )
+        self.assertEqual("Restored Incident", restored.incident)
+        self.assertEqual(72.5, restored.temp_f)
+
+        with patch.object(main, "BASE_LOG_DIRECTORY", str(archive_root)):
+            downloaded_archive = self.client.get(
+                "/ncssar/admin/flights/archive"
+            )
+        self.assertEqual(200, downloaded_archive.status_code)
+        with tarfile.open(
+            fileobj=io.BytesIO(downloaded_archive.content),
+            mode="r:gz",
+        ) as archive:
+            names = archive.getnames()
+        self.assertEqual(1, len(names))
+        self.assertTrue(names[0].startswith("2026/07/flightlog_"))
+
+    def test_directory_is_sorted_and_restricted_organizations_require_login(self):
+        zulu = asyncio.run(
+            self.store.create_organization(
+                legal_name="Zulu County Search and Rescue",
+                designator="ZCSAR",
+                admin_name="Zulu Administrator",
+                admin_email="admin@zulu.example",
+                postal_address="200 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        alpha = asyncio.run(
+            self.store.create_organization(
+                legal_name="Alpha County Search and Rescue",
+                designator="ACSAR",
+                admin_name="Alpha Administrator",
+                admin_email="admin@alpha.example",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        hidden = asyncio.run(
+            self.store.create_organization(
+                legal_name="Hidden County Search and Rescue",
+                designator="HCSAR",
+                admin_name="Hidden Administrator",
+                admin_email="admin@hidden.example",
+                postal_address="300 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        for organization in (zulu, alpha):
+            asyncio.run(
+                self.store.update_settings(
+                    organization_id=organization.id,
+                    records_visibility="public",
+                    record_retention_days=730,
+                    log_retention_days=30,
+                    notification_email=organization.primary_admin_email,
+                    actor_id="organization-owner",
+                )
+            )
+
+        directory = self.client.get("/")
+        self.assertEqual(200, directory.status_code)
+        self.assertIn("https://www.rid2caltopo.com/tracker", directory.text)
+        self.assertIn('href="/acsar"', directory.text)
+        self.assertIn('href="/zcsar"', directory.text)
+        self.assertIn(hidden.legal_name, directory.text)
+        self.assertIn("Sign-in required", directory.text)
+        self.assertLess(
+            directory.text.index(alpha.legal_name),
+            directory.text.index(zulu.legal_name),
+        )
+        with patch.object(
+            main,
+            "render_public_dashboard",
+            new=AsyncMock(return_value=main.HTMLResponse("public dashboard")),
+        ):
+            self.assertEqual(200, self.client.get("/acsar").status_code)
+        restricted = self.client.get("/hcsar", follow_redirects=False)
+        self.assertEqual(303, restricted.status_code)
+        self.assertEqual(
+            "/hcsar/login?next=%2Fhcsar",
+            restricted.headers["location"],
+        )
+        asyncio.run(
+            self.store.activate_owner(
+                hidden.designator,
+                hidden.primary_admin_email,
+                "correct horse battery staple",
+            )
+        )
+        login_page = self.client.get(restricted.headers["location"])
+        self.assertIn('name="next" value="/hcsar"', login_page.text)
+        login = self.client.post(
+            "/hcsar/login",
+            data={
+                "form_token": self.form_token(login_page),
+                "email": hidden.primary_admin_email,
+                "password": "correct horse battery staple",
+                "next": "/hcsar",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(303, login.status_code)
+        self.assertEqual("/hcsar", login.headers["location"])
+        with patch.object(
+            main,
+            "render_public_dashboard",
+            new=AsyncMock(return_value=main.HTMLResponse("restricted dashboard")),
+        ):
+            self.assertEqual(200, self.client.get("/hcsar").status_code)
+
+    def test_platform_and_organization_logins_coexist_and_logout_independently(self):
+        organization = asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Primary Administrator",
+                admin_email="admin@ncssar.example",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+            )
+        )
+
+        organization_login_page = self.client.get("/ncssar/login")
+        organization_login = self.client.post(
+            "/ncssar/login",
+            data={
+                "form_token": self.form_token(organization_login_page),
+                "email": organization.primary_admin_email,
+                "password": "correct horse battery staple",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(303, organization_login.status_code)
+        self.assertEqual(
+            200,
+            self.client.get("/platform-admin/organizations").status_code,
+        )
+
+        platform_page = self.client.get("/platform-admin/organizations")
+        platform_logout = self.client.post(
+            "/platform-admin/logout",
+            data={"form_token": self.form_token(platform_page)},
+            follow_redirects=False,
+        )
+        self.assertEqual(303, platform_logout.status_code)
+        self.assertEqual(200, self.client.get("/ncssar/admin").status_code)
+
+        platform_login_page = self.client.get("/platform-admin/login")
+        platform_login = self.client.post(
+            "/platform-admin/login",
+            data={
+                "form_token": self.form_token(platform_login_page),
+                "email": "platform@example.test",
+                "password": "platform secret phrase",
+                "next": "/platform-admin/organizations",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(303, platform_login.status_code)
+        self.assertEqual(200, self.client.get("/ncssar/admin").status_code)
+
+        organization_page = self.client.get("/ncssar/admin")
+        organization_logout = self.client.post(
+            "/ncssar/logout",
+            data={"form_token": self.form_token(organization_page)},
+            follow_redirects=False,
+        )
+        self.assertEqual(303, organization_logout.status_code)
+        self.assertEqual(
+            200,
+            self.client.get("/platform-admin/organizations").status_code,
+        )
+
+    def test_signed_out_organization_page_redirects_to_login(self):
+        asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Primary Administrator",
+                admin_email="admin@ncssar.example",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+
+        response = self.client.get(
+            "/ncssar/streams",
+            follow_redirects=False,
+        )
+
+        self.assertEqual(303, response.status_code)
+        self.assertEqual("/ncssar/login", response.headers["location"])
+
+    def test_onboarding_activation_and_enrollment_qr_flow(self):
+        platform_page = self.client.get(
+            "/platform-admin/organizations",
+        )
+        self.assertEqual(200, platform_page.status_code)
+        self.assertEqual("no-store", platform_page.headers["cache-control"])
+        self.assertEqual("no-referrer", platform_page.headers["referrer-policy"])
+        self.assertIn(
+            "frame-ancestors 'none'",
+            platform_page.headers["content-security-policy"],
+        )
+        self.assertNotIn("unpkg.com", platform_page.text)
+
+        created = self.client.post(
+            "/platform-admin/organizations",
+            data={
+                "form_token": self.platform_form_token(platform_page),
+                "legal_name": "North County Search and Rescue",
+                "designator": "NCSSAR",
+                "admin_name": "Primary Administrator",
+                "admin_email": "admin@ncssar.example",
+                "postal_address": "100 Rescue Way",
+                "pilot_acknowledged": "yes",
+            },
+            follow_redirects=True,
+        )
+        self.assertEqual(200, created.status_code)
+        self.assertIn("NCSSAR", created.text)
+        self.assertIn("100 Rescue Way", created.text)
+        self.assertIn("Provisioning jobs", created.text)
+        self.assertIn("Control-plane audit", created.text)
+        self.assertIn("organization.created", created.text)
+        activation_match = ACTIVATION_LINK_RE.search(created.text)
+        self.assertIsNotNone(activation_match)
+        idempotency_match = IDEMPOTENCY_RE.search(created.text)
+        self.assertIsNotNone(idempotency_match)
+        credited = self.client.post(
+            "/platform-admin/organizations/ncssar/credit",
+            data={
+                "form_token": self.platform_form_token(created),
+                "idempotency_key": idempotency_match.group(1),
+                "amount": "10.00",
+            },
+            follow_redirects=True,
+        )
+        self.assertEqual(200, credited.status_code)
+        self.assertIn("Recorded $10.00 simulation credit", credited.text)
+        activation_url = html.unescape(activation_match.group(1))
+        activation_path = urlparse(activation_url).path + "?" + urlparse(
+            activation_url
+        ).query
+
+        activation_page = self.client.get(activation_path)
+        self.assertEqual(200, activation_page.status_code)
+        activation_token = urlparse(activation_url).query.split("token=", 1)[1]
+        activated = self.client.post(
+            "/ncssar/activate",
+            data={
+                "form_token": self.form_token(activation_page),
+                "token": activation_token,
+                "password": "correct horse battery staple",
+                "password_confirm": "correct horse battery staple",
+            },
+            follow_redirects=True,
+        )
+        self.assertEqual(200, activated.status_code)
+        self.assertIn("NCSSAR administration", activated.text)
+        self.assertIn("Credit balance:", activated.text)
+        self.assertIn("$10.00", activated.text)
+        self.assertIn("Simulation prepaid account credit", activated.text)
+
+        campaign_created = self.client.post(
+            "/ncssar/enrollments",
+            data={
+                "form_token": self.form_token(activated),
+                "label": "Drone team training",
+                "expires_in_hours": "168",
+                "max_redemptions": "25",
+            },
+            follow_redirects=True,
+        )
+        self.assertEqual(200, campaign_created.status_code)
+        self.assertIn("Drone team training", campaign_created.text)
+        qr_match = QR_SRC_RE.search(campaign_created.text)
+        self.assertIsNotNone(qr_match)
+
+        qr_response = self.client.get(html.unescape(qr_match.group(1)))
+        self.assertEqual(200, qr_response.status_code)
+        self.assertEqual("image/svg+xml", qr_response.headers["content-type"])
+        self.assertIn(b"<svg", qr_response.content)
+        self.assertEqual("no-store", qr_response.headers["cache-control"])
+        self.assertIn(
+            "NCSSAR-enrollment-",
+            qr_response.headers["content-disposition"],
+        )
+        organization = asyncio.run(self.store.get_organization("NCSSAR"))
+        campaign = asyncio.run(
+            self.store.list_enrollment_campaigns(organization.id)
+        )[0]
+        enrollment_token = self.tokens.enrollment_token(
+            organization,
+            campaign,
+        )
+        with patch.object(main, "DEVICE_CREDENTIAL_ISSUANCE_ENABLED", True):
+            redeemed = self.client.post(
+                "/api/v1/device-enrollment/redeem",
+                json={
+                    "token": enrollment_token,
+                    "device_name": "Android field tablet",
+                    "platform": "android",
+                },
+            )
+        self.assertEqual(200, redeemed.status_code)
+        self.assertEqual("no-store", redeemed.headers["cache-control"])
+        self.assertEqual(
+            "https://r2c-tracker.com/ncssar",
+            redeemed.json()["tracker"]["base_url"],
+        )
+        installed_token = redeemed.json()["tracker"]["api_key"]
+        self.assertTrue(installed_token.startswith("r2c_dev_"))
+        self.assertTrue(
+            asyncio.run(main.authenticate_tracker_token(installed_token))
+        )
+        with self.assertRaises(WebSocketDisconnect):
+            with self.client.websocket_connect(
+                "/othersar/ws/r2c",
+                headers={"X-SAR-Token": installed_token},
+            ):
+                pass
+
+    def test_active_organization_user_can_sign_in_with_google(self):
+        organization = asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Primary Administrator",
+                admin_email="admin@ncssar.example",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+            )
+        )
+
+        with patch.object(main, "google_oidc_client", FakeGoogleOidcClient()):
+            login_page = self.client.get("/ncssar/login")
+            self.assertIn("Continue with Google", login_page.text)
+            start = self.client.get(
+                "/ncssar/google/start",
+                follow_redirects=False,
+            )
+            self.assertEqual(303, start.status_code)
+            self.assertTrue(
+                start.headers["location"].startswith(
+                    "https://accounts.google.test/auth"
+                )
+            )
+            callback = self.client.get(
+                "/google/callback"
+                "?code=test-code&state=organization-state",
+                follow_redirects=False,
+            )
+
+        self.assertEqual(303, callback.status_code)
+        self.assertEqual(
+            "/ncssar/admin",
+            callback.headers["location"],
+        )
+        self.assertEqual(
+            200,
+            self.client.get("/ncssar/admin").status_code,
+        )
+
+    def test_video_requester_sees_sorted_streams_and_request_stays_pending(self):
+        organization = asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Primary Administrator",
+                admin_email="admin@ncssar.example",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        owner = asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+            )
+        )
+        campaign = asyncio.run(
+            self.store.create_enrollment_campaign(
+                organization_id=organization.id,
+                label="Video tablet",
+                created_by_user_id=owner.id,
+                expires_in_hours=24,
+                max_redemptions=1,
+            )
+        )
+        device = asyncio.run(
+            self.store.issue_device_credential(
+                campaign_id=campaign.id,
+                organization_id=organization.id,
+                device_name="Android video tablet",
+                platform="android",
+            )
+        )
+        with self.client.websocket_connect(
+            "/ncssar/ws/r2c",
+            headers={"X-SAR-Token": device.token},
+        ) as websocket:
+            websocket.send_json(
+                {
+                    "type": "video_stream_advertisement",
+                    "incidentName": "Alpha",
+                    "timeZone": "America/Los_Angeles",
+                    "streams": [
+                        {
+                            "sessionId": "00000000-0000-0000-0000-000000000001",
+                            "droneDesignator": "10A",
+                            "sourceWidth": 1920,
+                            "sourceHeight": 1080,
+                            "sourceFps": 30,
+                            "sourceBitrateBps": 4_000_000,
+                            "sourceCodec": "h264",
+                        },
+                        {
+                            "sessionId": "00000000-0000-0000-0000-000000000002",
+                            "droneDesignator": "2B",
+                            "sourceWidth": 1280,
+                            "sourceHeight": 720,
+                            "sourceFps": 30,
+                            "sourceBitrateBps": 2_000_000,
+                            "sourceCodec": "h264",
+                        },
+                    ],
+                }
+            )
+            acknowledgement = websocket.receive_json()
+            self.assertEqual(
+                "video_stream_advertisement_ack",
+                acknowledgement["type"],
+            )
+            self.assertTrue(acknowledgement["accepted"])
+        login_page = self.client.get("/ncssar/login")
+        login = self.client.post(
+            "/ncssar/login",
+            data={
+                "form_token": self.form_token(login_page),
+                "email": organization.primary_admin_email,
+                "password": "correct horse battery staple",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(303, login.status_code)
+
+        streams_page = self.client.get("/ncssar/streams")
+
+        self.assertEqual(200, streams_page.status_code)
+        self.assertEqual("no-store", streams_page.headers["cache-control"])
+        self.assertLess(streams_page.text.index("10A"), streams_page.text.index("2B"))
+        self.assertIn("Request video", streams_page.text)
+        self.assertIn("Android video tablet", streams_page.text)
+        self.assertIn("R2C instance", streams_page.text)
+        self.assertIn("/static/organization_streams_live.js", streams_page.text)
+        self.assertIn("does not start video", streams_page.text)
+        self.assertNotIn("/whep", streams_page.text)
+        self.assertNotIn("/streams/status", streams_page.text)
+        with self.client.websocket_connect(
+            "/ncssar/streams/events"
+        ) as event_websocket:
+            self.assertEqual("ready", event_websocket.receive_json()["type"])
+            event_websocket.portal.call(
+                main.organization_stream_event_hub.broadcast,
+                organization.id,
+            )
+            self.assertEqual(
+                "streams_changed",
+                event_websocket.receive_json()["type"],
+            )
+        stream_form_token = html.unescape(
+            STREAM_REQUEST_TOKEN_RE.search(streams_page.text).group(1)
+        )
+        request = self.client.post(
+            "/ncssar/streams/"
+            "00000000-0000-0000-0000-000000000001/request",
+            data={
+                "form_token": stream_form_token
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(303, request.status_code)
+
+        request_id = parse_qs(
+            urlparse(request.headers["location"]).query
+        )["preflight"][0]
+        # A competing lifecycle reload can omit the redirect query.  The
+        # session-carried request must still start the browser preflight.
+        request = self.client.get("/ncssar/streams")
+        self.assertEqual(200, request.status_code)
+        self.assertIn("Video will remain off", request.text)
+        self.assertIn("pending", request.text)
+        self.assertIn("Request in progress", request.text)
+        self.assertIn("request-button\" type=\"button\" disabled", request.text)
+        self.assertRegex(request.text, r"\bP(?:S|D)T\b")
+        self.assertIn("/static/video_preflight.js", request.text)
+        offer_sdp = (
+            "v=0\r\n"
+            "o=- 1 2 IN IP4 127.0.0.1\r\n"
+            "s=-\r\n"
+            "t=0 0\r\n"
+        )
+        offer_response = self.client.post(
+            f"/ncssar/streams/requests/{request_id}/preflight/offer",
+            json={
+                "sdp": offer_sdp,
+                "form_token": stream_form_token,
+            },
+        )
+        self.assertEqual(200, offer_response.status_code)
+        self.assertTrue(offer_response.json()["accepted"])
+        self.assertFalse(offer_response.json()["delivered"])
+
+        with self.client.websocket_connect(
+            "/ws/r2c",
+            headers={"X-SAR-Token": device.token},
+        ) as replay_websocket:
+            replay_websocket.send_json(
+                {
+                    "type": "video_stream_advertisement",
+                    "incidentName": "Alpha",
+                    "streams": [
+                        {
+                            "sessionId": (
+                                "00000000-0000-0000-0000-000000000001"
+                            ),
+                            "droneDesignator": "10A",
+                        }
+                    ],
+                }
+            )
+            replay_ack = replay_websocket.receive_json()
+            self.assertEqual(
+                "video_stream_advertisement_ack",
+                replay_ack["type"],
+            )
+            replayed_request = replay_websocket.receive_json()
+            self.assertEqual("video_stream_request", replayed_request["type"])
+            self.assertEqual(
+                organization.primary_admin_email,
+                replayed_request["requesterEmail"],
+            )
+            self.assertEqual(1920, replayed_request["sourceWidth"])
+            self.assertEqual(4_000_000, replayed_request["sourceBitrateBps"])
+            self.assertTrue(replayed_request["consentRequired"])
+            preflight_offer = replay_websocket.receive_json()
+            self.assertEqual("video_preflight_offer", preflight_offer["type"])
+            self.assertEqual(request_id, preflight_offer["requestId"])
+            self.assertEqual(offer_sdp, preflight_offer["sdp"])
+            self.assertEqual(2000, preflight_offer["probeDurationMs"])
+            answer_sdp = (
+                "v=0\r\n"
+                "o=- 2 3 IN IP4 127.0.0.1\r\n"
+                "s=-\r\n"
+                "t=0 0\r\n"
+            )
+            replay_websocket.send_json(
+                {
+                    "type": "video_preflight_answer",
+                    "requestId": request_id,
+                    "sdp": answer_sdp,
+                }
+            )
+            answer_ack = replay_websocket.receive_json()
+            self.assertEqual(
+                "video_preflight_answer_ack",
+                answer_ack["type"],
+            )
+            self.assertTrue(answer_ack["accepted"])
+
+            async def store_legacy_apple_answer():
+                async with self.store.sessions() as session:
+                    exchange = await session.get(
+                        VideoPreflightExchange,
+                        request_id,
+                    )
+                    exchange.device_answer_sdp = (
+                        answer_sdp + "a=max-message-size:262144"
+                    )
+                    await session.commit()
+
+            asyncio.run(store_legacy_apple_answer())
+            preflight_status = self.client.get(
+                f"/ncssar/streams/requests/{request_id}/preflight/status"
+            )
+            self.assertEqual(200, preflight_status.status_code)
+            self.assertEqual(
+                answer_sdp,
+                preflight_status.json()["answerSdp"],
+            )
+            replay_websocket.send_json(
+                {
+                    "type": "video_preflight_result",
+                    "requestId": replayed_request["requestId"],
+                    "routeKind": "direct",
+                    "estimatedUplinkBps": 8_000_000,
+                }
+            )
+            preflight_ack = replay_websocket.receive_json()
+            self.assertEqual(
+                "video_preflight_result_ack",
+                preflight_ack["type"],
+            )
+            self.assertTrue(preflight_ack["accepted"])
+            self.assertEqual("awaiting_approval", preflight_ack["state"])
+            preflight_page = self.client.get("/ncssar/streams")
+            self.assertIn("Direct", preflight_page.text)
+            self.assertIn("8.0", preflight_page.text)
+            self.assertIn("0.0 MB transferred", preflight_page.text)
+            self.assertIn("Video 0 B received", preflight_page.text)
+            self.assertIn("VoIP 0 B to R2C", preflight_page.text)
+            self.assertIn("0 B from R2C", preflight_page.text)
+            self.assertIn("awaiting_approval", preflight_page.text)
+            self.assertIn("Cancel", preflight_page.text)
+            cancel_response = self.client.post(
+                f"/ncssar/streams/requests/{request_id}/cancel",
+                data={"form_token": stream_form_token},
+                follow_redirects=True,
+            )
+            self.assertEqual(200, cancel_response.status_code)
+            self.assertIn("tablet was notified", cancel_response.text)
+            cancellation = replay_websocket.receive_json()
+            self.assertEqual(
+                "video_stream_request_cancelled",
+                cancellation["type"],
+            )
+            self.assertEqual(request_id, cancellation["requestId"])
+
+        cancelled_page = self.client.get("/ncssar/streams")
+        self.assertIn("cancelled", cancelled_page.text)
+
+        self.assertEqual(
+            404,
+            self.client.get("/organization/ncssar/streams").status_code,
+        )
+
+    def test_video_requester_event_socket_wakes_from_empty_stream_list(self):
+        organization = asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Primary Administrator",
+                admin_email="admin@ncssar.example",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+            )
+        )
+        login_page = self.client.get("/ncssar/login")
+        login = self.client.post(
+            "/ncssar/login",
+            data={
+                "form_token": self.form_token(login_page),
+                "email": organization.primary_admin_email,
+                "password": "correct horse battery staple",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(303, login.status_code)
+
+        with self.client.websocket_connect(
+            "/ncssar/streams/events"
+        ) as event_websocket:
+            ready = event_websocket.receive_json()
+            self.assertEqual("ready", ready["type"])
+            self.assertFalse(ready["active"])
+            self.assertRegex(ready["revision"], r"^[0-9a-f]{20}$")
+            event_websocket.portal.call(
+                main.organization_stream_event_hub.broadcast,
+                organization.id,
+            )
+            self.assertEqual(
+                "streams_changed",
+                event_websocket.receive_json()["type"],
+            )
+
+    def test_google_email_must_be_active_in_the_organization(self):
+        organization = asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Primary Administrator",
+                admin_email="admin@ncssar.example",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+            )
+        )
+
+        with patch.object(
+            main,
+            "google_oidc_client",
+            FakeGoogleOidcClient("other@example.test"),
+        ):
+            self.client.get(
+                "/ncssar/google/start",
+                follow_redirects=False,
+            )
+            callback = self.client.get(
+                "/google/callback"
+                "?code=test-code&state=organization-state",
+                follow_redirects=False,
+            )
+
+        self.assertEqual(303, callback.status_code)
+        self.assertEqual(
+            "/ncssar/login",
+            callback.headers["location"],
+        )
+        protected = self.client.get(
+            "/ncssar/admin",
+            follow_redirects=False,
+        )
+        self.assertEqual(303, protected.status_code)
+        self.assertEqual("/ncssar/login", protected.headers["location"])
+
+    def test_matching_google_email_activates_pending_member(self):
+        organization = asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Primary Administrator",
+                admin_email="admin@ncssar.example",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+
+        with patch.object(
+            main,
+            "google_oidc_client",
+            FakeGoogleOidcClient(organization.primary_admin_email),
+        ):
+            self.client.get(
+                "/ncssar/google/start",
+                follow_redirects=False,
+            )
+            callback = self.client.get(
+                "/google/callback"
+                "?code=test-code&state=organization-state",
+                follow_redirects=False,
+            )
+
+        self.assertEqual(303, callback.status_code)
+        self.assertEqual(
+            "/ncssar/admin",
+            callback.headers["location"],
+        )
+        admin_page = self.client.get("/ncssar/admin")
+        self.assertEqual(200, admin_page.status_code)
+        self.assertIn("active", admin_page.text)
+
+    def test_cross_tenant_session_is_rejected(self):
+        asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Administrator",
+                admin_email="admin@ncssar.example",
+                postal_address="",
+                actor_id="platform-admin",
+            )
+        )
+        asyncio.run(
+            self.store.create_organization(
+                legal_name="Example County Search and Rescue",
+                designator="EXSAR",
+                admin_name="Administrator",
+                admin_email="admin@exsar.example",
+                postal_address="",
+                actor_id="platform-admin",
+            )
+        )
+        invitation = asyncio.run(
+            self.store.get_invitation("NCSSAR", "admin@ncssar.example")
+        )
+        asyncio.run(
+            self.store.activate_owner(
+                "NCSSAR",
+                "admin@ncssar.example",
+                "correct horse battery staple",
+                activation_nonce=invitation.activation_nonce,
+            )
+        )
+        login_page = self.client.get("/ncssar/login")
+        login = self.client.post(
+            "/ncssar/login",
+            data={
+                "form_token": self.form_token(login_page),
+                "email": "admin@ncssar.example",
+                "password": "correct horse battery staple",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(303, login.status_code)
+
+        response = self.client.get(
+            "/exsar/admin",
+            follow_redirects=False,
+        )
+
+        self.assertEqual(303, response.status_code)
+        self.assertEqual("/exsar/login", response.headers["location"])
+        records_response = self.client.get(
+            "/exsar/admin/flights",
+            follow_redirects=False,
+        )
+        self.assertEqual(303, records_response.status_code)
+        self.assertEqual("/exsar/login", records_response.headers["location"])
+
+        ex_invitation = asyncio.run(
+            self.store.get_invitation("EXSAR", "admin@exsar.example")
+        )
+        ex_owner = asyncio.run(
+            self.store.activate_owner(
+                "EXSAR",
+                "admin@exsar.example",
+                "another correct battery staple",
+                activation_nonce=ex_invitation.activation_nonce,
+            )
+        )
+        ex_organization = asyncio.run(self.store.get_organization("EXSAR"))
+        ex_campaign = asyncio.run(
+            self.store.create_enrollment_campaign(
+                organization_id=ex_organization.id,
+                label="EXSAR private enrollment",
+                created_by_user_id=ex_owner.id,
+                expires_in_hours=24,
+                max_redemptions=5,
+            )
+        )
+        cross_tenant_qr = self.client.get(
+            f"/ncssar/enrollments/{ex_campaign.id}/qr.svg"
+        )
+        self.assertEqual(404, cross_tenant_qr.status_code)
+
+    def test_live_org_site_requires_https_only_session_cookie(self):
+        with (
+            patch.object(main, "CONTROL_PLANE_SIMULATION", False),
+            patch.object(main, "SESSION_COOKIE_HTTPS_ONLY", False),
+        ):
+            self.assertFalse(main.organization_site_ready())
+
+        with (
+            patch.object(main, "CONTROL_PLANE_SIMULATION", False),
+            patch.object(main, "SESSION_COOKIE_HTTPS_ONLY", True),
+        ):
+            self.assertTrue(main.organization_site_ready())
+
+
+if __name__ == "__main__":
+    unittest.main()

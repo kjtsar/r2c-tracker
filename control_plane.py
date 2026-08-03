@@ -1,0 +1,4253 @@
+import hashlib
+import json
+import re
+import secrets
+import uuid
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from typing import Iterable, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from sqlalchemy import (
+    Boolean,
+    BigInteger,
+    DateTime,
+    ForeignKey,
+    Integer,
+    Numeric,
+    inspect,
+    String,
+    Text,
+    UniqueConstraint,
+    delete,
+    event,
+    func,
+    select,
+    text,
+    update,
+)
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+
+DESIGNATOR_RE = re.compile(r"^[A-Z][A-Z0-9]{1,15}$")
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+ROLE_NAMES = frozenset(
+    {
+        "organization_owner",
+        "billing_admin",
+        "user_admin",
+        "records_admin",
+        "records_viewer",
+        "video_requester",
+    }
+)
+DEFAULT_OWNER_ROLES = (
+    "billing_admin",
+    "organization_owner",
+    "records_admin",
+    "records_viewer",
+    "user_admin",
+    "video_requester",
+)
+ONBOARDING_STEPS = (
+    "reserve organization identity and hostname",
+    "prepare tenant database boundary",
+    "prepare tenant object-storage boundary",
+    "prepare tenant secret references",
+    "prepare hostname routing",
+    "run tenant health checks",
+    "prepare administrator activation",
+)
+
+# A preflight can under-report when the synthetic TURN probe itself stalls.
+# Keep the exception deliberately narrow: only the smallest field-usable
+# profile may exceed the measured result.
+EMERGENCY_VIDEO_MAX_LONG_EDGE = 640
+EMERGENCY_VIDEO_MAX_FPS = 5.0
+EMERGENCY_VIDEO_MAX_BITRATE_BPS = 200_000
+
+
+def is_emergency_video_fallback(
+    *,
+    width: int,
+    height: int,
+    fps_milli: int,
+    bitrate_bps: int,
+) -> bool:
+    return (
+        width > 0
+        and height > 0
+        and max(width, height) <= EMERGENCY_VIDEO_MAX_LONG_EDGE
+        and 0 < fps_milli <= int(EMERGENCY_VIDEO_MAX_FPS * 1000)
+        and 0 < bitrate_bps <= EMERGENCY_VIDEO_MAX_BITRATE_BPS
+    )
+
+
+class ControlPlaneError(Exception):
+    pass
+
+
+class DuplicateOrganizationError(ControlPlaneError):
+    pass
+
+
+class InvalidOrganizationError(ControlPlaneError):
+    pass
+
+
+def require_separate_database(control_plane_url: str, tenant_database_url: str) -> None:
+    if (
+        control_plane_url
+        and tenant_database_url
+        and control_plane_url.strip() == tenant_database_url.strip()
+    ):
+        raise ValueError(
+            "CONTROL_PLANE_DATABASE_URL must not be the tenant DATABASE_URL."
+        )
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+def utc_now() -> datetime:
+    return datetime.now(tz=UTC)
+
+
+def as_utc(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def new_id() -> str:
+    return str(uuid.uuid4())
+
+
+def device_token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+class Organization(Base):
+    __tablename__ = "organizations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    legal_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    designator: Mapped[str] = mapped_column(String(16), unique=True, index=True)
+    hostname: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), default="trial")
+    provisioning_state: Mapped[str] = mapped_column(
+        String(32), default="simulation pending"
+    )
+    billing_mode: Mapped[str] = mapped_column(String(32), default="shadow billing")
+    trial_starts_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    trial_ends_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    records_visibility: Mapped[str] = mapped_column(String(24), default="restricted")
+    record_retention_days: Mapped[int] = mapped_column(Integer, default=730)
+    log_retention_days: Mapped[int] = mapped_column(Integer, default=30)
+    notification_email: Mapped[str] = mapped_column(String(320), default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class OrganizationContact(Base):
+    __tablename__ = "organization_contacts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id"), index=True
+    )
+    contact_role: Mapped[str] = mapped_column(String(32), default="primary_admin")
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    email: Mapped[str] = mapped_column(String(320), nullable=False)
+    postal_address: Mapped[str] = mapped_column(Text, default="")
+    notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+
+
+class OrganizationUser(Base):
+    __tablename__ = "organization_users"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "email", name="uq_org_user_email"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id"), index=True
+    )
+    email: Mapped[str] = mapped_column(String(320), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    password_hash: Mapped[str] = mapped_column(Text, default="")
+    roles_json: Mapped[str] = mapped_column(Text, default="[]")
+    state: Mapped[str] = mapped_column(String(24), default="invited")
+    activation_nonce: Mapped[str] = mapped_column(String(64), default=new_id)
+    activation_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True)
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    last_login_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True)
+    )
+
+    @property
+    def roles(self) -> tuple[str, ...]:
+        values = json.loads(self.roles_json or "[]")
+        return tuple(value for value in values if value in ROLE_NAMES)
+
+    def set_roles(self, roles: tuple[str, ...]) -> None:
+        invalid = set(roles) - ROLE_NAMES
+        if invalid:
+            raise ValueError(f"Unknown organization roles: {sorted(invalid)}")
+        self.roles_json = json.dumps(sorted(set(roles)))
+
+
+class OrganizationLoginThrottle(Base):
+    __tablename__ = "organization_login_throttles"
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id",
+            "email",
+            name="uq_org_login_throttle",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id"), index=True
+    )
+    email: Mapped[str] = mapped_column(String(320), nullable=False)
+    failure_count: Mapped[int] = mapped_column(Integer, default=0)
+    window_started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    locked_until: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True)
+    )
+
+
+class PlatformAdminUser(Base):
+    __tablename__ = "platform_admin_users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    password_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(String(24), default="active")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    last_login_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True)
+    )
+
+
+class PlatformAdminLoginThrottle(Base):
+    __tablename__ = "platform_admin_login_throttles"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    failure_count: Mapped[int] = mapped_column(Integer, default=0)
+    window_started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    locked_until: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True)
+    )
+
+
+class PlatformAdminPasswordSetupToken(Base):
+    __tablename__ = "platform_admin_password_setup_tokens"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    email: Mapped[str] = mapped_column(String(320), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    identity_generation: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
+class PlatformAdminPasswordSetupThrottle(Base):
+    __tablename__ = "platform_admin_password_setup_throttles"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    request_count: Mapped[int] = mapped_column(Integer, default=0)
+    window_started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    last_requested_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True)
+    )
+
+
+class ProvisioningJob(Base):
+    __tablename__ = "provisioning_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id"), index=True
+    )
+    state: Mapped[str] = mapped_column(String(24), default="queued")
+    current_step: Mapped[str] = mapped_column(String(160), default="")
+    steps_json: Mapped[str] = mapped_column(Text, default="[]")
+    simulation: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True)
+    )
+
+
+class Subscription(Base):
+    __tablename__ = "subscriptions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id"), unique=True, index=True
+    )
+    state: Mapped[str] = mapped_column(String(24), default="trial")
+    collection_method: Mapped[str] = mapped_column(
+        String(32), default="not configured"
+    )
+    billing_cadence: Mapped[str] = mapped_column(
+        String(24), default="not configured"
+    )
+    external_customer_id: Mapped[str] = mapped_column(String(160), default="")
+    external_subscription_id: Mapped[str] = mapped_column(String(160), default="")
+    trial_starts_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True)
+    )
+    trial_ends_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True)
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class UsageDaily(Base):
+    __tablename__ = "usage_daily"
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id",
+            "usage_date",
+            name="uq_usage_daily_organization_date",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id"), index=True
+    )
+    usage_date: Mapped[str] = mapped_column(String(10), nullable=False)
+    compute_units: Mapped[Decimal] = mapped_column(
+        Numeric(20, 6), default=Decimal("0")
+    )
+    compute_cost: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), default=Decimal("0")
+    )
+    network_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    network_cost: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), default=Decimal("0")
+    )
+    storage_byte_days: Mapped[int] = mapped_column(BigInteger, default=0)
+    storage_cost: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), default=Decimal("0")
+    )
+    database_units: Mapped[Decimal] = mapped_column(
+        Numeric(20, 6), default=Decimal("0")
+    )
+    database_cost: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), default=Decimal("0")
+    )
+    faa_proxy_requests: Mapped[int] = mapped_column(Integer, default=0)
+    faa_proxy_cost: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), default=Decimal("0")
+    )
+    turn_relay_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    turn_relay_cost: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), default=Decimal("0")
+    )
+    other_cost: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), default=Decimal("0")
+    )
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+
+
+class BillingLedgerEntry(Base):
+    __tablename__ = "billing_ledger"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_billing_ledger_idempotency"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id"), index=True
+    )
+    entry_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 4), nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), default="USD")
+    description: Mapped[str] = mapped_column(String(240), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    external_reference: Mapped[str] = mapped_column(String(200), default="")
+    created_by_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_by_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+
+
+class ControlPlaneAuditEvent(Base):
+    __tablename__ = "control_plane_audit_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("organizations.id"), index=True
+    )
+    actor_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    details_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+
+
+class EnrollmentCampaign(Base):
+    __tablename__ = "enrollment_campaigns"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id"), index=True
+    )
+    label: Mapped[str] = mapped_column(String(160), nullable=False)
+    created_by_user_id: Mapped[str] = mapped_column(
+        ForeignKey("organization_users.id")
+    )
+    state: Mapped[str] = mapped_column(String(24), default="active")
+    max_redemptions: Mapped[int] = mapped_column(Integer, default=25)
+    redemption_count: Mapped[int] = mapped_column(Integer, default=0)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
+class DeviceCredential(Base):
+    __tablename__ = "device_credentials"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id"), index=True
+    )
+    campaign_id: Mapped[str] = mapped_column(
+        ForeignKey("enrollment_campaigns.id"), index=True
+    )
+    device_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    platform: Mapped[str] = mapped_column(String(24), nullable=False)
+    token_prefix: Mapped[str] = mapped_column(String(20), nullable=False)
+    token_hash: Mapped[str] = mapped_column(
+        String(64), unique=True, index=True, nullable=False
+    )
+    state: Mapped[str] = mapped_column(String(24), default="active")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True)
+    )
+
+
+class ActiveVideoStream(Base):
+    __tablename__ = "active_video_streams"
+    __table_args__ = (
+        UniqueConstraint("session_id", name="uq_active_video_stream_session"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    session_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id"), index=True
+    )
+    device_credential_id: Mapped[str] = mapped_column(
+        ForeignKey("device_credentials.id"), index=True
+    )
+    device_name: Mapped[str] = mapped_column(
+        String(160), nullable=False, default="Unknown device"
+    )
+    incident_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    drone_designator: Mapped[str] = mapped_column(String(160), nullable=False)
+    source_width: Mapped[int] = mapped_column(Integer, default=0)
+    source_height: Mapped[int] = mapped_column(Integer, default=0)
+    source_fps_milli: Mapped[int] = mapped_column(Integer, default=0)
+    source_bitrate_bps: Mapped[int] = mapped_column(BigInteger, default=0)
+    source_codec: Mapped[str] = mapped_column(String(32), default="")
+    timezone_name: Mapped[str] = mapped_column(String(64), default="UTC")
+    state: Mapped[str] = mapped_column(String(24), default="active")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, index=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+
+
+class VideoStreamRequest(Base):
+    __tablename__ = "video_stream_requests"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id"), index=True
+    )
+    active_stream_id: Mapped[str] = mapped_column(
+        ForeignKey("active_video_streams.id"), index=True
+    )
+    requester_user_id: Mapped[str] = mapped_column(
+        ForeignKey("organization_users.id"), index=True
+    )
+    requester_email: Mapped[str] = mapped_column(String(320), nullable=False)
+    state: Mapped[str] = mapped_column(String(24), default="pending")
+    route_kind: Mapped[str] = mapped_column(String(16), default="unknown")
+    estimated_uplink_bps: Mapped[int] = mapped_column(BigInteger, default=0)
+    selected_width: Mapped[int] = mapped_column(Integer, default=0)
+    selected_height: Mapped[int] = mapped_column(Integer, default=0)
+    selected_fps_milli: Mapped[int] = mapped_column(Integer, default=0)
+    selected_bitrate_bps: Mapped[int] = mapped_column(BigInteger, default=0)
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, index=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    stopped_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    audio_bytes_sent: Mapped[int] = mapped_column(BigInteger, default=0)
+    audio_bytes_received: Mapped[int] = mapped_column(BigInteger, default=0)
+    video_bytes_received: Mapped[int] = mapped_column(BigInteger, default=0)
+
+
+class VideoPreflightExchange(Base):
+    __tablename__ = "video_preflight_exchanges"
+
+    request_id: Mapped[str] = mapped_column(
+        ForeignKey("video_stream_requests.id"),
+        primary_key=True,
+    )
+    browser_offer_sdp: Mapped[str] = mapped_column(Text, nullable=False)
+    device_answer_sdp: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        index=True,
+    )
+
+
+class VideoMediaExchange(Base):
+    """Short-lived WHEP signaling; media never traverses the tracker."""
+
+    __tablename__ = "video_media_exchanges"
+
+    request_id: Mapped[str] = mapped_column(
+        ForeignKey("video_stream_requests.id"),
+        primary_key=True,
+    )
+    browser_offer_sdp: Mapped[str] = mapped_column(Text, nullable=False)
+    device_answer_sdp: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class VideoMediaMetricsSegment(Base):
+    """Last observed WebRTC counters for one browser media connection."""
+
+    __tablename__ = "video_media_metrics_segments"
+
+    request_id: Mapped[str] = mapped_column(
+        ForeignKey("video_stream_requests.id"),
+        primary_key=True,
+    )
+    metrics_session_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    audio_bytes_sent: Mapped[int] = mapped_column(BigInteger, default=0)
+    audio_bytes_received: Mapped[int] = mapped_column(BigInteger, default=0)
+    video_bytes_received: Mapped[int] = mapped_column(BigInteger, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+@dataclass(frozen=True)
+class OrganizationRecord:
+    id: str
+    legal_name: str
+    designator: str
+    hostname: str
+    lifecycle_state: str
+    provisioning_state: str
+    billing_mode: str
+    trial_ends_at: Optional[datetime]
+    records_visibility: str
+    record_retention_days: int
+    log_retention_days: int
+    notification_email: str
+    primary_admin_name: str
+    primary_admin_email: str
+    subscription_state: str = "trial"
+    credit_balance: Decimal = Decimal("0.00")
+    primary_admin_postal_address: str = ""
+
+
+@dataclass(frozen=True)
+class UserRecord:
+    id: str
+    organization_id: str
+    email: str
+    display_name: str
+    roles: tuple[str, ...]
+    state: str
+
+
+@dataclass(frozen=True)
+class PlatformAdminRecord:
+    id: str
+    email: str
+    display_name: str
+    state: str
+
+
+@dataclass(frozen=True)
+class InvitationRecord:
+    user_id: str
+    organization_id: str
+    designator: str
+    email: str
+    activation_nonce: str
+    expires_at: datetime
+
+
+@dataclass(frozen=True)
+class EnrollmentCampaignRecord:
+    id: str
+    organization_id: str
+    label: str
+    state: str
+    max_redemptions: int
+    redemption_count: int
+    expires_at: datetime
+    created_at: datetime
+    revoked_at: Optional[datetime]
+
+    def is_usable(self, now: Optional[datetime] = None) -> bool:
+        checked_at = now or utc_now()
+        return (
+            self.state == "active"
+            and self.expires_at >= checked_at
+            and self.redemption_count < self.max_redemptions
+        )
+
+
+@dataclass(frozen=True)
+class BillingLedgerRecord:
+    id: str
+    entry_type: str
+    amount: Decimal
+    currency: str
+    description: str
+    external_reference: str
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class UsageCostRecord:
+    organization_id: str
+    compute: Decimal
+    network: Decimal
+    storage: Decimal
+    database: Decimal
+    other: Decimal
+
+    @property
+    def total(self) -> Decimal:
+        return self.compute + self.network + self.storage + self.database + self.other
+
+
+@dataclass(frozen=True)
+class UsageAggregateRecord:
+    organization_id: str
+    compute_units: Decimal = Decimal("0")
+    network_bytes: int = 0
+    storage_byte_days: int = 0
+    database_units: Decimal = Decimal("0")
+    faa_proxy_requests: int = 0
+    turn_relay_bytes: int = 0
+
+
+@dataclass(frozen=True)
+class ProvisioningJobRecord:
+    id: str
+    organization_id: str
+    designator: str
+    state: str
+    current_step: str
+    simulation: bool
+    steps: tuple[dict, ...]
+    created_at: datetime
+    completed_at: Optional[datetime]
+
+
+@dataclass(frozen=True)
+class AuditEventRecord:
+    id: str
+    organization_id: Optional[str]
+    designator: Optional[str]
+    actor_type: str
+    actor_id: str
+    event_type: str
+    details: dict
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class IssuedDeviceCredential:
+    id: str
+    organization_id: str
+    designator: str
+    token: str
+    device_name: str
+    platform: str
+    expires_at: datetime
+
+
+@dataclass(frozen=True)
+class DeviceCredentialRecord:
+    id: str
+    organization_id: str
+    designator: str
+    device_name: str
+    platform: str
+    expires_at: datetime
+
+
+@dataclass(frozen=True)
+class ActiveVideoStreamRecord:
+    id: str
+    session_id: str
+    organization_id: str
+    device_credential_id: str
+    device_name: str
+    incident_name: str
+    drone_designator: str
+    source_width: int
+    source_height: int
+    source_fps: float
+    source_bitrate_bps: int
+    source_codec: str
+    timezone_name: str
+    last_seen_at: datetime
+    expires_at: datetime
+
+
+@dataclass(frozen=True)
+class VideoStreamRequestRecord:
+    id: str
+    organization_id: str
+    device_credential_id: str
+    device_name: str
+    stream_session_id: str
+    incident_name: str
+    drone_designator: str
+    requester_user_id: str
+    requester_email: str
+    source_width: int
+    source_height: int
+    source_fps: float
+    source_bitrate_bps: int
+    source_codec: str
+    timezone_name: str
+    state: str
+    route_kind: str
+    estimated_uplink_bps: int
+    selected_width: int
+    selected_height: int
+    selected_fps: float
+    selected_bitrate_bps: int
+    requested_at: datetime
+    expires_at: datetime
+    started_at: Optional[datetime]
+    stopped_at: Optional[datetime]
+    audio_bytes_sent: int
+    audio_bytes_received: int
+    video_bytes_received: int
+
+    @property
+    def requested_at_local(self) -> datetime:
+        try:
+            zone = ZoneInfo(self.timezone_name)
+        except ZoneInfoNotFoundError:
+            zone = ZoneInfo("UTC")
+        return as_utc(self.requested_at).astimezone(zone)
+
+    @property
+    def duration_seconds(self) -> Optional[int]:
+        if self.started_at is None:
+            return None
+        ended_at = self.stopped_at or utc_now()
+        return max(0, int((as_utc(ended_at) - as_utc(self.started_at)).total_seconds()))
+
+    @property
+    def total_media_bytes(self) -> int:
+        return max(0, self.audio_bytes_sent) + max(0, self.audio_bytes_received) + max(0, self.video_bytes_received)
+
+
+@dataclass(frozen=True)
+class VideoPreflightExchangeRecord:
+    request_id: str
+    organization_id: str
+    device_credential_id: str
+    requester_user_id: str
+    state: str
+    route_kind: str
+    estimated_uplink_bps: int
+    browser_offer_sdp: str
+    device_answer_sdp: str
+    expires_at: datetime
+
+
+@dataclass(frozen=True)
+class VideoMediaExchangeRecord:
+    request_id: str
+    organization_id: str
+    device_credential_id: str
+    requester_user_id: str
+    stream_session_id: str
+    state: str
+    browser_offer_sdp: str
+    device_answer_sdp: str
+    expires_at: datetime
+
+
+def normalize_designator(value: str) -> str:
+    designator = value.strip().upper()
+    if not DESIGNATOR_RE.fullmatch(designator):
+        raise InvalidOrganizationError(
+            "Designator must be 2-16 uppercase letters or digits and begin "
+            "with a letter."
+        )
+    return designator
+
+
+def normalize_email(value: str) -> str:
+    email = value.strip().lower()
+    if not EMAIL_RE.fullmatch(email):
+        raise InvalidOrganizationError("Enter a valid administrator email address.")
+    return email
+
+
+def normalize_session_description(value: str) -> str:
+    description = value.strip()
+    # Some browser/WebView combinations submit the SDP with escaped newline
+    # sequences.  Passing that one-line value to native WebRTC produces an
+    # opaque "SessionDescription is NULL" error.  Normalize both escaped and
+    # real line endings to the CRLF form required by SDP.
+    if "\n" not in description and "\\n" in description:
+        description = description.replace("\\r\\n", "\n").replace("\\n", "\n")
+    description = "\r\n".join(description.splitlines()) + "\r\n"
+    if (
+        not description.startswith("v=0")
+        or len(description) > 262_144
+        or "\x00" in description
+        or "\r\n" not in description
+    ):
+        raise ControlPlaneError("WebRTC session description is invalid.")
+    return description
+
+
+def normalize_video_preflight_answer(value: str) -> str:
+    """Return a conservative browser-compatible SDP answer.
+
+    Apple's WebRTC stack advertises the optional SCTP max-message-size
+    attribute.  Some Chromium builds reject an otherwise valid answer when
+    that attribute is the final SDP line.  The synthetic preflight uses small
+    data-channel messages, so omitting the optional advertisement preserves
+    the probe while avoiding that browser-specific parser dependency.
+    """
+    description = normalize_session_description(value)
+    lines = [
+        line
+        for line in description.splitlines()
+        if not line.startswith("a=max-message-size:")
+    ]
+    return "\r\n".join(lines) + "\r\n"
+
+
+def normalize_timezone_name(value: str) -> str:
+    timezone_name = value.strip() or "UTC"
+    if len(timezone_name) > 64:
+        raise ControlPlaneError("Tablet timezone name is too long.")
+    try:
+        ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError as exc:
+        raise ControlPlaneError("Tablet timezone is not recognized.") from exc
+    return timezone_name
+
+
+def hash_password(password: str) -> str:
+    if len(password) < 12:
+        raise ValueError("Password must be at least 12 characters.")
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt,
+        n=2**14,
+        r=8,
+        p=1,
+        dklen=32,
+    )
+    return f"scrypt$16384$8$1${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    try:
+        algorithm, n, r, p, salt_hex, digest_hex = encoded.split("$")
+        if algorithm != "scrypt":
+            return False
+        candidate = hashlib.scrypt(
+            password.encode("utf-8"),
+            salt=bytes.fromhex(salt_hex),
+            n=int(n),
+            r=int(r),
+            p=int(p),
+            dklen=len(bytes.fromhex(digest_hex)),
+        )
+        return secrets.compare_digest(candidate, bytes.fromhex(digest_hex))
+    except (TypeError, ValueError):
+        return False
+
+
+DUMMY_PASSWORD_HASH = hash_password(
+    "r2c constant-time unknown organization user password"
+)
+
+
+class ControlPlaneStore:
+    def __init__(self, database_url: str):
+        if not database_url:
+            raise ValueError("A separate control-plane database URL is required.")
+        # Cloud SQL can close an otherwise idle TCP connection while a
+        # scale-to-zero Cloud Run instance still retains its SQLAlchemy pool.
+        # Validate connections when they are checked out and recycle them
+        # before common infrastructure idle limits are reached.
+        self.engine = create_async_engine(
+            database_url,
+            echo=False,
+            pool_pre_ping=True,
+            pool_recycle=300,
+        )
+        if database_url.startswith("sqlite"):
+            event.listen(
+                self.engine.sync_engine,
+                "connect",
+                self._enable_sqlite_foreign_keys,
+            )
+        self.sessions = async_sessionmaker(
+            self.engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+
+    @staticmethod
+    def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    async def init(self) -> None:
+        async with self.engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            columns = await connection.run_sync(
+                lambda sync_connection: {
+                    item["name"]
+                    for item in inspect(sync_connection).get_columns(
+                        "active_video_streams"
+                    )
+                }
+            )
+            if "timezone_name" not in columns:
+                await connection.execute(text(
+                    "ALTER TABLE active_video_streams "
+                    "ADD COLUMN timezone_name VARCHAR(64) "
+                    "DEFAULT 'UTC' NOT NULL"
+                ))
+            if "device_name" not in columns:
+                await connection.execute(text(
+                    "ALTER TABLE active_video_streams "
+                    "ADD COLUMN device_name VARCHAR(160) "
+                    "DEFAULT 'Unknown device' NOT NULL"
+                ))
+            request_columns = await connection.run_sync(
+                lambda sync_connection: {
+                    item["name"]
+                    for item in inspect(sync_connection).get_columns(
+                        "video_stream_requests"
+                    )
+                }
+            )
+            timestamp_type = (
+                "TIMESTAMP WITH TIME ZONE"
+                if self.engine.dialect.name == "postgresql"
+                else "DATETIME"
+            )
+            if "started_at" not in request_columns:
+                await connection.execute(text(
+                    "ALTER TABLE video_stream_requests "
+                    f"ADD COLUMN started_at {timestamp_type}"
+                ))
+            for column_name in (
+                "audio_bytes_sent",
+                "audio_bytes_received",
+                "video_bytes_received",
+            ):
+                if column_name not in request_columns:
+                    await connection.execute(text(
+                        "ALTER TABLE video_stream_requests "
+                        f"ADD COLUMN {column_name} BIGINT DEFAULT 0 NOT NULL"
+                    ))
+        async with self.sessions() as session:
+            organizations = (await session.scalars(select(Organization))).all()
+            subscribed_ids = set(
+                await session.scalars(select(Subscription.organization_id))
+            )
+            for organization in organizations:
+                if organization.id in subscribed_ids:
+                    continue
+                session.add(
+                    Subscription(
+                        id=new_id(),
+                        organization_id=organization.id,
+                        state=organization.lifecycle_state,
+                        trial_starts_at=organization.trial_starts_at,
+                        trial_ends_at=organization.trial_ends_at,
+                        created_at=organization.created_at,
+                        updated_at=utc_now(),
+                    )
+                )
+            await session.commit()
+
+    async def _notify_video_stream_change(
+        self,
+        session: AsyncSession,
+        organization_id: str,
+    ) -> None:
+        if self.engine.dialect.name == "postgresql":
+            await session.execute(
+                select(func.pg_notify("r2c_stream_change", organization_id))
+            )
+
+    async def dispose(self) -> None:
+        await self.engine.dispose()
+
+    async def ensure_platform_admin(
+        self,
+        *,
+        email: str,
+        display_name: str,
+        bootstrap_password: str,
+    ) -> PlatformAdminRecord:
+        clean_email = normalize_email(email)
+        clean_name = display_name.strip()
+        if not clean_name:
+            raise InvalidOrganizationError("Enter the platform administrator's name.")
+        async with self.sessions() as session:
+            existing = await session.scalar(
+                select(PlatformAdminUser).where(
+                    PlatformAdminUser.email == clean_email
+                )
+            )
+            if existing is None:
+                any_admin = await session.scalar(select(PlatformAdminUser.id))
+                if any_admin is not None:
+                    raise ControlPlaneError(
+                        "A platform administrator already exists; invite additional "
+                        "administrators from the authenticated site."
+                    )
+                existing = PlatformAdminUser(
+                    id=new_id(),
+                    email=clean_email,
+                    display_name=clean_name,
+                    password_hash=hash_password(bootstrap_password),
+                    state="active",
+                )
+                session.add(existing)
+                await session.commit()
+            return PlatformAdminRecord(
+                id=existing.id,
+                email=existing.email,
+                display_name=existing.display_name,
+                state=existing.state,
+            )
+
+    async def reconcile_platform_admin_identity(
+        self,
+        *,
+        email: str,
+        display_name: str,
+    ) -> PlatformAdminRecord:
+        """Make the infrastructure-selected identity the sole active administrator."""
+        clean_email = normalize_email(email)
+        clean_name = display_name.strip()
+        if not clean_name:
+            raise InvalidOrganizationError("Enter the platform administrator's name.")
+        async with self.sessions() as session:
+            users = (await session.scalars(select(PlatformAdminUser))).all()
+            target = next((user for user in users if user.email == clean_email), None)
+            target_was_active = target is not None and target.state == "active"
+            for user in users:
+                if user.email != clean_email and user.state == "active":
+                    user.state = "disabled"
+            if target is None:
+                target = PlatformAdminUser(
+                    id=new_id(),
+                    email=clean_email,
+                    display_name=clean_name,
+                    password_hash="",
+                    state="active",
+                )
+                session.add(target)
+            else:
+                target.display_name = clean_name
+                if not target_was_active:
+                    # Never restore a former administrator's password when an
+                    # infrastructure maintainer assigns the identity again.
+                    target.password_hash = ""
+                target.state = "active"
+            await session.commit()
+            return PlatformAdminRecord(
+                id=target.id,
+                email=target.email,
+                display_name=target.display_name,
+                state=target.state,
+            )
+
+    async def get_platform_admin(
+        self,
+        user_id: str,
+    ) -> Optional[PlatformAdminRecord]:
+        async with self.sessions() as session:
+            user = await session.get(PlatformAdminUser, user_id)
+        if user is None or user.state != "active":
+            return None
+        return PlatformAdminRecord(
+            id=user.id,
+            email=user.email,
+            display_name=user.display_name,
+            state=user.state,
+        )
+
+    async def authenticate_platform_admin(
+        self,
+        email: str,
+        password: str,
+        now: Optional[datetime] = None,
+    ) -> Optional[PlatformAdminRecord]:
+        clean_email = normalize_email(email)
+        login_at = now or utc_now()
+        async with self.sessions() as session:
+            throttle = await session.scalar(
+                select(PlatformAdminLoginThrottle).where(
+                    PlatformAdminLoginThrottle.email == clean_email
+                )
+            )
+            if (
+                throttle is not None
+                and as_utc(throttle.locked_until) is not None
+                and as_utc(throttle.locked_until) > login_at
+            ):
+                verify_password(password, DUMMY_PASSWORD_HASH)
+                return None
+            user = await session.scalar(
+                select(PlatformAdminUser).where(
+                    PlatformAdminUser.email == clean_email,
+                    PlatformAdminUser.state == "active",
+                )
+            )
+            password_valid = (
+                verify_password(password, user.password_hash)
+                if user is not None
+                else verify_password(password, DUMMY_PASSWORD_HASH)
+            )
+            if user is None or not password_valid:
+                if throttle is None:
+                    throttle = PlatformAdminLoginThrottle(
+                        id=new_id(),
+                        email=clean_email,
+                        failure_count=0,
+                        window_started_at=login_at,
+                    )
+                    session.add(throttle)
+                window_started_at = as_utc(throttle.window_started_at) or login_at
+                if window_started_at < login_at - timedelta(minutes=15):
+                    throttle.failure_count = 0
+                    throttle.window_started_at = login_at
+                throttle.failure_count += 1
+                if throttle.failure_count >= 5:
+                    throttle.locked_until = login_at + timedelta(minutes=15)
+                await session.commit()
+                return None
+            if throttle is not None:
+                throttle.failure_count = 0
+                throttle.window_started_at = login_at
+                throttle.locked_until = None
+            user.last_login_at = login_at
+            await session.commit()
+            return PlatformAdminRecord(
+                id=user.id,
+                email=user.email,
+                display_name=user.display_name,
+                state=user.state,
+            )
+
+    async def change_platform_admin_password(
+        self,
+        *,
+        user_id: str,
+        current_password: str,
+        new_password: str,
+    ) -> None:
+        async with self.sessions() as session:
+            user = await session.get(PlatformAdminUser, user_id)
+            if (
+                user is None
+                or user.state != "active"
+                or not verify_password(current_password, user.password_hash)
+            ):
+                raise ControlPlaneError("Current password is incorrect.")
+            user.password_hash = hash_password(new_password)
+            await session.commit()
+
+    async def platform_admin_has_password(self, user_id: str) -> bool:
+        async with self.sessions() as session:
+            user = await session.get(PlatformAdminUser, user_id)
+            return bool(
+                user is not None
+                and user.state == "active"
+                and user.password_hash
+            )
+
+    async def issue_platform_admin_password_setup(
+        self,
+        *,
+        email: str,
+        identity_generation: str,
+        now: Optional[datetime] = None,
+    ) -> Optional[str]:
+        clean_email = normalize_email(email)
+        issued_at = now or utc_now()
+        async with self.sessions() as session:
+            user = await session.scalar(
+                select(PlatformAdminUser).where(
+                    PlatformAdminUser.email == clean_email,
+                    PlatformAdminUser.state == "active",
+                )
+            )
+            if user is None:
+                return None
+            throttle = await session.scalar(
+                select(PlatformAdminPasswordSetupThrottle).where(
+                    PlatformAdminPasswordSetupThrottle.email == clean_email
+                )
+            )
+            if throttle is None:
+                throttle = PlatformAdminPasswordSetupThrottle(
+                    id=new_id(),
+                    email=clean_email,
+                    request_count=0,
+                    window_started_at=issued_at,
+                )
+                session.add(throttle)
+            window_started = as_utc(throttle.window_started_at) or issued_at
+            last_requested = as_utc(throttle.last_requested_at)
+            if window_started < issued_at - timedelta(hours=1):
+                throttle.window_started_at = issued_at
+                throttle.request_count = 0
+            elif throttle.request_count >= 5:
+                return None
+            if (
+                last_requested is not None
+                and last_requested > issued_at - timedelta(minutes=1)
+            ):
+                return None
+            existing_tokens = (
+                await session.scalars(
+                    select(PlatformAdminPasswordSetupToken).where(
+                        PlatformAdminPasswordSetupToken.email == clean_email,
+                        PlatformAdminPasswordSetupToken.consumed_at.is_(None),
+                    )
+                )
+            ).all()
+            for existing in existing_tokens:
+                existing.consumed_at = issued_at
+            token = secrets.token_urlsafe(32)
+            session.add(
+                PlatformAdminPasswordSetupToken(
+                    id=new_id(),
+                    email=clean_email,
+                    token_hash=device_token_hash(token),
+                    identity_generation=identity_generation,
+                    created_at=issued_at,
+                    expires_at=issued_at + timedelta(minutes=5),
+                )
+            )
+            throttle.request_count += 1
+            throttle.last_requested_at = issued_at
+            await session.commit()
+            return token
+
+    async def set_platform_admin_password_from_token(
+        self,
+        *,
+        token: str,
+        email: str,
+        identity_generation: str,
+        new_password: str,
+        now: Optional[datetime] = None,
+    ) -> Optional[PlatformAdminRecord]:
+        password_hash = hash_password(new_password)
+        clean_email = normalize_email(email)
+        consumed_at = now or utc_now()
+        async with self.sessions() as session:
+            setup = await session.scalar(
+                select(PlatformAdminPasswordSetupToken).where(
+                    PlatformAdminPasswordSetupToken.token_hash
+                    == device_token_hash(token),
+                    PlatformAdminPasswordSetupToken.email == clean_email,
+                    PlatformAdminPasswordSetupToken.identity_generation
+                    == identity_generation,
+                    PlatformAdminPasswordSetupToken.consumed_at.is_(None),
+                )
+            )
+            if (
+                setup is None
+                or (as_utc(setup.expires_at) or consumed_at) <= consumed_at
+            ):
+                return None
+            user = await session.scalar(
+                select(PlatformAdminUser).where(
+                    PlatformAdminUser.email == clean_email,
+                    PlatformAdminUser.state == "active",
+                )
+            )
+            if user is None:
+                return None
+            setup.consumed_at = consumed_at
+            user.password_hash = password_hash
+            await session.commit()
+            return PlatformAdminRecord(
+                id=user.id,
+                email=user.email,
+                display_name=user.display_name,
+                state=user.state,
+            )
+
+    async def create_organization(
+        self,
+        *,
+        legal_name: str,
+        designator: str,
+        admin_name: str,
+        admin_email: str,
+        postal_address: str,
+        actor_id: str,
+        simulation: bool = True,
+        pilot_acknowledged: bool = False,
+        now: Optional[datetime] = None,
+    ) -> OrganizationRecord:
+        created_at = now or utc_now()
+        clean_name = legal_name.strip()
+        clean_admin_name = admin_name.strip()
+        clean_designator = normalize_designator(designator)
+        clean_email = normalize_email(admin_email)
+        if not clean_name or len(clean_name) > 200:
+            raise InvalidOrganizationError("Enter the organization's official name.")
+        if not clean_admin_name or len(clean_admin_name) > 160:
+            raise InvalidOrganizationError("Enter the site administrator's name.")
+
+        hostname = f"{clean_designator.lower()}.r2c-tracker.com"
+        trial_start = created_at if simulation else None
+        trial_end = created_at + timedelta(days=30) if simulation else None
+        organization = Organization(
+            id=new_id(),
+            legal_name=clean_name,
+            designator=clean_designator,
+            hostname=hostname,
+            lifecycle_state="trial",
+            provisioning_state=(
+                "simulation ready" if simulation else "provisioning queued"
+            ),
+            billing_mode="shadow billing",
+            trial_starts_at=trial_start,
+            trial_ends_at=trial_end,
+            notification_email=clean_email,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+        contact = OrganizationContact(
+            organization_id=organization.id,
+            name=clean_admin_name,
+            email=clean_email,
+            postal_address=postal_address.strip(),
+            created_at=created_at,
+        )
+        owner = OrganizationUser(
+            id=new_id(),
+            organization_id=organization.id,
+            email=clean_email,
+            display_name=clean_admin_name,
+            state="invited",
+            activation_expires_at=created_at + timedelta(days=7),
+            created_at=created_at,
+        )
+        owner.set_roles(DEFAULT_OWNER_ROLES)
+        job = ProvisioningJob(
+            organization_id=organization.id,
+            state="simulated" if simulation else "queued",
+            current_step=ONBOARDING_STEPS[-1] if simulation else ONBOARDING_STEPS[0],
+            steps_json=json.dumps(
+                [
+                    {"step": step, "state": "simulated" if simulation else "queued"}
+                    for step in ONBOARDING_STEPS
+                ]
+            ),
+            simulation=simulation,
+            created_at=created_at,
+            completed_at=created_at if simulation else None,
+        )
+        subscription = Subscription(
+            id=new_id(),
+            organization_id=organization.id,
+            state="trial",
+            trial_starts_at=trial_start,
+            trial_ends_at=trial_end,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+        audit = ControlPlaneAuditEvent(
+            organization_id=organization.id,
+            actor_type="platform_admin",
+            actor_id=actor_id,
+            event_type="organization.created",
+            details_json=json.dumps(
+                {
+                    "designator": clean_designator,
+                    "hostname": hostname,
+                    "simulation": simulation,
+                    "pilot_acknowledged": pilot_acknowledged,
+                }
+            ),
+            created_at=created_at,
+        )
+        async with self.sessions() as session:
+            existing = await session.scalar(
+                select(Organization.id).where(
+                    (Organization.designator == clean_designator)
+                    | (Organization.hostname == hostname)
+                )
+            )
+            if existing:
+                raise DuplicateOrganizationError(
+                    "That designator or hostname is already reserved."
+                )
+            try:
+                session.add(organization)
+                await session.flush()
+                session.add_all((contact, owner, job, subscription, audit))
+                await session.commit()
+            except IntegrityError as exc:
+                await session.rollback()
+                raise DuplicateOrganizationError(
+                    "That designator or hostname is already reserved."
+                ) from exc
+
+        return OrganizationRecord(
+            id=organization.id,
+            legal_name=organization.legal_name,
+            designator=organization.designator,
+            hostname=organization.hostname,
+            lifecycle_state=organization.lifecycle_state,
+            provisioning_state=organization.provisioning_state,
+            billing_mode=organization.billing_mode,
+            trial_ends_at=organization.trial_ends_at,
+            records_visibility=organization.records_visibility,
+            record_retention_days=organization.record_retention_days,
+            log_retention_days=organization.log_retention_days,
+            notification_email=organization.notification_email,
+            primary_admin_name=contact.name,
+            primary_admin_email=contact.email,
+            subscription_state=subscription.state,
+            credit_balance=Decimal("0.00"),
+            primary_admin_postal_address=contact.postal_address,
+        )
+
+    async def mark_organization_invitation_sent(
+        self,
+        *,
+        organization_id: str,
+        actor_id: str,
+        now: Optional[datetime] = None,
+    ) -> None:
+        sent_at = now or utc_now()
+        async with self.sessions() as session:
+            organization = await session.get(Organization, organization_id)
+            job = await session.scalar(
+                select(ProvisioningJob).where(
+                    ProvisioningJob.organization_id == organization_id
+                )
+            )
+            if organization is None or job is None:
+                raise ControlPlaneError("Organization provisioning job not found.")
+            organization.provisioning_state = "activation pending"
+            organization.updated_at = sent_at
+            steps = [
+                {"step": step, "state": "completed"}
+                for step in ONBOARDING_STEPS[:-1]
+            ] + [{"step": ONBOARDING_STEPS[-1], "state": "pending"}]
+            job.state = "waiting for activation"
+            job.current_step = ONBOARDING_STEPS[-1]
+            job.steps_json = json.dumps(steps)
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=organization_id,
+                    actor_type="platform_admin",
+                    actor_id=actor_id,
+                    event_type="administrator.invitation_sent",
+                    details_json="{}",
+                    created_at=sent_at,
+                )
+            )
+            await session.commit()
+
+    async def _complete_organization_activation(
+        self,
+        session: AsyncSession,
+        organization_id: str,
+        activated_at: datetime,
+    ) -> None:
+        organization = await session.get(Organization, organization_id)
+        if organization is None:
+            raise ControlPlaneError("Organization not found.")
+        organization.provisioning_state = "ready"
+        organization.lifecycle_state = "trial"
+        organization.trial_starts_at = activated_at
+        organization.trial_ends_at = activated_at + timedelta(days=30)
+        organization.updated_at = activated_at
+        subscription = await session.scalar(
+            select(Subscription).where(
+                Subscription.organization_id == organization_id
+            )
+        )
+        if subscription is not None:
+            subscription.state = "trial"
+            subscription.trial_starts_at = activated_at
+            subscription.trial_ends_at = activated_at + timedelta(days=30)
+            subscription.updated_at = activated_at
+        job = await session.scalar(
+            select(ProvisioningJob).where(
+                ProvisioningJob.organization_id == organization_id
+            )
+        )
+        if job is not None and not job.simulation:
+            job.state = "completed"
+            job.current_step = ONBOARDING_STEPS[-1]
+            job.steps_json = json.dumps(
+                [{"step": step, "state": "completed"} for step in ONBOARDING_STEPS]
+            )
+            job.completed_at = activated_at
+
+    async def list_organizations(self) -> tuple[OrganizationRecord, ...]:
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(Organization, OrganizationContact, Subscription)
+                    .join(
+                        OrganizationContact,
+                        OrganizationContact.organization_id == Organization.id,
+                    )
+                    .join(
+                        Subscription,
+                        Subscription.organization_id == Organization.id,
+                    )
+                    .where(OrganizationContact.contact_role == "primary_admin")
+                    .order_by(Organization.designator)
+                )
+            ).all()
+            ledger_rows = (
+                await session.execute(
+                    select(
+                        BillingLedgerEntry.organization_id,
+                        BillingLedgerEntry.amount,
+                    )
+                )
+            ).all()
+        balances: dict[str, Decimal] = {}
+        for organization_id, amount in ledger_rows:
+            balances[organization_id] = (
+                balances.get(organization_id, Decimal("0")) + Decimal(amount)
+            )
+        return tuple(
+            OrganizationRecord(
+                id=organization.id,
+                legal_name=organization.legal_name,
+                designator=organization.designator,
+                hostname=organization.hostname,
+                lifecycle_state=organization.lifecycle_state,
+                provisioning_state=organization.provisioning_state,
+                billing_mode=organization.billing_mode,
+                trial_ends_at=as_utc(organization.trial_ends_at),
+                records_visibility=organization.records_visibility,
+                record_retention_days=organization.record_retention_days,
+                log_retention_days=organization.log_retention_days,
+                notification_email=organization.notification_email,
+                primary_admin_name=contact.name,
+                primary_admin_email=contact.email,
+                subscription_state=subscription.state,
+                credit_balance=balances.get(
+                    organization.id,
+                    Decimal("0.00"),
+                ),
+                primary_admin_postal_address=contact.postal_address,
+            )
+            for organization, contact, subscription in rows
+        )
+
+    async def get_organization(self, designator: str) -> Optional[OrganizationRecord]:
+        clean_designator = normalize_designator(designator)
+        organizations = await self.list_organizations()
+        return next(
+            (
+                organization
+                for organization in organizations
+                if organization.designator == clean_designator
+            ),
+            None,
+        )
+
+    async def get_organization_by_id(
+        self,
+        organization_id: str,
+    ) -> Optional[OrganizationRecord]:
+        organizations = await self.list_organizations()
+        return next(
+            (
+                organization
+                for organization in organizations
+                if organization.id == organization_id
+            ),
+            None,
+        )
+
+    async def get_organization_by_hostname(
+        self,
+        hostname: str,
+    ) -> Optional[OrganizationRecord]:
+        clean_hostname = hostname.strip().lower().rstrip(".")
+        if not clean_hostname:
+            return None
+        organizations = await self.list_organizations()
+        return next(
+            (
+                organization
+                for organization in organizations
+                if organization.hostname.lower() == clean_hostname
+            ),
+            None,
+        )
+
+    async def get_user(self, user_id: str) -> Optional[UserRecord]:
+        async with self.sessions() as session:
+            user = await session.get(OrganizationUser, user_id)
+        if user is None:
+            return None
+        return UserRecord(
+            id=user.id,
+            organization_id=user.organization_id,
+            email=user.email,
+            display_name=user.display_name,
+            roles=user.roles,
+            state=user.state,
+        )
+
+    async def get_invitation(
+        self,
+        designator: str,
+        email: str,
+    ) -> Optional[InvitationRecord]:
+        clean_designator = normalize_designator(designator)
+        clean_email = normalize_email(email)
+        async with self.sessions() as session:
+            row = (
+                await session.execute(
+                    select(OrganizationUser, Organization)
+                    .join(
+                        Organization,
+                        Organization.id == OrganizationUser.organization_id,
+                    )
+                    .where(
+                        Organization.designator == clean_designator,
+                        OrganizationUser.email == clean_email,
+                        OrganizationUser.state == "invited",
+                    )
+                )
+            ).first()
+        if row is None:
+            return None
+        user, organization = row
+        expires_at = as_utc(user.activation_expires_at)
+        if expires_at is None:
+            return None
+        return InvitationRecord(
+            user_id=user.id,
+            organization_id=user.organization_id,
+            designator=organization.designator,
+            email=user.email,
+            activation_nonce=user.activation_nonce,
+            expires_at=expires_at,
+        )
+
+    async def renew_invitation(
+        self,
+        designator: str,
+        email: str,
+        now: Optional[datetime] = None,
+    ) -> InvitationRecord:
+        clean_designator = normalize_designator(designator)
+        clean_email = normalize_email(email)
+        issued_at = now or utc_now()
+        async with self.sessions() as session:
+            row = (
+                await session.execute(
+                    select(OrganizationUser, Organization)
+                    .join(
+                        Organization,
+                        Organization.id == OrganizationUser.organization_id,
+                    )
+                    .where(
+                        Organization.designator == clean_designator,
+                        OrganizationUser.email == clean_email,
+                        OrganizationUser.state == "invited",
+                    )
+                )
+            ).first()
+            if row is None:
+                raise ControlPlaneError(
+                    "No pending administrator invitation is available."
+                )
+            user, organization = row
+            user.activation_nonce = new_id()
+            user.activation_expires_at = issued_at + timedelta(days=7)
+            await session.commit()
+            return InvitationRecord(
+                user_id=user.id,
+                organization_id=user.organization_id,
+                designator=organization.designator,
+                email=user.email,
+                activation_nonce=user.activation_nonce,
+                expires_at=as_utc(user.activation_expires_at),
+            )
+
+    async def authenticate_user(
+        self,
+        designator: str,
+        email: str,
+        password: str,
+        now: Optional[datetime] = None,
+    ) -> Optional[UserRecord]:
+        clean_designator = normalize_designator(designator)
+        clean_email = normalize_email(email)
+        login_at = now or utc_now()
+        async with self.sessions() as session:
+            organization = await session.scalar(
+                select(Organization).where(
+                    Organization.designator == clean_designator
+                )
+            )
+            if organization is None:
+                verify_password(password, DUMMY_PASSWORD_HASH)
+                return None
+            throttle = await session.scalar(
+                select(OrganizationLoginThrottle).where(
+                    OrganizationLoginThrottle.organization_id == organization.id,
+                    OrganizationLoginThrottle.email == clean_email,
+                )
+            )
+            if (
+                throttle is not None
+                and as_utc(throttle.locked_until) is not None
+                and as_utc(throttle.locked_until) > login_at
+            ):
+                verify_password(password, DUMMY_PASSWORD_HASH)
+                return None
+            user = await session.scalar(
+                select(OrganizationUser).where(
+                    OrganizationUser.organization_id == organization.id,
+                    OrganizationUser.email == clean_email,
+                    OrganizationUser.state == "active",
+                )
+            )
+            password_valid = (
+                verify_password(password, user.password_hash)
+                if user is not None
+                else verify_password(password, DUMMY_PASSWORD_HASH)
+            )
+            if user is None or not password_valid:
+                if throttle is None:
+                    throttle = OrganizationLoginThrottle(
+                        id=new_id(),
+                        organization_id=organization.id,
+                        email=clean_email,
+                        failure_count=0,
+                        window_started_at=login_at,
+                    )
+                    session.add(throttle)
+                window_started_at = as_utc(throttle.window_started_at) or login_at
+                if window_started_at < login_at - timedelta(minutes=15):
+                    throttle.failure_count = 0
+                    throttle.window_started_at = login_at
+                throttle.failure_count += 1
+                if throttle.failure_count >= 5:
+                    throttle.locked_until = login_at + timedelta(minutes=15)
+                await session.commit()
+                return None
+            if throttle is not None:
+                throttle.failure_count = 0
+                throttle.window_started_at = login_at
+                throttle.locked_until = None
+            user.last_login_at = login_at
+            await session.commit()
+            return UserRecord(
+                id=user.id,
+                organization_id=user.organization_id,
+                email=user.email,
+                display_name=user.display_name,
+                roles=user.roles,
+                state=user.state,
+            )
+
+    async def authorize_google_user(
+        self,
+        designator: str,
+        email: str,
+        now: Optional[datetime] = None,
+    ) -> Optional[UserRecord]:
+        """Authorize an exact verified email, activating a pending member."""
+        clean_designator = normalize_designator(designator)
+        clean_email = normalize_email(email)
+        login_at = now or utc_now()
+        async with self.sessions() as session:
+            user = await session.scalar(
+                select(OrganizationUser)
+                .join(
+                    Organization,
+                    Organization.id == OrganizationUser.organization_id,
+                )
+                .where(
+                    Organization.designator == clean_designator,
+                    OrganizationUser.email == clean_email,
+                    OrganizationUser.state.in_(("active", "invited")),
+                )
+            )
+            if user is None:
+                return None
+            if user.state == "invited":
+                activation_expires_at = as_utc(user.activation_expires_at)
+                if (
+                    activation_expires_at is None
+                    or activation_expires_at < login_at
+                ):
+                    return None
+                user.state = "active"
+                user.activation_nonce = new_id()
+                await self._complete_organization_activation(
+                    session,
+                    user.organization_id,
+                    login_at,
+                )
+                session.add(
+                    ControlPlaneAuditEvent(
+                        organization_id=user.organization_id,
+                        actor_type="organization_user",
+                        actor_id=user.id,
+                        event_type="administrator.google_activated",
+                        details_json="{}",
+                        created_at=login_at,
+                    )
+                )
+            user.last_login_at = login_at
+            await session.commit()
+            return UserRecord(
+                id=user.id,
+                organization_id=user.organization_id,
+                email=user.email,
+                display_name=user.display_name,
+                roles=user.roles,
+                state=user.state,
+            )
+
+    async def activate_owner(
+        self,
+        designator: str,
+        email: str,
+        password: str,
+        now: Optional[datetime] = None,
+        *,
+        activation_nonce: Optional[str] = None,
+    ) -> UserRecord:
+        clean_designator = normalize_designator(designator)
+        clean_email = normalize_email(email)
+        activated_at = now or utc_now()
+        async with self.sessions() as session:
+            user = await session.scalar(
+                select(OrganizationUser)
+                .join(
+                    Organization,
+                    Organization.id == OrganizationUser.organization_id,
+                )
+                .where(
+                    Organization.designator == clean_designator,
+                    OrganizationUser.email == clean_email,
+                    OrganizationUser.state == "invited",
+                )
+            )
+            if user is None:
+                raise ControlPlaneError("No pending administrator invitation found.")
+            if activation_nonce is not None and not secrets.compare_digest(
+                user.activation_nonce,
+                activation_nonce,
+            ):
+                raise ControlPlaneError("The administrator invitation is invalid.")
+            activation_expires_at = as_utc(user.activation_expires_at)
+            if activation_expires_at is None or activation_expires_at < activated_at:
+                raise ControlPlaneError("The administrator invitation has expired.")
+            user.password_hash = hash_password(password)
+            user.state = "active"
+            user.activation_nonce = new_id()
+            await self._complete_organization_activation(
+                session,
+                user.organization_id,
+                activated_at,
+            )
+            audit = ControlPlaneAuditEvent(
+                organization_id=user.organization_id,
+                actor_type="organization_user",
+                actor_id=user.id,
+                event_type="administrator.activated",
+                details_json="{}",
+                created_at=activated_at,
+            )
+            session.add(audit)
+            await session.commit()
+            return UserRecord(
+                id=user.id,
+                organization_id=user.organization_id,
+                email=user.email,
+                display_name=user.display_name,
+                roles=user.roles,
+                state=user.state,
+            )
+
+    async def list_users(self, organization_id: str) -> tuple[UserRecord, ...]:
+        async with self.sessions() as session:
+            users = (
+                await session.scalars(
+                    select(OrganizationUser)
+                    .where(OrganizationUser.organization_id == organization_id)
+                    .order_by(OrganizationUser.display_name)
+                )
+            ).all()
+        return tuple(
+            UserRecord(
+                id=user.id,
+                organization_id=user.organization_id,
+                email=user.email,
+                display_name=user.display_name,
+                roles=user.roles,
+                state=user.state,
+            )
+            for user in users
+        )
+
+    async def add_user(
+        self,
+        *,
+        organization_id: str,
+        display_name: str,
+        email: str,
+        roles: tuple[str, ...],
+        actor_id: str,
+        now: Optional[datetime] = None,
+    ) -> UserRecord:
+        created_at = now or utc_now()
+        clean_name = display_name.strip()
+        clean_email = normalize_email(email)
+        if not clean_name:
+            raise ControlPlaneError("Enter the member's name.")
+        user = OrganizationUser(
+            id=new_id(),
+            organization_id=organization_id,
+            display_name=clean_name,
+            email=clean_email,
+            state="invited",
+            activation_expires_at=created_at + timedelta(days=7),
+            created_at=created_at,
+        )
+        user.set_roles(roles)
+        async with self.sessions() as session:
+            organization = await session.get(Organization, organization_id)
+            if organization is None:
+                raise ControlPlaneError("Organization not found.")
+            existing = await session.scalar(
+                select(OrganizationUser.id).where(
+                    OrganizationUser.organization_id == organization_id,
+                    OrganizationUser.email == clean_email,
+                )
+            )
+            if existing:
+                raise ControlPlaneError("That email is already an organization member.")
+            session.add(user)
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=organization_id,
+                    actor_type="organization_user",
+                    actor_id=actor_id,
+                    event_type="member.invited",
+                    details_json=json.dumps(
+                        {"user_id": user.id, "roles": list(user.roles)}
+                    ),
+                    created_at=created_at,
+                )
+            )
+            try:
+                await session.commit()
+            except IntegrityError as exc:
+                await session.rollback()
+                raise ControlPlaneError(
+                    "That email is already an organization member."
+                ) from exc
+        return UserRecord(
+            id=user.id,
+            organization_id=user.organization_id,
+            email=user.email,
+            display_name=user.display_name,
+            roles=user.roles,
+            state=user.state,
+        )
+
+    async def update_settings(
+        self,
+        *,
+        organization_id: str,
+        records_visibility: str,
+        record_retention_days: int,
+        log_retention_days: int,
+        notification_email: str,
+        actor_id: str,
+        now: Optional[datetime] = None,
+    ) -> None:
+        if records_visibility not in {"public", "restricted"}:
+            raise ControlPlaneError("Invalid flight-record visibility.")
+        if not 30 <= record_retention_days <= 3650:
+            raise ControlPlaneError("Record retention must be 30-3650 days.")
+        if not 1 <= log_retention_days <= 730:
+            raise ControlPlaneError("Flight-log retention must be 1-730 days.")
+        clean_email = normalize_email(notification_email)
+        updated_at = now or utc_now()
+        async with self.sessions() as session:
+            organization = await session.get(Organization, organization_id)
+            if organization is None:
+                raise ControlPlaneError("Organization not found.")
+            organization.records_visibility = records_visibility
+            organization.record_retention_days = record_retention_days
+            organization.log_retention_days = log_retention_days
+            organization.notification_email = clean_email
+            organization.updated_at = updated_at
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=organization_id,
+                    actor_type="organization_user",
+                    actor_id=actor_id,
+                    event_type="organization.settings_updated",
+                    details_json=json.dumps(
+                        {
+                            "records_visibility": records_visibility,
+                            "record_retention_days": record_retention_days,
+                            "log_retention_days": log_retention_days,
+                        }
+                    ),
+                    created_at=updated_at,
+                )
+            )
+            await session.commit()
+
+    async def append_ledger_entry(
+        self,
+        *,
+        organization_id: str,
+        entry_type: str,
+        amount: Decimal,
+        description: str,
+        idempotency_key: str,
+        created_by_type: str,
+        created_by_id: str,
+        external_reference: str = "",
+        now: Optional[datetime] = None,
+    ) -> BillingLedgerRecord:
+        allowed_types = {
+            "charge",
+            "credit",
+            "payment",
+            "refund",
+            "adjustment",
+            "expiration",
+        }
+        if entry_type not in allowed_types:
+            raise ControlPlaneError("Invalid billing ledger entry type.")
+        clean_description = description.strip()
+        clean_key = idempotency_key.strip()
+        if not clean_description or not clean_key:
+            raise ControlPlaneError(
+                "Billing description and idempotency key are required."
+            )
+        created_at = now or utc_now()
+        entry = BillingLedgerEntry(
+            id=new_id(),
+            organization_id=organization_id,
+            entry_type=entry_type,
+            amount=Decimal(amount).quantize(Decimal("0.0001")),
+            description=clean_description,
+            idempotency_key=clean_key,
+            external_reference=external_reference.strip(),
+            created_by_type=created_by_type,
+            created_by_id=created_by_id,
+            created_at=created_at,
+        )
+        async with self.sessions() as session:
+            organization = await session.get(Organization, organization_id)
+            if organization is None:
+                raise ControlPlaneError("Organization not found.")
+            existing = await session.scalar(
+                select(BillingLedgerEntry).where(
+                    BillingLedgerEntry.idempotency_key == clean_key
+                )
+            )
+            if existing is not None:
+                if (
+                    existing.organization_id != organization_id
+                    or existing.entry_type != entry_type
+                    or Decimal(existing.amount) != entry.amount
+                ):
+                    raise ControlPlaneError(
+                        "Billing idempotency key conflicts with an existing entry."
+                    )
+                return self._ledger_record(existing)
+            session.add(entry)
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=organization_id,
+                    actor_type=created_by_type,
+                    actor_id=created_by_id,
+                    event_type="billing.ledger_entry_appended",
+                    details_json=json.dumps(
+                        {
+                            "entry_id": entry.id,
+                            "entry_type": entry_type,
+                            "amount": str(entry.amount),
+                        }
+                    ),
+                    created_at=created_at,
+                )
+            )
+            await session.commit()
+        return self._ledger_record(entry)
+
+    async def list_ledger(
+        self,
+        organization_id: str,
+        limit: int = 50,
+    ) -> tuple[BillingLedgerRecord, ...]:
+        safe_limit = max(1, min(limit, 200))
+        async with self.sessions() as session:
+            entries = (
+                await session.scalars(
+                    select(BillingLedgerEntry)
+                    .where(BillingLedgerEntry.organization_id == organization_id)
+                    .order_by(BillingLedgerEntry.created_at.desc())
+                    .limit(safe_limit)
+                )
+            ).all()
+        return tuple(self._ledger_record(entry) for entry in entries)
+
+    async def collected_month_to_date(
+        self,
+        now: Optional[datetime] = None,
+    ) -> Decimal:
+        checked_at = now or utc_now()
+        month_start = checked_at.replace(
+            day=1,
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        async with self.sessions() as session:
+            entries = (
+                await session.scalars(
+                    select(BillingLedgerEntry).where(
+                        BillingLedgerEntry.entry_type == "payment",
+                        BillingLedgerEntry.created_at >= month_start,
+                    )
+                )
+            ).all()
+        return sum(
+            (Decimal(entry.amount) for entry in entries),
+            Decimal("0.00"),
+        )
+
+    async def record_daily_usage(
+        self,
+        *,
+        organization_id: str,
+        usage_date: str,
+        compute_units: Decimal = Decimal("0"),
+        compute_cost: Decimal = Decimal("0"),
+        network_bytes: int = 0,
+        network_cost: Decimal = Decimal("0"),
+        storage_byte_days: int = 0,
+        storage_cost: Decimal = Decimal("0"),
+        database_units: Decimal = Decimal("0"),
+        database_cost: Decimal = Decimal("0"),
+        faa_proxy_requests: int = 0,
+        faa_proxy_cost: Decimal = Decimal("0"),
+        turn_relay_bytes: int = 0,
+        turn_relay_cost: Decimal = Decimal("0"),
+        other_cost: Decimal = Decimal("0"),
+        now: Optional[datetime] = None,
+    ) -> None:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", usage_date):
+            raise ControlPlaneError("Usage date must use YYYY-MM-DD.")
+        integer_values = (
+            network_bytes,
+            storage_byte_days,
+            faa_proxy_requests,
+            turn_relay_bytes,
+        )
+        decimal_values = (
+            compute_units,
+            compute_cost,
+            network_cost,
+            storage_cost,
+            database_units,
+            database_cost,
+            faa_proxy_cost,
+            turn_relay_cost,
+            other_cost,
+        )
+        if any(value < 0 for value in integer_values) or any(
+            Decimal(value) < 0 for value in decimal_values
+        ):
+            raise ControlPlaneError("Aggregate usage values cannot be negative.")
+        async with self.sessions() as session:
+            organization = await session.get(Organization, organization_id)
+            if organization is None:
+                raise ControlPlaneError("Organization not found.")
+            usage = await session.scalar(
+                select(UsageDaily).where(
+                    UsageDaily.organization_id == organization_id,
+                    UsageDaily.usage_date == usage_date,
+                )
+            )
+            if usage is None:
+                usage = UsageDaily(
+                    id=new_id(),
+                    organization_id=organization_id,
+                    usage_date=usage_date,
+                )
+                session.add(usage)
+            usage.compute_units = Decimal(compute_units)
+            usage.compute_cost = Decimal(compute_cost)
+            usage.network_bytes = network_bytes
+            usage.network_cost = Decimal(network_cost)
+            usage.storage_byte_days = storage_byte_days
+            usage.storage_cost = Decimal(storage_cost)
+            usage.database_units = Decimal(database_units)
+            usage.database_cost = Decimal(database_cost)
+            usage.faa_proxy_requests = faa_proxy_requests
+            usage.faa_proxy_cost = Decimal(faa_proxy_cost)
+            usage.turn_relay_bytes = turn_relay_bytes
+            usage.turn_relay_cost = Decimal(turn_relay_cost)
+            usage.other_cost = Decimal(other_cost)
+            usage.recorded_at = now or utc_now()
+            await session.commit()
+
+    async def increment_daily_usage(
+        self,
+        *,
+        organization_id: str,
+        usage_date: Optional[str] = None,
+        compute_units: Decimal = Decimal("0"),
+        network_bytes: int = 0,
+        storage_byte_days: int = 0,
+        database_units: Decimal = Decimal("0"),
+        faa_proxy_requests: int = 0,
+        turn_relay_bytes: int = 0,
+        now: Optional[datetime] = None,
+    ) -> None:
+        """Atomically add privacy-safe counters to one organization's daily row."""
+        recorded_at = now or utc_now()
+        day = usage_date or recorded_at.strftime("%Y-%m-%d")
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+            raise ControlPlaneError("Usage date must use YYYY-MM-DD.")
+        integer_values = (
+            network_bytes,
+            storage_byte_days,
+            faa_proxy_requests,
+            turn_relay_bytes,
+        )
+        decimal_values = (compute_units, database_units)
+        if any(value < 0 for value in integer_values) or any(
+            Decimal(value) < 0 for value in decimal_values
+        ):
+            raise ControlPlaneError("Aggregate usage values cannot be negative.")
+
+        values = {
+            "id": new_id(),
+            "organization_id": organization_id,
+            "usage_date": day,
+            "compute_units": Decimal(compute_units),
+            "network_bytes": network_bytes,
+            "storage_byte_days": storage_byte_days,
+            "database_units": Decimal(database_units),
+            "faa_proxy_requests": faa_proxy_requests,
+            "turn_relay_bytes": turn_relay_bytes,
+            "recorded_at": recorded_at,
+        }
+        async with self.sessions() as session:
+            if await session.get(Organization, organization_id) is None:
+                raise ControlPlaneError("Organization not found.")
+            insert = (
+                postgresql_insert(UsageDaily)
+                if self.engine.dialect.name == "postgresql"
+                else sqlite_insert(UsageDaily)
+            ).values(**values)
+            excluded = insert.excluded
+            insert = insert.on_conflict_do_update(
+                index_elements=["organization_id", "usage_date"],
+                set_={
+                    "compute_units": UsageDaily.compute_units + excluded.compute_units,
+                    "network_bytes": UsageDaily.network_bytes + excluded.network_bytes,
+                    "storage_byte_days": (
+                        UsageDaily.storage_byte_days + excluded.storage_byte_days
+                    ),
+                    "database_units": (
+                        UsageDaily.database_units + excluded.database_units
+                    ),
+                    "faa_proxy_requests": (
+                        UsageDaily.faa_proxy_requests + excluded.faa_proxy_requests
+                    ),
+                    "turn_relay_bytes": (
+                        UsageDaily.turn_relay_bytes + excluded.turn_relay_bytes
+                    ),
+                    "recorded_at": recorded_at,
+                },
+            )
+            await session.execute(insert)
+            await session.commit()
+
+    async def month_to_date_usage_costs(
+        self,
+        now: Optional[datetime] = None,
+    ) -> dict[str, UsageCostRecord]:
+        checked_at = now or utc_now()
+        month_prefix = checked_at.strftime("%Y-%m-")
+        async with self.sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(UsageDaily).where(
+                        UsageDaily.usage_date.startswith(month_prefix)
+                    )
+                )
+            ).all()
+        totals: dict[str, dict[str, Decimal]] = {}
+        for row in rows:
+            organization_totals = totals.setdefault(
+                row.organization_id,
+                {
+                    "compute": Decimal("0"),
+                    "network": Decimal("0"),
+                    "storage": Decimal("0"),
+                    "database": Decimal("0"),
+                    "other": Decimal("0"),
+                },
+            )
+            organization_totals["compute"] += Decimal(row.compute_cost)
+            organization_totals["network"] += Decimal(row.network_cost)
+            organization_totals["storage"] += Decimal(row.storage_cost)
+            organization_totals["database"] += Decimal(row.database_cost)
+            organization_totals["other"] += (
+                Decimal(row.faa_proxy_cost)
+                + Decimal(row.turn_relay_cost)
+                + Decimal(row.other_cost)
+            )
+        return {
+            organization_id: UsageCostRecord(
+                organization_id=organization_id,
+                **values,
+            )
+            for organization_id, values in totals.items()
+        }
+
+    async def month_to_date_usage_aggregates(
+        self,
+        now: Optional[datetime] = None,
+    ) -> dict[str, UsageAggregateRecord]:
+        checked_at = now or utc_now()
+        month_prefix = checked_at.strftime("%Y-%m-")
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        UsageDaily.organization_id,
+                        func.sum(UsageDaily.compute_units),
+                        func.sum(UsageDaily.network_bytes),
+                        func.sum(UsageDaily.storage_byte_days),
+                        func.sum(UsageDaily.database_units),
+                        func.sum(UsageDaily.faa_proxy_requests),
+                        func.sum(UsageDaily.turn_relay_bytes),
+                    )
+                    .where(UsageDaily.usage_date.startswith(month_prefix))
+                    .group_by(UsageDaily.organization_id)
+                )
+            ).all()
+        return {
+            organization_id: UsageAggregateRecord(
+                organization_id=organization_id,
+                compute_units=Decimal(compute_units or 0),
+                network_bytes=int(network_bytes or 0),
+                storage_byte_days=int(storage_byte_days or 0),
+                database_units=Decimal(database_units or 0),
+                faa_proxy_requests=int(faa_proxy_requests or 0),
+                turn_relay_bytes=int(turn_relay_bytes or 0),
+            )
+            for (
+                organization_id,
+                compute_units,
+                network_bytes,
+                storage_byte_days,
+                database_units,
+                faa_proxy_requests,
+                turn_relay_bytes,
+            ) in rows
+        }
+
+    async def list_provisioning_jobs(
+        self,
+        limit: int = 50,
+    ) -> tuple[ProvisioningJobRecord, ...]:
+        safe_limit = max(1, min(limit, 200))
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(ProvisioningJob, Organization.designator)
+                    .join(
+                        Organization,
+                        Organization.id == ProvisioningJob.organization_id,
+                    )
+                    .order_by(ProvisioningJob.created_at.desc())
+                    .limit(safe_limit)
+                )
+            ).all()
+        return tuple(
+            ProvisioningJobRecord(
+                id=job.id,
+                organization_id=job.organization_id,
+                designator=designator,
+                state=job.state,
+                current_step=job.current_step,
+                simulation=job.simulation,
+                steps=tuple(json.loads(job.steps_json or "[]")),
+                created_at=as_utc(job.created_at),
+                completed_at=as_utc(job.completed_at),
+            )
+            for job, designator in rows
+        )
+
+    async def list_audit_events(
+        self,
+        limit: int = 100,
+    ) -> tuple[AuditEventRecord, ...]:
+        safe_limit = max(1, min(limit, 500))
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(ControlPlaneAuditEvent, Organization.designator)
+                    .outerjoin(
+                        Organization,
+                        Organization.id
+                        == ControlPlaneAuditEvent.organization_id,
+                    )
+                    .order_by(ControlPlaneAuditEvent.created_at.desc())
+                    .limit(safe_limit)
+                )
+            ).all()
+        return tuple(
+            AuditEventRecord(
+                id=event.id,
+                organization_id=event.organization_id,
+                designator=designator,
+                actor_type=event.actor_type,
+                actor_id=event.actor_id,
+                event_type=event.event_type,
+                details=json.loads(event.details_json or "{}"),
+                created_at=as_utc(event.created_at),
+            )
+            for event, designator in rows
+        )
+
+    async def create_enrollment_campaign(
+        self,
+        *,
+        organization_id: str,
+        label: str,
+        created_by_user_id: str,
+        expires_in_hours: int,
+        max_redemptions: int,
+        now: Optional[datetime] = None,
+    ) -> EnrollmentCampaignRecord:
+        created_at = now or utc_now()
+        clean_label = label.strip()
+        if not clean_label:
+            raise ControlPlaneError("Enter an enrollment label.")
+        if not 1 <= expires_in_hours <= 24 * 30:
+            raise ControlPlaneError("Enrollment validity must be 1-720 hours.")
+        if not 1 <= max_redemptions <= 500:
+            raise ControlPlaneError("Enrollment uses must be 1-500.")
+        campaign = EnrollmentCampaign(
+            id=new_id(),
+            organization_id=organization_id,
+            label=clean_label,
+            created_by_user_id=created_by_user_id,
+            max_redemptions=max_redemptions,
+            expires_at=created_at + timedelta(hours=expires_in_hours),
+            created_at=created_at,
+        )
+        async with self.sessions() as session:
+            user = await session.get(OrganizationUser, created_by_user_id)
+            if user is None or user.organization_id != organization_id:
+                raise ControlPlaneError("Enrollment campaign owner is invalid.")
+            session.add(campaign)
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=organization_id,
+                    actor_type="organization_user",
+                    actor_id=created_by_user_id,
+                    event_type="enrollment.created",
+                    details_json=json.dumps(
+                        {
+                            "campaign_id": campaign.id,
+                            "max_redemptions": max_redemptions,
+                            "expires_in_hours": expires_in_hours,
+                        }
+                    ),
+                    created_at=created_at,
+                )
+            )
+            await session.commit()
+        return self._campaign_record(campaign)
+
+    async def list_enrollment_campaigns(
+        self,
+        organization_id: str,
+    ) -> tuple[EnrollmentCampaignRecord, ...]:
+        async with self.sessions() as session:
+            campaigns = (
+                await session.scalars(
+                    select(EnrollmentCampaign)
+                    .where(EnrollmentCampaign.organization_id == organization_id)
+                    .order_by(EnrollmentCampaign.created_at.desc())
+                )
+            ).all()
+        return tuple(self._campaign_record(campaign) for campaign in campaigns)
+
+    async def get_enrollment_campaign(
+        self,
+        campaign_id: str,
+    ) -> Optional[EnrollmentCampaignRecord]:
+        async with self.sessions() as session:
+            campaign = await session.get(EnrollmentCampaign, campaign_id)
+        return None if campaign is None else self._campaign_record(campaign)
+
+    async def revoke_enrollment_campaign(
+        self,
+        *,
+        campaign_id: str,
+        organization_id: str,
+        actor_id: str,
+        now: Optional[datetime] = None,
+    ) -> None:
+        revoked_at = now or utc_now()
+        async with self.sessions() as session:
+            campaign = await session.get(EnrollmentCampaign, campaign_id)
+            if campaign is None or campaign.organization_id != organization_id:
+                raise ControlPlaneError("Enrollment campaign not found.")
+            campaign.state = "revoked"
+            campaign.revoked_at = revoked_at
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=organization_id,
+                    actor_type="organization_user",
+                    actor_id=actor_id,
+                    event_type="enrollment.revoked",
+                    details_json=json.dumps({"campaign_id": campaign_id}),
+                    created_at=revoked_at,
+                )
+            )
+            await session.commit()
+
+    async def redeem_enrollment_campaign(
+        self,
+        *,
+        campaign_id: str,
+        organization_id: str,
+        now: Optional[datetime] = None,
+    ) -> EnrollmentCampaignRecord:
+        redeemed_at = now or utc_now()
+        async with self.sessions() as session:
+            campaign = await session.get(EnrollmentCampaign, campaign_id)
+            if campaign is None or campaign.organization_id != organization_id:
+                raise ControlPlaneError("Enrollment campaign not found.")
+            expires_at = as_utc(campaign.expires_at)
+            if campaign.state != "active" or expires_at is None:
+                raise ControlPlaneError("Enrollment campaign is not active.")
+            if expires_at < redeemed_at:
+                campaign.state = "expired"
+                await session.commit()
+                raise ControlPlaneError("Enrollment campaign has expired.")
+            if campaign.redemption_count >= campaign.max_redemptions:
+                campaign.state = "exhausted"
+                await session.commit()
+                raise ControlPlaneError("Enrollment campaign has no uses remaining.")
+            campaign.redemption_count += 1
+            if campaign.redemption_count >= campaign.max_redemptions:
+                campaign.state = "exhausted"
+            await session.commit()
+            return self._campaign_record(campaign)
+
+    async def issue_device_credential(
+        self,
+        *,
+        campaign_id: str,
+        organization_id: str,
+        device_name: str,
+        platform: str,
+        now: Optional[datetime] = None,
+    ) -> IssuedDeviceCredential:
+        issued_at = now or utc_now()
+        clean_name = device_name.strip()
+        clean_platform = platform.strip().lower()
+        if not clean_name or len(clean_name) > 160:
+            raise ControlPlaneError("Enter a device name.")
+        if clean_platform not in {"android", "ios"}:
+            raise ControlPlaneError("Device platform must be Android or iOS.")
+        token = "r2c_dev_" + secrets.token_urlsafe(32)
+        expires_at = issued_at + timedelta(days=365)
+        async with self.sessions() as session:
+            campaign = await session.scalar(
+                select(EnrollmentCampaign)
+                .where(EnrollmentCampaign.id == campaign_id)
+                .with_for_update()
+            )
+            if campaign is None or campaign.organization_id != organization_id:
+                raise ControlPlaneError("Enrollment campaign not found.")
+            campaign_expires_at = as_utc(campaign.expires_at)
+            if campaign.state != "active" or campaign_expires_at is None:
+                raise ControlPlaneError("Enrollment campaign is not active.")
+            if campaign_expires_at < issued_at:
+                campaign.state = "expired"
+                await session.commit()
+                raise ControlPlaneError("Enrollment campaign has expired.")
+            if campaign.redemption_count >= campaign.max_redemptions:
+                campaign.state = "exhausted"
+                await session.commit()
+                raise ControlPlaneError("Enrollment campaign has no uses remaining.")
+            organization = await session.get(Organization, organization_id)
+            if organization is None:
+                raise ControlPlaneError("Organization not found.")
+            credential = DeviceCredential(
+                id=new_id(),
+                organization_id=organization_id,
+                campaign_id=campaign_id,
+                device_name=clean_name,
+                platform=clean_platform,
+                token_prefix=token[:16],
+                token_hash=device_token_hash(token),
+                state="active",
+                created_at=issued_at,
+                expires_at=expires_at,
+            )
+            campaign.redemption_count += 1
+            if campaign.redemption_count >= campaign.max_redemptions:
+                campaign.state = "exhausted"
+            session.add(credential)
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=organization_id,
+                    actor_type="device_enrollment",
+                    actor_id=credential.id,
+                    event_type="device.credential_issued",
+                    details_json=json.dumps(
+                        {
+                            "campaign_id": campaign_id,
+                            "platform": clean_platform,
+                            "device_name": clean_name,
+                        }
+                    ),
+                    created_at=issued_at,
+                )
+            )
+            await session.commit()
+            return IssuedDeviceCredential(
+                id=credential.id,
+                organization_id=organization_id,
+                designator=organization.designator,
+                token=token,
+                device_name=clean_name,
+                platform=clean_platform,
+                expires_at=expires_at,
+            )
+
+    async def authenticate_device_token(
+        self,
+        token: str,
+        now: Optional[datetime] = None,
+    ) -> Optional[DeviceCredentialRecord]:
+        if not token.startswith("r2c_dev_") or len(token) < 40:
+            return None
+        checked_at = now or utc_now()
+        async with self.sessions() as session:
+            row = (
+                await session.execute(
+                    select(DeviceCredential, Organization.designator)
+                    .join(
+                        Organization,
+                        Organization.id == DeviceCredential.organization_id,
+                    )
+                    .where(
+                        DeviceCredential.token_hash == device_token_hash(token),
+                        DeviceCredential.state == "active",
+                    )
+                )
+            ).first()
+            if row is None:
+                return None
+            credential, designator = row
+            expires_at = as_utc(credential.expires_at)
+            if expires_at is None or expires_at < checked_at:
+                credential.state = "expired"
+                await session.commit()
+                return None
+            credential.last_used_at = checked_at
+            await session.commit()
+            return DeviceCredentialRecord(
+                id=credential.id,
+                organization_id=credential.organization_id,
+                designator=designator,
+                device_name=credential.device_name,
+                platform=credential.platform,
+                expires_at=expires_at,
+            )
+
+    async def advertise_video_stream(
+        self,
+        *,
+        organization_id: str,
+        device_credential_id: str,
+        device_name: str = "",
+        session_id: str,
+        incident_name: str,
+        drone_designator: str,
+        source_width: int = 0,
+        source_height: int = 0,
+        source_fps: float = 0.0,
+        source_bitrate_bps: int = 0,
+        source_codec: str = "",
+        timezone_name: str = "UTC",
+        ttl_seconds: int = 45,
+        now: Optional[datetime] = None,
+    ) -> ActiveVideoStreamRecord:
+        seen_at = now or utc_now()
+        clean_session_id = session_id.strip()
+        clean_incident = incident_name.strip()
+        clean_drone = drone_designator.strip()
+        clean_device_name = device_name.strip()
+        clean_codec = source_codec.strip().lower()
+        clean_timezone = normalize_timezone_name(timezone_name)
+        if not clean_session_id or len(clean_session_id) > 36:
+            raise ControlPlaneError("A valid stream session ID is required.")
+        if not clean_incident:
+            raise ControlPlaneError("An incident name is required.")
+        if not clean_drone:
+            raise ControlPlaneError("A drone designator is required.")
+        if len(clean_device_name) > 160:
+            raise ControlPlaneError("Device name must be 160 characters or fewer.")
+        if not 10 <= ttl_seconds <= 120:
+            raise ControlPlaneError("Stream presence TTL must be 10-120 seconds.")
+        width = max(0, min(int(source_width), 16384))
+        height = max(0, min(int(source_height), 16384))
+        fps_milli = max(0, min(int(round(source_fps * 1000)), 240000))
+        bitrate = max(0, min(int(source_bitrate_bps), 1_000_000_000))
+        expires_at = seen_at + timedelta(seconds=ttl_seconds)
+        async with self.sessions() as session:
+            credential = await session.get(DeviceCredential, device_credential_id)
+            if (
+                credential is None
+                or credential.organization_id != organization_id
+                or credential.state != "active"
+            ):
+                raise ControlPlaneError("Active organization device not found.")
+            stream = await session.scalar(
+                select(ActiveVideoStream).where(
+                    ActiveVideoStream.session_id == clean_session_id
+                )
+            )
+            if stream is not None and (
+                stream.organization_id != organization_id
+                or stream.device_credential_id != device_credential_id
+            ):
+                raise ControlPlaneError(
+                    "Stream session belongs to a different organization device."
+                )
+            is_new_stream = stream is None
+            if stream is None:
+                stream = ActiveVideoStream(
+                    id=new_id(),
+                    session_id=clean_session_id,
+                    organization_id=organization_id,
+                    device_credential_id=device_credential_id,
+                    created_at=seen_at,
+                )
+                session.add(stream)
+            if clean_device_name:
+                credential.device_name = clean_device_name
+            meaningful_change = is_new_stream or any((
+                stream.state != "active",
+                as_utc(stream.expires_at) is None,
+                (as_utc(stream.expires_at) or seen_at) < seen_at,
+                stream.incident_name != clean_incident[:160],
+                stream.drone_designator != clean_drone[:160],
+                stream.device_name != credential.device_name[:160],
+                width > 0 and stream.source_width != width,
+                height > 0 and stream.source_height != height,
+                fps_milli > 0 and stream.source_fps_milli != fps_milli,
+                bitrate > 0 and stream.source_bitrate_bps != bitrate,
+                bool(clean_codec) and stream.source_codec != clean_codec[:32],
+                stream.timezone_name != clean_timezone,
+            ))
+            stream.incident_name = clean_incident[:160]
+            stream.drone_designator = clean_drone[:160]
+            stream.device_name = credential.device_name[:160]
+            if is_new_stream or width > 0:
+                stream.source_width = width
+            if is_new_stream or height > 0:
+                stream.source_height = height
+            if is_new_stream or fps_milli > 0:
+                stream.source_fps_milli = fps_milli
+            if is_new_stream or bitrate > 0:
+                stream.source_bitrate_bps = bitrate
+            if is_new_stream or clean_codec:
+                stream.source_codec = clean_codec[:32]
+            stream.timezone_name = clean_timezone
+            stream.state = "active"
+            stream.last_seen_at = seen_at
+            stream.expires_at = expires_at
+            if meaningful_change:
+                await self._notify_video_stream_change(session, organization_id)
+            await session.commit()
+            return self._active_video_stream_record(stream)
+
+    async def list_active_video_streams(
+        self,
+        organization_id: str,
+        now: Optional[datetime] = None,
+    ) -> tuple[ActiveVideoStreamRecord, ...]:
+        checked_at = now or utc_now()
+        async with self.sessions() as session:
+            streams = (
+                await session.scalars(
+                    select(ActiveVideoStream)
+                    .where(
+                        ActiveVideoStream.organization_id == organization_id,
+                        ActiveVideoStream.state == "active",
+                        ActiveVideoStream.expires_at >= checked_at,
+                    )
+                    .order_by(
+                        func.lower(ActiveVideoStream.incident_name),
+                        func.lower(ActiveVideoStream.drone_designator),
+                    )
+                )
+            ).all()
+        return tuple(self._active_video_stream_record(stream) for stream in streams)
+
+    async def reconcile_device_video_streams(
+        self,
+        *,
+        organization_id: str,
+        device_credential_id: str,
+        active_session_ids: Iterable[str],
+        now: Optional[datetime] = None,
+    ) -> int:
+        """Retire streams omitted from a device's authoritative advertisement."""
+        retired_at = now or utc_now()
+        clean_session_ids = {
+            str(session_id).strip()
+            for session_id in active_session_ids
+            if str(session_id).strip()
+        }
+        async with self.sessions() as session:
+            statement = select(ActiveVideoStream).where(
+                ActiveVideoStream.organization_id == organization_id,
+                ActiveVideoStream.device_credential_id == device_credential_id,
+                ActiveVideoStream.state == "active",
+            )
+            if clean_session_ids:
+                statement = statement.where(
+                    ActiveVideoStream.session_id.not_in(clean_session_ids)
+                )
+            streams = (await session.scalars(statement)).all()
+            for stream in streams:
+                stream.state = "inactive"
+                stream.expires_at = retired_at
+            retired_stream_ids = [stream.id for stream in streams]
+            unavailable_requests = []
+            if retired_stream_ids:
+                unavailable_requests = (
+                    await session.scalars(
+                        select(VideoStreamRequest).where(
+                            VideoStreamRequest.active_stream_id.in_(
+                                retired_stream_ids
+                            ),
+                            VideoStreamRequest.state.in_((
+                                "pending",
+                                "probing",
+                                "awaiting_approval",
+                                "approved",
+                                "streaming",
+                            )),
+                        )
+                    )
+                ).all()
+                for request in unavailable_requests:
+                    request.state = "e_nosuch_stream"
+                    request.stopped_at = retired_at
+                    session.add(
+                        ControlPlaneAuditEvent(
+                            organization_id=request.organization_id,
+                            actor_type="organization_device",
+                            actor_id=device_credential_id,
+                            event_type="video.e_nosuch_stream",
+                            details_json=json.dumps({"request_id": request.id}),
+                            created_at=retired_at,
+                        )
+                    )
+                request_ids = [request.id for request in unavailable_requests]
+                if request_ids:
+                    await session.execute(
+                        delete(VideoPreflightExchange).where(
+                            VideoPreflightExchange.request_id.in_(request_ids)
+                        )
+                    )
+                    await session.execute(
+                        delete(VideoMediaExchange).where(
+                            VideoMediaExchange.request_id.in_(request_ids)
+                        )
+                    )
+            if streams:
+                await self._notify_video_stream_change(session, organization_id)
+                await session.commit()
+            return len(streams)
+
+    async def create_video_stream_request(
+        self,
+        *,
+        organization_id: str,
+        stream_session_id: str,
+        requester_user_id: str,
+        now: Optional[datetime] = None,
+    ) -> VideoStreamRequestRecord:
+        requested_at = now or utc_now()
+        async with self.sessions() as session:
+            stream = await session.scalar(
+                select(ActiveVideoStream).where(
+                    ActiveVideoStream.organization_id == organization_id,
+                    ActiveVideoStream.session_id == stream_session_id,
+                    ActiveVideoStream.state == "active",
+                    ActiveVideoStream.expires_at >= requested_at,
+                ).with_for_update()
+            )
+            requester = await session.get(OrganizationUser, requester_user_id)
+            if stream is None:
+                raise ControlPlaneError(
+                    "That stream is no longer active. Refresh the list and try again."
+                )
+            if (
+                requester is None
+                or requester.organization_id != organization_id
+                or requester.state != "active"
+                or "video_requester" not in requester.roles
+            ):
+                raise ControlPlaneError(
+                    "Your organization role does not permit stream requests."
+                )
+            existing_request = await session.scalar(
+                select(VideoStreamRequest).where(
+                    VideoStreamRequest.active_stream_id == stream.id,
+                    VideoStreamRequest.state.in_((
+                        "pending",
+                        "probing",
+                        "awaiting_approval",
+                        "approved",
+                        "streaming",
+                    )),
+                    VideoStreamRequest.expires_at >= requested_at,
+                )
+            )
+            if existing_request is not None:
+                raise ControlPlaneError(
+                    "A video request for this stream is already in progress. "
+                    "Cancel or stop it before requesting again."
+                )
+            request = VideoStreamRequest(
+                id=new_id(),
+                organization_id=organization_id,
+                active_stream_id=stream.id,
+                requester_user_id=requester.id,
+                requester_email=requester.email,
+                state="pending",
+                requested_at=requested_at,
+                expires_at=requested_at + timedelta(minutes=10),
+            )
+            session.add(request)
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=organization_id,
+                    actor_type="organization_user",
+                    actor_id=requester.id,
+                    event_type="video.requested",
+                    # Platform-level audit views may show that a request
+                    # occurred, but never incident or aircraft labels.
+                    details_json=json.dumps({"request_id": request.id}),
+                    created_at=requested_at,
+                )
+            )
+            if self.engine.dialect.name == "postgresql":
+                await session.execute(
+                    select(func.pg_notify("r2c_video_request", request.id))
+                )
+            await self._notify_video_stream_change(session, organization_id)
+            await session.commit()
+            return self._video_stream_request_record(request, stream)
+
+    async def get_pending_video_stream_request(
+        self,
+        request_id: str,
+        now: Optional[datetime] = None,
+    ) -> Optional[VideoStreamRequestRecord]:
+        checked_at = now or utc_now()
+        async with self.sessions() as session:
+            row = (
+                await session.execute(
+                    select(VideoStreamRequest, ActiveVideoStream)
+                    .join(
+                        ActiveVideoStream,
+                        ActiveVideoStream.id
+                        == VideoStreamRequest.active_stream_id,
+                    )
+                    .where(
+                        VideoStreamRequest.id == request_id,
+                        VideoStreamRequest.state.in_(("pending", "probing")),
+                        VideoStreamRequest.expires_at >= checked_at,
+                    )
+                )
+            ).first()
+        if row is None:
+            return None
+        request, stream = row
+        return self._video_stream_request_record(request, stream)
+
+    async def list_video_stream_requests(
+        self,
+        *,
+        organization_id: str,
+        requester_user_id: Optional[str] = None,
+        limit: int = 20,
+        now: Optional[datetime] = None,
+    ) -> tuple[VideoStreamRequestRecord, ...]:
+        checked_at = now or utc_now()
+        statement = (
+            select(VideoStreamRequest, ActiveVideoStream)
+            .join(
+                ActiveVideoStream,
+                ActiveVideoStream.id == VideoStreamRequest.active_stream_id,
+            )
+            .where(VideoStreamRequest.organization_id == organization_id)
+        )
+        if requester_user_id is not None:
+            statement = statement.where(
+                VideoStreamRequest.requester_user_id == requester_user_id
+            )
+        statement = statement.order_by(
+            VideoStreamRequest.requested_at.desc()
+        ).limit(max(1, min(limit, 100)))
+        async with self.sessions() as session:
+            await self._expire_video_stream_requests(
+                session,
+                checked_at=checked_at,
+                organization_id=organization_id,
+            )
+            await session.execute(
+                delete(VideoPreflightExchange).where(
+                    VideoPreflightExchange.expires_at < checked_at
+                )
+            )
+            await session.commit()
+            rows = (await session.execute(statement)).all()
+        return tuple(
+            self._video_stream_request_record(request, stream)
+            for request, stream in rows
+        )
+
+    async def list_pending_video_stream_requests_for_device(
+        self,
+        *,
+        device_credential_id: str,
+        now: Optional[datetime] = None,
+        limit: int = 20,
+    ) -> tuple[VideoStreamRequestRecord, ...]:
+        checked_at = now or utc_now()
+        statement = (
+            select(VideoStreamRequest, ActiveVideoStream)
+            .join(
+                ActiveVideoStream,
+                ActiveVideoStream.id == VideoStreamRequest.active_stream_id,
+            )
+            .where(
+                ActiveVideoStream.device_credential_id == device_credential_id,
+                VideoStreamRequest.state.in_(("pending", "probing")),
+                VideoStreamRequest.expires_at >= checked_at,
+            )
+            .order_by(VideoStreamRequest.requested_at)
+            .limit(max(1, min(limit, 100)))
+        )
+        async with self.sessions() as session:
+            rows = (await session.execute(statement)).all()
+        return tuple(
+            self._video_stream_request_record(request, stream)
+            for request, stream in rows
+        )
+
+    async def cancel_video_stream_request(
+        self,
+        *,
+        request_id: str,
+        organization_id: str,
+        requester_user_id: str,
+        now: Optional[datetime] = None,
+    ) -> VideoStreamRequestRecord:
+        cancelled_at = now or utc_now()
+        async with self.sessions() as session:
+            row = (
+                await session.execute(
+                    select(VideoStreamRequest, ActiveVideoStream)
+                    .join(
+                        ActiveVideoStream,
+                        ActiveVideoStream.id == VideoStreamRequest.active_stream_id,
+                    )
+                    .where(VideoStreamRequest.id == request_id)
+                )
+            ).first()
+            if row is None:
+                raise ControlPlaneError("Video stream request not found.")
+            request, stream = row
+            if (
+                request.organization_id != organization_id
+                or request.requester_user_id != requester_user_id
+            ):
+                raise ControlPlaneError(
+                    "Video stream request belongs to another user."
+                )
+            if as_utc(request.expires_at) < cancelled_at:
+                request.state = "expired"
+                request.stopped_at = cancelled_at
+                exchange = await session.get(VideoPreflightExchange, request.id)
+                if exchange is not None:
+                    await session.delete(exchange)
+                await session.commit()
+                raise ControlPlaneError("Video stream request has expired.")
+            if request.state == "cancelled":
+                return self._video_stream_request_record(request, stream)
+            if request.state not in {"pending", "probing", "awaiting_approval"}:
+                raise ControlPlaneError(
+                    "Video stream request can no longer be cancelled."
+                )
+            request.state = "cancelled"
+            request.stopped_at = cancelled_at
+            exchange = await session.get(VideoPreflightExchange, request.id)
+            if exchange is not None:
+                await session.delete(exchange)
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=request.organization_id,
+                    actor_type="organization_user",
+                    actor_id=requester_user_id,
+                    event_type="video.request_cancelled",
+                    details_json=json.dumps({"request_id": request.id}),
+                    created_at=cancelled_at,
+                )
+            )
+            await self._notify_video_stream_change(
+                session, request.organization_id
+            )
+            await session.commit()
+            return self._video_stream_request_record(request, stream)
+
+    @staticmethod
+    async def _expire_video_stream_requests(
+        session: AsyncSession,
+        *,
+        checked_at: datetime,
+        organization_id: Optional[str] = None,
+    ) -> int:
+        statement = select(VideoStreamRequest.id).where(
+            VideoStreamRequest.state.in_((
+                "pending", "probing", "awaiting_approval", "approved"
+            )),
+            VideoStreamRequest.expires_at < checked_at,
+        )
+        if organization_id is not None:
+            statement = statement.where(
+                VideoStreamRequest.organization_id == organization_id
+            )
+        request_ids = tuple((await session.scalars(statement)).all())
+        if not request_ids:
+            return 0
+        await session.execute(
+            update(VideoStreamRequest)
+            .where(VideoStreamRequest.id.in_(request_ids))
+            .values(state="expired", stopped_at=checked_at)
+        )
+        return len(request_ids)
+
+    async def start_video_preflight(
+        self,
+        *,
+        request_id: str,
+        organization_id: str,
+        requester_user_id: str,
+        browser_offer_sdp: str,
+        now: Optional[datetime] = None,
+    ) -> VideoPreflightExchangeRecord:
+        started_at = now or utc_now()
+        offer = normalize_session_description(browser_offer_sdp)
+        async with self.sessions() as session:
+            row = (
+                await session.execute(
+                    select(VideoStreamRequest, ActiveVideoStream)
+                    .join(
+                        ActiveVideoStream,
+                        ActiveVideoStream.id
+                        == VideoStreamRequest.active_stream_id,
+                    )
+                    .where(VideoStreamRequest.id == request_id)
+                )
+            ).first()
+            if row is None:
+                raise ControlPlaneError("Video stream request not found.")
+            request, stream = row
+            if (
+                request.organization_id != organization_id
+                or request.requester_user_id != requester_user_id
+            ):
+                raise ControlPlaneError(
+                    "Video stream request belongs to another user."
+                )
+            if as_utc(request.expires_at) < started_at:
+                request.state = "expired"
+                await session.commit()
+                raise ControlPlaneError("Video stream request has expired.")
+            if request.state not in {"pending", "probing"}:
+                raise ControlPlaneError(
+                    "Video stream request is not available for preflight."
+                )
+            exchange = await session.get(VideoPreflightExchange, request.id)
+            if exchange is None:
+                exchange = VideoPreflightExchange(
+                    request_id=request.id,
+                    browser_offer_sdp=offer,
+                    device_answer_sdp="",
+                    created_at=started_at,
+                    updated_at=started_at,
+                    expires_at=request.expires_at,
+                )
+                session.add(exchange)
+            else:
+                exchange.browser_offer_sdp = offer
+                exchange.device_answer_sdp = ""
+                exchange.updated_at = started_at
+                exchange.expires_at = request.expires_at
+            request.state = "probing"
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=request.organization_id,
+                    actor_type="organization_user",
+                    actor_id=requester_user_id,
+                    event_type="video.preflight_started",
+                    details_json=json.dumps({"request_id": request.id}),
+                    created_at=started_at,
+                )
+            )
+            if self.engine.dialect.name == "postgresql":
+                await session.execute(
+                    select(func.pg_notify("r2c_video_preflight", request.id))
+                )
+            await self._notify_video_stream_change(
+                session, request.organization_id
+            )
+            await session.commit()
+            return self._video_preflight_exchange_record(
+                request,
+                stream,
+                exchange,
+            )
+
+    async def get_video_preflight_exchange_for_requester(
+        self,
+        *,
+        request_id: str,
+        organization_id: str,
+        requester_user_id: str,
+        now: Optional[datetime] = None,
+    ) -> VideoPreflightExchangeRecord:
+        checked_at = now or utc_now()
+        async with self.sessions() as session:
+            row = (
+                await session.execute(
+                    select(
+                        VideoStreamRequest,
+                        ActiveVideoStream,
+                        VideoPreflightExchange,
+                    )
+                    .join(
+                        ActiveVideoStream,
+                        ActiveVideoStream.id
+                        == VideoStreamRequest.active_stream_id,
+                    )
+                    .outerjoin(
+                        VideoPreflightExchange,
+                        VideoPreflightExchange.request_id
+                        == VideoStreamRequest.id,
+                    )
+                    .where(VideoStreamRequest.id == request_id)
+                )
+            ).first()
+            if row is None:
+                raise ControlPlaneError("Video stream request not found.")
+            request, stream, exchange = row
+            if (
+                request.organization_id != organization_id
+                or request.requester_user_id != requester_user_id
+            ):
+                raise ControlPlaneError(
+                    "Video stream request belongs to another user."
+                )
+            if as_utc(request.expires_at) < checked_at:
+                request.state = "expired"
+                if exchange is not None:
+                    await session.delete(exchange)
+                await session.commit()
+                raise ControlPlaneError("Video stream request has expired.")
+            if exchange is None:
+                exchange = VideoPreflightExchange(
+                    request_id=request.id,
+                    browser_offer_sdp="",
+                    device_answer_sdp="",
+                    created_at=request.requested_at,
+                    updated_at=request.requested_at,
+                    expires_at=request.expires_at,
+                )
+            return self._video_preflight_exchange_record(
+                request,
+                stream,
+                exchange,
+            )
+
+    async def cleanup_expired_video_preflight_exchanges(
+        self,
+        *,
+        now: Optional[datetime] = None,
+    ) -> int:
+        """Discard expired SDP and embedded ICE credentials."""
+        checked_at = now or utc_now()
+        async with self.sessions() as session:
+            await self._expire_video_stream_requests(
+                session,
+                checked_at=checked_at,
+            )
+            result = await session.execute(
+                delete(VideoPreflightExchange).where(
+                    VideoPreflightExchange.expires_at < checked_at
+                )
+            )
+            await session.commit()
+            return int(result.rowcount or 0)
+
+    async def get_pending_video_preflight_offer(
+        self,
+        *,
+        request_id: str,
+        now: Optional[datetime] = None,
+    ) -> Optional[VideoPreflightExchangeRecord]:
+        checked_at = now or utc_now()
+        async with self.sessions() as session:
+            row = (
+                await session.execute(
+                    select(
+                        VideoStreamRequest,
+                        ActiveVideoStream,
+                        VideoPreflightExchange,
+                    )
+                    .join(
+                        ActiveVideoStream,
+                        ActiveVideoStream.id
+                        == VideoStreamRequest.active_stream_id,
+                    )
+                    .join(
+                        VideoPreflightExchange,
+                        VideoPreflightExchange.request_id
+                        == VideoStreamRequest.id,
+                    )
+                    .where(
+                        VideoStreamRequest.id == request_id,
+                        VideoStreamRequest.state == "probing",
+                        VideoStreamRequest.expires_at >= checked_at,
+                    )
+                )
+            ).first()
+        if row is None:
+            return None
+        request, stream, exchange = row
+        return self._video_preflight_exchange_record(
+            request,
+            stream,
+            exchange,
+        )
+
+    async def list_pending_video_preflight_offers_for_device(
+        self,
+        *,
+        device_credential_id: str,
+        now: Optional[datetime] = None,
+        limit: int = 10,
+    ) -> tuple[VideoPreflightExchangeRecord, ...]:
+        checked_at = now or utc_now()
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        VideoStreamRequest,
+                        ActiveVideoStream,
+                        VideoPreflightExchange,
+                    )
+                    .join(
+                        ActiveVideoStream,
+                        ActiveVideoStream.id
+                        == VideoStreamRequest.active_stream_id,
+                    )
+                    .join(
+                        VideoPreflightExchange,
+                        VideoPreflightExchange.request_id
+                        == VideoStreamRequest.id,
+                    )
+                    .where(
+                        ActiveVideoStream.device_credential_id
+                        == device_credential_id,
+                        VideoStreamRequest.state == "probing",
+                        VideoStreamRequest.expires_at >= checked_at,
+                        VideoPreflightExchange.device_answer_sdp == "",
+                    )
+                    .order_by(VideoPreflightExchange.created_at)
+                    .limit(max(1, min(limit, 20)))
+                )
+            ).all()
+        return tuple(
+            self._video_preflight_exchange_record(request, stream, exchange)
+            for request, stream, exchange in rows
+        )
+
+    async def record_video_preflight_answer(
+        self,
+        *,
+        request_id: str,
+        device_credential_id: str,
+        device_answer_sdp: str,
+        now: Optional[datetime] = None,
+    ) -> VideoPreflightExchangeRecord:
+        answered_at = now or utc_now()
+        answer = normalize_video_preflight_answer(device_answer_sdp)
+        async with self.sessions() as session:
+            row = (
+                await session.execute(
+                    select(
+                        VideoStreamRequest,
+                        ActiveVideoStream,
+                        VideoPreflightExchange,
+                    )
+                    .join(
+                        ActiveVideoStream,
+                        ActiveVideoStream.id
+                        == VideoStreamRequest.active_stream_id,
+                    )
+                    .join(
+                        VideoPreflightExchange,
+                        VideoPreflightExchange.request_id
+                        == VideoStreamRequest.id,
+                    )
+                    .where(VideoStreamRequest.id == request_id)
+                )
+            ).first()
+            if row is None:
+                raise ControlPlaneError("Video preflight offer not found.")
+            request, stream, exchange = row
+            if stream.device_credential_id != device_credential_id:
+                raise ControlPlaneError(
+                    "Video stream request belongs to another device."
+                )
+            if (
+                request.state != "probing"
+                or as_utc(request.expires_at) < answered_at
+            ):
+                raise ControlPlaneError(
+                    "Video stream request is not awaiting a preflight answer."
+                )
+            exchange.device_answer_sdp = answer
+            exchange.updated_at = answered_at
+            await session.commit()
+            return self._video_preflight_exchange_record(
+                request,
+                stream,
+                exchange,
+            )
+
+    async def record_video_preflight_result(
+        self,
+        *,
+        request_id: str,
+        device_credential_id: str,
+        route_kind: str,
+        estimated_uplink_bps: int,
+        now: Optional[datetime] = None,
+    ) -> VideoStreamRequestRecord:
+        measured_at = now or utc_now()
+        clean_route = route_kind.strip().lower()
+        if clean_route not in {"direct", "routed"}:
+            raise ControlPlaneError("Preflight route must be Direct or Routed.")
+        estimate = int(estimated_uplink_bps)
+        if not 1 <= estimate <= 1_000_000_000:
+            raise ControlPlaneError("Preflight bandwidth estimate is invalid.")
+        async with self.sessions() as session:
+            row = (
+                await session.execute(
+                    select(VideoStreamRequest, ActiveVideoStream)
+                    .join(
+                        ActiveVideoStream,
+                        ActiveVideoStream.id
+                        == VideoStreamRequest.active_stream_id,
+                    )
+                    .where(VideoStreamRequest.id == request_id)
+                )
+            ).first()
+            if row is None:
+                raise ControlPlaneError("Video stream request not found.")
+            request, stream = row
+            if stream.device_credential_id != device_credential_id:
+                raise ControlPlaneError(
+                    "Video stream request belongs to another device."
+                )
+            if as_utc(request.expires_at) < measured_at:
+                request.state = "expired"
+                await session.commit()
+                raise ControlPlaneError("Video stream request has expired.")
+            if request.state not in {
+                "pending",
+                "probing",
+                "awaiting_approval",
+            }:
+                raise ControlPlaneError(
+                    "Video stream request is not awaiting preflight."
+                )
+            request.state = "awaiting_approval"
+            request.route_kind = clean_route
+            request.estimated_uplink_bps = estimate
+            await session.execute(
+                delete(VideoPreflightExchange).where(
+                    VideoPreflightExchange.request_id == request.id
+                )
+            )
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=request.organization_id,
+                    actor_type="organization_device",
+                    actor_id=device_credential_id,
+                    event_type="video.preflight_completed",
+                    details_json=json.dumps({"request_id": request.id}),
+                    created_at=measured_at,
+                )
+            )
+            await self._notify_video_stream_change(
+                session, request.organization_id
+            )
+            await session.commit()
+            return self._video_stream_request_record(request, stream)
+
+    async def record_video_stream_decision(
+        self,
+        *,
+        request_id: str,
+        device_credential_id: str,
+        decision: str,
+        selected_width: int = 0,
+        selected_height: int = 0,
+        selected_fps: float = 0.0,
+        selected_bitrate_bps: int = 0,
+        now: Optional[datetime] = None,
+    ) -> VideoStreamRequestRecord:
+        decided_at = now or utc_now()
+        clean_decision = decision.strip().lower()
+        if clean_decision not in {"approve", "decline"}:
+            raise ControlPlaneError("Video decision must be Approve or Decline.")
+        width = max(0, min(int(selected_width), 16384))
+        height = max(0, min(int(selected_height), 16384))
+        fps_milli = max(0, min(int(round(selected_fps * 1000)), 240000))
+        bitrate = max(0, min(int(selected_bitrate_bps), 1_000_000_000))
+        async with self.sessions() as session:
+            row = (
+                await session.execute(
+                    select(VideoStreamRequest, ActiveVideoStream)
+                    .join(
+                        ActiveVideoStream,
+                        ActiveVideoStream.id == VideoStreamRequest.active_stream_id,
+                    )
+                    .where(VideoStreamRequest.id == request_id)
+                )
+            ).first()
+            if row is None:
+                raise ControlPlaneError("Video stream request not found.")
+            request, stream = row
+            if stream.device_credential_id != device_credential_id:
+                raise ControlPlaneError(
+                    "Video stream request belongs to another device."
+                )
+            if as_utc(request.expires_at) < decided_at:
+                request.state = "expired"
+                await session.commit()
+                raise ControlPlaneError("Video stream request has expired.")
+            if request.state != "awaiting_approval":
+                raise ControlPlaneError(
+                    "Video stream request is not awaiting pilot approval."
+                )
+            if clean_decision == "approve":
+                if fps_milli <= 0 or bitrate <= 0:
+                    raise ControlPlaneError(
+                        "An approved stream requires a frame rate and bitrate."
+                    )
+                if (
+                    bitrate > request.estimated_uplink_bps
+                    and not is_emergency_video_fallback(
+                        width=width,
+                        height=height,
+                        fps_milli=fps_milli,
+                        bitrate_bps=bitrate,
+                    )
+                ):
+                    raise ControlPlaneError(
+                        "Selected bitrate exceeds the measured usable uplink; "
+                        "only the 640 px, 5 fps, 0.2 Mbps emergency fallback "
+                        "may override a failed-low preflight result."
+                    )
+                request.state = "approved"
+                request.selected_width = width
+                request.selected_height = height
+                request.selected_fps_milli = fps_milli
+                request.selected_bitrate_bps = bitrate
+            else:
+                request.state = "declined"
+                request.selected_width = 0
+                request.selected_height = 0
+                request.selected_fps_milli = 0
+                request.selected_bitrate_bps = 0
+            request.decided_at = decided_at
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=request.organization_id,
+                    actor_type="organization_device",
+                    actor_id=device_credential_id,
+                    event_type=f"video.{request.state}",
+                    details_json=json.dumps({"request_id": request.id}),
+                    created_at=decided_at,
+                )
+            )
+            await self._notify_video_stream_change(
+                session, request.organization_id
+            )
+            await session.commit()
+            return self._video_stream_request_record(request, stream)
+
+    async def record_video_stream_unavailable(
+        self,
+        *,
+        request_id: str,
+        device_credential_id: str,
+        stream_session_id: str = "",
+        error_code: str = "e_nosuch_stream",
+        now: Optional[datetime] = None,
+    ) -> VideoStreamRequestRecord:
+        """Close a request that no longer maps to a live tablet source."""
+        reported_at = now or utc_now()
+        clean_error = error_code.strip().lower()
+        if clean_error != "e_nosuch_stream":
+            raise ControlPlaneError("Unsupported video stream error code.")
+        async with self.sessions() as session:
+            row = (
+                await session.execute(
+                    select(VideoStreamRequest, ActiveVideoStream)
+                    .join(
+                        ActiveVideoStream,
+                        ActiveVideoStream.id
+                        == VideoStreamRequest.active_stream_id,
+                    )
+                    .where(VideoStreamRequest.id == request_id)
+                )
+            ).first()
+            if row is None:
+                raise ControlPlaneError("Video stream request not found.")
+            request, stream = row
+            if stream.device_credential_id != device_credential_id:
+                raise ControlPlaneError(
+                    "Video stream request belongs to another device."
+                )
+            clean_session_id = stream_session_id.strip()
+            if clean_session_id and stream.session_id != clean_session_id:
+                raise ControlPlaneError(
+                    "Video stream request identifies another stream session."
+                )
+            if request.state == clean_error:
+                return self._video_stream_request_record(request, stream)
+            if request.state not in {
+                "pending",
+                "probing",
+                "awaiting_approval",
+                "approved",
+                "streaming",
+            }:
+                raise ControlPlaneError(
+                    "Video stream request is no longer active."
+                )
+            request.state = clean_error
+            request.stopped_at = reported_at
+            await session.execute(
+                delete(VideoPreflightExchange).where(
+                    VideoPreflightExchange.request_id == request.id
+                )
+            )
+            await session.execute(
+                delete(VideoMediaExchange).where(
+                    VideoMediaExchange.request_id == request.id
+                )
+            )
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=request.organization_id,
+                    actor_type="organization_device",
+                    actor_id=device_credential_id,
+                    event_type="video.e_nosuch_stream",
+                    details_json=json.dumps({"request_id": request.id}),
+                    created_at=reported_at,
+                )
+            )
+            await self._notify_video_stream_change(
+                session, request.organization_id
+            )
+            await session.commit()
+            return self._video_stream_request_record(request, stream)
+
+    async def start_video_media(
+        self,
+        *,
+        request_id: str,
+        organization_id: str,
+        requester_user_id: str,
+        browser_offer_sdp: str,
+        now: Optional[datetime] = None,
+    ) -> VideoMediaExchangeRecord:
+        started_at = now or utc_now()
+        offer = normalize_session_description(browser_offer_sdp)
+        async with self.sessions() as session:
+            row = (await session.execute(
+                select(VideoStreamRequest, ActiveVideoStream)
+                .join(ActiveVideoStream, ActiveVideoStream.id == VideoStreamRequest.active_stream_id)
+                .where(VideoStreamRequest.id == request_id)
+            )).first()
+            if row is None:
+                raise ControlPlaneError("Video stream request not found.")
+            request, stream = row
+            if request.organization_id != organization_id or request.requester_user_id != requester_user_id:
+                raise ControlPlaneError("Video stream request belongs to another user.")
+            if as_utc(request.expires_at) < started_at:
+                request.state = "expired"
+                await session.commit()
+                raise ControlPlaneError("Video stream request has expired.")
+            if request.state not in {"approved", "streaming"}:
+                raise ControlPlaneError("Pilot approval is required before media signaling.")
+            exchange = await session.get(VideoMediaExchange, request.id)
+            if exchange is None:
+                exchange = VideoMediaExchange(
+                    request_id=request.id,
+                    browser_offer_sdp=offer,
+                    device_answer_sdp="",
+                    created_at=started_at,
+                    updated_at=started_at,
+                    expires_at=request.expires_at,
+                )
+                session.add(exchange)
+            else:
+                exchange.browser_offer_sdp = offer
+                exchange.device_answer_sdp = ""
+                exchange.updated_at = started_at
+            session.add(ControlPlaneAuditEvent(
+                organization_id=request.organization_id,
+                actor_type="organization_user",
+                actor_id=requester_user_id,
+                event_type="video.media_signaling_started",
+                details_json=json.dumps({"request_id": request.id}),
+                created_at=started_at,
+            ))
+            if self.engine.dialect.name == "postgresql":
+                await session.execute(select(func.pg_notify("r2c_video_media", request.id)))
+            await session.commit()
+            return self._video_media_exchange_record(request, stream, exchange)
+
+    async def get_video_media_exchange_for_requester(
+        self, *, request_id: str, organization_id: str, requester_user_id: str
+    ) -> VideoMediaExchangeRecord:
+        async with self.sessions() as session:
+            row = (await session.execute(
+                select(VideoStreamRequest, ActiveVideoStream, VideoMediaExchange)
+                .join(ActiveVideoStream, ActiveVideoStream.id == VideoStreamRequest.active_stream_id)
+                .join(VideoMediaExchange, VideoMediaExchange.request_id == VideoStreamRequest.id)
+                .where(VideoStreamRequest.id == request_id)
+            )).first()
+        if row is None:
+            raise ControlPlaneError("Video media signaling was not found.")
+        request, stream, exchange = row
+        if request.organization_id != organization_id or request.requester_user_id != requester_user_id:
+            raise ControlPlaneError("Video stream request belongs to another user.")
+        return self._video_media_exchange_record(request, stream, exchange)
+
+    async def get_pending_video_media_offer(
+        self, *, request_id: str, now: Optional[datetime] = None
+    ) -> Optional[VideoMediaExchangeRecord]:
+        checked_at = now or utc_now()
+        async with self.sessions() as session:
+            row = (await session.execute(
+                select(VideoStreamRequest, ActiveVideoStream, VideoMediaExchange)
+                .join(ActiveVideoStream, ActiveVideoStream.id == VideoStreamRequest.active_stream_id)
+                .join(VideoMediaExchange, VideoMediaExchange.request_id == VideoStreamRequest.id)
+                .where(
+                    VideoStreamRequest.id == request_id,
+                    VideoStreamRequest.state.in_(("approved", "streaming")),
+                    VideoStreamRequest.expires_at >= checked_at,
+                    VideoMediaExchange.device_answer_sdp == "",
+                )
+            )).first()
+        if row is None:
+            return None
+        return self._video_media_exchange_record(*row)
+
+    async def list_pending_video_media_offers_for_device(
+        self, *, device_credential_id: str, now: Optional[datetime] = None
+    ) -> tuple[VideoMediaExchangeRecord, ...]:
+        checked_at = now or utc_now()
+        async with self.sessions() as session:
+            rows = (await session.execute(
+                select(VideoStreamRequest, ActiveVideoStream, VideoMediaExchange)
+                .join(ActiveVideoStream, ActiveVideoStream.id == VideoStreamRequest.active_stream_id)
+                .join(VideoMediaExchange, VideoMediaExchange.request_id == VideoStreamRequest.id)
+                .where(
+                    ActiveVideoStream.device_credential_id == device_credential_id,
+                    VideoStreamRequest.state.in_(("approved", "streaming")),
+                    VideoStreamRequest.expires_at >= checked_at,
+                    VideoMediaExchange.device_answer_sdp == "",
+                )
+            )).all()
+        return tuple(self._video_media_exchange_record(*row) for row in rows)
+
+    async def record_video_media_answer(
+        self, *, request_id: str, device_credential_id: str, device_answer_sdp: str,
+        now: Optional[datetime] = None,
+    ) -> VideoMediaExchangeRecord:
+        answered_at = now or utc_now()
+        answer = normalize_session_description(device_answer_sdp)
+        async with self.sessions() as session:
+            row = (await session.execute(
+                select(VideoStreamRequest, ActiveVideoStream, VideoMediaExchange)
+                .join(ActiveVideoStream, ActiveVideoStream.id == VideoStreamRequest.active_stream_id)
+                .join(VideoMediaExchange, VideoMediaExchange.request_id == VideoStreamRequest.id)
+                .where(VideoStreamRequest.id == request_id)
+            )).first()
+            if row is None:
+                raise ControlPlaneError("Video media offer not found.")
+            request, stream, exchange = row
+            if stream.device_credential_id != device_credential_id:
+                raise ControlPlaneError("Video stream request belongs to another device.")
+            if request.state not in {"approved", "streaming"}:
+                raise ControlPlaneError("Video stream is not approved.")
+            exchange.device_answer_sdp = answer
+            exchange.updated_at = answered_at
+            await session.commit()
+            return self._video_media_exchange_record(request, stream, exchange)
+
+    async def mark_video_streaming(
+        self, *, request_id: str, organization_id: str, requester_user_id: str,
+        now: Optional[datetime] = None,
+    ) -> VideoStreamRequestRecord:
+        started_at = now or utc_now()
+        async with self.sessions() as session:
+            row = (await session.execute(
+                select(VideoStreamRequest, ActiveVideoStream)
+                .join(ActiveVideoStream, ActiveVideoStream.id == VideoStreamRequest.active_stream_id)
+                .where(VideoStreamRequest.id == request_id)
+            )).first()
+            if row is None:
+                raise ControlPlaneError("Video stream request not found.")
+            request, stream = row
+            if request.organization_id != organization_id or request.requester_user_id != requester_user_id:
+                raise ControlPlaneError("Video stream request belongs to another user.")
+            if request.state not in {"approved", "streaming"}:
+                raise ControlPlaneError("Video stream is not approved.")
+            request.state = "streaming"
+            if request.started_at is None:
+                request.started_at = started_at
+            session.add(ControlPlaneAuditEvent(
+                organization_id=request.organization_id,
+                actor_type="organization_user",
+                actor_id=requester_user_id,
+                event_type="video.streaming",
+                details_json=json.dumps({"request_id": request.id}),
+                created_at=started_at,
+            ))
+            await self._notify_video_stream_change(session, request.organization_id)
+            await session.commit()
+            return self._video_stream_request_record(request, stream)
+
+    async def record_video_media_metrics(
+        self,
+        *,
+        request_id: str,
+        organization_id: str,
+        requester_user_id: str,
+        metrics_session_id: str,
+        audio_bytes_sent: int,
+        audio_bytes_received: int,
+        video_bytes_received: int,
+        now: Optional[datetime] = None,
+    ) -> VideoStreamRequestRecord:
+        measured_at = now or utc_now()
+        clean_session_id = metrics_session_id.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", clean_session_id):
+            raise ControlPlaneError("Video media metrics session is invalid.")
+        counters = tuple(
+            max(0, int(value))
+            for value in (audio_bytes_sent, audio_bytes_received, video_bytes_received)
+        )
+        async with self.sessions() as session:
+            row = (await session.execute(
+                select(VideoStreamRequest, ActiveVideoStream)
+                .join(ActiveVideoStream, ActiveVideoStream.id == VideoStreamRequest.active_stream_id)
+                .where(VideoStreamRequest.id == request_id)
+                .with_for_update()
+            )).first()
+            if row is None:
+                raise ControlPlaneError("Video stream request not found.")
+            request, stream = row
+            if request.organization_id != organization_id or request.requester_user_id != requester_user_id:
+                raise ControlPlaneError("Video stream request belongs to another user.")
+            if request.state not in {"approved", "streaming", "stopped"}:
+                raise ControlPlaneError("Video media metrics cannot be recorded.")
+            segment = await session.get(
+                VideoMediaMetricsSegment,
+                {"request_id": request.id, "metrics_session_id": clean_session_id},
+            )
+            if segment is None:
+                segment = VideoMediaMetricsSegment(
+                    request_id=request.id,
+                    metrics_session_id=clean_session_id,
+                    audio_bytes_sent=0,
+                    audio_bytes_received=0,
+                    video_bytes_received=0,
+                )
+                session.add(segment)
+            previous = (
+                segment.audio_bytes_sent,
+                segment.audio_bytes_received,
+                segment.video_bytes_received,
+            )
+            deltas = tuple(max(0, current - prior) for current, prior in zip(counters, previous))
+            request.audio_bytes_sent += deltas[0]
+            request.audio_bytes_received += deltas[1]
+            request.video_bytes_received += deltas[2]
+            segment.audio_bytes_sent = max(previous[0], counters[0])
+            segment.audio_bytes_received = max(previous[1], counters[1])
+            segment.video_bytes_received = max(previous[2], counters[2])
+            segment.updated_at = measured_at
+            await session.commit()
+            return self._video_stream_request_record(request, stream)
+
+    async def stop_video_stream(
+        self, *, request_id: str, organization_id: str, requester_user_id: str,
+        now: Optional[datetime] = None,
+    ) -> VideoStreamRequestRecord:
+        stopped_at = now or utc_now()
+        async with self.sessions() as session:
+            row = (await session.execute(
+                select(VideoStreamRequest, ActiveVideoStream)
+                .join(ActiveVideoStream, ActiveVideoStream.id == VideoStreamRequest.active_stream_id)
+                .where(VideoStreamRequest.id == request_id)
+            )).first()
+            if row is None:
+                raise ControlPlaneError("Video stream request not found.")
+            request, stream = row
+            if request.organization_id != organization_id or request.requester_user_id != requester_user_id:
+                raise ControlPlaneError("Video stream request belongs to another user.")
+            if request.state not in {"approved", "streaming", "stopped"}:
+                raise ControlPlaneError("Video stream cannot be stopped.")
+            if request.state == "stopped":
+                return self._video_stream_request_record(request, stream)
+            request.state = "stopped"
+            request.stopped_at = stopped_at
+            exchange = await session.get(VideoMediaExchange, request.id)
+            if exchange is not None:
+                await session.delete(exchange)
+            session.add(ControlPlaneAuditEvent(
+                organization_id=request.organization_id,
+                actor_type="organization_user",
+                actor_id=requester_user_id,
+                event_type="video.stopped",
+                details_json=json.dumps({"request_id": request.id}),
+                created_at=stopped_at,
+            ))
+            await self._notify_video_stream_change(session, request.organization_id)
+            await session.commit()
+            return self._video_stream_request_record(request, stream)
+
+    async def stop_video_stream_from_device(
+        self, *, request_id: str, device_credential_id: str,
+        reason: str = "device_terminated", now: Optional[datetime] = None,
+    ) -> VideoStreamRequestRecord:
+        stopped_at = now or utc_now()
+        async with self.sessions() as session:
+            row = (await session.execute(
+                select(VideoStreamRequest, ActiveVideoStream)
+                .join(ActiveVideoStream, ActiveVideoStream.id == VideoStreamRequest.active_stream_id)
+                .where(VideoStreamRequest.id == request_id)
+            )).first()
+            if row is None:
+                raise ControlPlaneError("Video stream request not found.")
+            request, stream = row
+            if stream.device_credential_id != device_credential_id:
+                raise ControlPlaneError("Video stream request belongs to another device.")
+            if request.state not in {"approved", "streaming", "stopped"}:
+                raise ControlPlaneError("Video stream cannot be stopped.")
+            if request.state != "stopped":
+                request.state = "stopped"
+                request.stopped_at = stopped_at
+                exchange = await session.get(VideoMediaExchange, request.id)
+                if exchange is not None:
+                    await session.delete(exchange)
+                session.add(ControlPlaneAuditEvent(
+                    organization_id=request.organization_id,
+                    actor_type="organization_device",
+                    actor_id=device_credential_id,
+                    event_type="video.stopped_by_device",
+                    details_json=json.dumps({
+                        "request_id": request.id,
+                        "reason": str(reason or "device_terminated")[:80],
+                    }),
+                    created_at=stopped_at,
+                ))
+                await self._notify_video_stream_change(session, request.organization_id)
+                await session.commit()
+            return self._video_stream_request_record(request, stream)
+
+    @staticmethod
+    def _video_preflight_exchange_record(
+        request: VideoStreamRequest,
+        stream: ActiveVideoStream,
+        exchange: VideoPreflightExchange,
+    ) -> VideoPreflightExchangeRecord:
+        return VideoPreflightExchangeRecord(
+            request_id=request.id,
+            organization_id=request.organization_id,
+            device_credential_id=stream.device_credential_id,
+            requester_user_id=request.requester_user_id,
+            state=request.state,
+            route_kind=request.route_kind,
+            estimated_uplink_bps=request.estimated_uplink_bps,
+            browser_offer_sdp=exchange.browser_offer_sdp,
+            device_answer_sdp=exchange.device_answer_sdp,
+            expires_at=as_utc(request.expires_at),
+        )
+
+    @staticmethod
+    def _video_media_exchange_record(
+        request: VideoStreamRequest,
+        stream: ActiveVideoStream,
+        exchange: VideoMediaExchange,
+    ) -> VideoMediaExchangeRecord:
+        return VideoMediaExchangeRecord(
+            request_id=request.id,
+            organization_id=request.organization_id,
+            device_credential_id=stream.device_credential_id,
+            requester_user_id=request.requester_user_id,
+            stream_session_id=stream.session_id,
+            state=request.state,
+            browser_offer_sdp=exchange.browser_offer_sdp,
+            device_answer_sdp=exchange.device_answer_sdp,
+            expires_at=as_utc(request.expires_at),
+        )
+
+    @staticmethod
+    def _active_video_stream_record(
+        stream: ActiveVideoStream,
+    ) -> ActiveVideoStreamRecord:
+        return ActiveVideoStreamRecord(
+            id=stream.id,
+            session_id=stream.session_id,
+            organization_id=stream.organization_id,
+            device_credential_id=stream.device_credential_id,
+            device_name=stream.device_name or "Unknown device",
+            incident_name=stream.incident_name,
+            drone_designator=stream.drone_designator,
+            source_width=stream.source_width,
+            source_height=stream.source_height,
+            source_fps=stream.source_fps_milli / 1000.0,
+            source_bitrate_bps=stream.source_bitrate_bps,
+            source_codec=stream.source_codec,
+            timezone_name=stream.timezone_name or "UTC",
+            last_seen_at=as_utc(stream.last_seen_at),
+            expires_at=as_utc(stream.expires_at),
+        )
+
+    @staticmethod
+    def _video_stream_request_record(
+        request: VideoStreamRequest,
+        stream: ActiveVideoStream,
+    ) -> VideoStreamRequestRecord:
+        return VideoStreamRequestRecord(
+            id=request.id,
+            organization_id=request.organization_id,
+            device_credential_id=stream.device_credential_id,
+            device_name=stream.device_name or "Unknown device",
+            stream_session_id=stream.session_id,
+            incident_name=stream.incident_name,
+            drone_designator=stream.drone_designator,
+            requester_user_id=request.requester_user_id,
+            requester_email=request.requester_email,
+            source_width=stream.source_width,
+            source_height=stream.source_height,
+            source_fps=stream.source_fps_milli / 1000.0,
+            source_bitrate_bps=stream.source_bitrate_bps,
+            source_codec=stream.source_codec,
+            timezone_name=stream.timezone_name or "UTC",
+            state=request.state,
+            route_kind=request.route_kind,
+            estimated_uplink_bps=request.estimated_uplink_bps,
+            selected_width=request.selected_width,
+            selected_height=request.selected_height,
+            selected_fps=request.selected_fps_milli / 1000.0,
+            selected_bitrate_bps=request.selected_bitrate_bps,
+            requested_at=as_utc(request.requested_at),
+            expires_at=as_utc(request.expires_at),
+            started_at=as_utc(request.started_at) if request.started_at else None,
+            stopped_at=as_utc(request.stopped_at) if request.stopped_at else None,
+            audio_bytes_sent=request.audio_bytes_sent,
+            audio_bytes_received=request.audio_bytes_received,
+            video_bytes_received=request.video_bytes_received,
+        )
+
+    @staticmethod
+    def _campaign_record(
+        campaign: EnrollmentCampaign,
+    ) -> EnrollmentCampaignRecord:
+        return EnrollmentCampaignRecord(
+            id=campaign.id,
+            organization_id=campaign.organization_id,
+            label=campaign.label,
+            state=campaign.state,
+            max_redemptions=campaign.max_redemptions,
+            redemption_count=campaign.redemption_count,
+            expires_at=as_utc(campaign.expires_at),
+            created_at=as_utc(campaign.created_at),
+            revoked_at=as_utc(campaign.revoked_at),
+        )
+
+    @staticmethod
+    def _ledger_record(entry: BillingLedgerEntry) -> BillingLedgerRecord:
+        return BillingLedgerRecord(
+            id=entry.id,
+            entry_type=entry.entry_type,
+            amount=Decimal(entry.amount),
+            currency=entry.currency,
+            description=entry.description,
+            external_reference=entry.external_reference,
+            created_at=as_utc(entry.created_at),
+        )

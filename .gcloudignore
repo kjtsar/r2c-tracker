@@ -1,0 +1,15 @@
+.gcloudignore
+.git
+.gitignore
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.\#*
+\#*\#
+.#tracker2.txt
+\#tracker2.txt\#
+*~
+tracker2.txt
+#!include:.gitignore

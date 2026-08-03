@@ -1,0 +1,1208 @@
+import asyncio
+import tempfile
+import unittest
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from pathlib import Path
+
+from control_plane import (
+    DEFAULT_OWNER_ROLES,
+    ControlPlaneError,
+    ControlPlaneStore,
+    DuplicateOrganizationError,
+    InvalidOrganizationError,
+    UsageDaily,
+    hash_password,
+    is_emergency_video_fallback,
+    normalize_designator,
+    normalize_session_description,
+    normalize_video_preflight_answer,
+    require_separate_database,
+    verify_password,
+)
+
+
+class ControlPlaneStoreTest(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        database_path = Path(self.temp_dir.name) / "control-plane.db"
+        self.store = ControlPlaneStore(
+            f"sqlite+aiosqlite:///{database_path}"
+        )
+        asyncio.run(self.store.init())
+        self.now = datetime(2026, 7, 30, 9, 0, tzinfo=UTC)
+
+    def tearDown(self):
+        asyncio.run(self.store.dispose())
+        self.temp_dir.cleanup()
+
+    def create_organization(self, **overrides):
+        values = {
+            "legal_name": "North County Search and Rescue",
+            "designator": "NCSSAR",
+            "admin_name": "Primary Administrator",
+            "admin_email": "admin@ncssar.example",
+            "postal_address": "100 Rescue Way\nAuburn, CA",
+            "actor_id": "platform-admin",
+            "simulation": True,
+            "now": self.now,
+        }
+        values.update(overrides)
+        return asyncio.run(self.store.create_organization(**values))
+
+    def test_simulated_onboarding_creates_separate_commercial_record(self):
+        organization = self.create_organization()
+
+        self.assertEqual("NCSSAR", organization.designator)
+        self.assertEqual("ncssar.r2c-tracker.com", organization.hostname)
+        self.assertEqual("simulation ready", organization.provisioning_state)
+        self.assertEqual("restricted", organization.records_visibility)
+        self.assertEqual(730, organization.record_retention_days)
+        self.assertEqual(30, organization.log_retention_days)
+
+        organizations = asyncio.run(self.store.list_organizations())
+        self.assertEqual((organization,), organizations)
+        jobs = asyncio.run(self.store.list_provisioning_jobs())
+        self.assertEqual(1, len(jobs))
+        self.assertTrue(jobs[0].simulation)
+        self.assertTrue(all(step["state"] == "simulated" for step in jobs[0].steps))
+        audit_events = asyncio.run(self.store.list_audit_events())
+        self.assertEqual("organization.created", audit_events[0].event_type)
+
+    def test_live_onboarding_waits_for_email_and_starts_trial_on_activation(self):
+        organization = self.create_organization(
+            designator="LIVESAR",
+            admin_email="admin@livesar.example",
+            simulation=False,
+        )
+        self.assertIsNone(organization.trial_ends_at)
+        self.assertEqual("provisioning queued", organization.provisioning_state)
+
+        asyncio.run(
+            self.store.mark_organization_invitation_sent(
+                organization_id=organization.id,
+                actor_id="platform-admin",
+                now=self.now,
+            )
+        )
+        pending = asyncio.run(self.store.get_organization("LIVESAR"))
+        self.assertEqual("activation pending", pending.provisioning_state)
+
+        invitation = asyncio.run(
+            self.store.get_invitation("LIVESAR", "admin@livesar.example")
+        )
+        asyncio.run(
+            self.store.activate_owner(
+                "LIVESAR",
+                "admin@livesar.example",
+                "generated complex password",
+                now=self.now + timedelta(hours=1),
+                activation_nonce=invitation.activation_nonce,
+            )
+        )
+        activated = asyncio.run(self.store.get_organization("LIVESAR"))
+        self.assertEqual("ready", activated.provisioning_state)
+        self.assertEqual(
+            self.now + timedelta(days=30, hours=1),
+            activated.trial_ends_at,
+        )
+        job = asyncio.run(self.store.list_provisioning_jobs())[0]
+        self.assertEqual("completed", job.state)
+        self.assertTrue(all(step["state"] == "completed" for step in job.steps))
+
+    def test_session_description_normalizes_escaped_newlines_to_crlf(self):
+        escaped = "v=0\\no=- 1 2 IN IP4 127.0.0.1\\ns=-\\nt=0 0\\n"
+
+        normalized = normalize_session_description(escaped)
+
+        self.assertEqual(
+            "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n",
+            normalized,
+        )
+
+    def test_preflight_answer_omits_optional_sctp_message_size(self):
+        apple_answer = (
+            "v=0\r\n"
+            "o=- 1 2 IN IP4 127.0.0.1\r\n"
+            "s=-\r\n"
+            "t=0 0\r\n"
+            "a=sctp-port:5000\r\n"
+            "a=max-message-size:262144"
+        )
+
+        normalized = normalize_video_preflight_answer(apple_answer)
+
+        self.assertEqual(
+            "v=0\r\n"
+            "o=- 1 2 IN IP4 127.0.0.1\r\n"
+            "s=-\r\n"
+            "t=0 0\r\n"
+            "a=sctp-port:5000\r\n",
+            normalized,
+        )
+
+    def test_emergency_video_fallback_is_narrowly_bounded(self):
+        self.assertTrue(is_emergency_video_fallback(
+            width=640,
+            height=360,
+            fps_milli=5_000,
+            bitrate_bps=180_000,
+        ))
+        self.assertFalse(is_emergency_video_fallback(
+            width=960,
+            height=540,
+            fps_milli=5_000,
+            bitrate_bps=180_000,
+        ))
+        self.assertFalse(is_emergency_video_fallback(
+            width=640,
+            height=360,
+            fps_milli=10_000,
+            bitrate_bps=180_000,
+        ))
+        self.assertFalse(is_emergency_video_fallback(
+            width=640,
+            height=360,
+            fps_milli=5_000,
+            bitrate_bps=250_000,
+        ))
+
+    def test_platform_admin_uses_hashed_email_login_and_can_change_password(self):
+        admin = asyncio.run(
+            self.store.ensure_platform_admin(
+                email="Platform.Admin@Example.org",
+                display_name="Platform Administrator",
+                bootstrap_password="initial complex password",
+            )
+        )
+
+        self.assertEqual("platform.admin@example.org", admin.email)
+        authenticated = asyncio.run(
+            self.store.authenticate_platform_admin(
+                "platform.admin@example.org",
+                "initial complex password",
+                self.now,
+            )
+        )
+        self.assertEqual(admin.id, authenticated.id)
+        asyncio.run(
+            self.store.change_platform_admin_password(
+                user_id=admin.id,
+                current_password="initial complex password",
+                new_password="replacement complex password",
+            )
+        )
+        self.assertIsNone(
+            asyncio.run(
+                self.store.authenticate_platform_admin(
+                    admin.email,
+                    "initial complex password",
+                    self.now + timedelta(minutes=1),
+                )
+            )
+        )
+        self.assertIsNotNone(
+            asyncio.run(
+                self.store.authenticate_platform_admin(
+                    admin.email,
+                    "replacement complex password",
+                    self.now + timedelta(minutes=2),
+                )
+            )
+        )
+
+    def test_infrastructure_identity_rotation_disables_old_admin_without_password_transfer(self):
+        old_admin = asyncio.run(
+            self.store.ensure_platform_admin(
+                email="old@example.org",
+                display_name="Old Administrator",
+                bootstrap_password="old complex password",
+            )
+        )
+        new_admin = asyncio.run(
+            self.store.reconcile_platform_admin_identity(
+                email="new@example.org",
+                display_name="New Administrator",
+            )
+        )
+
+        self.assertIsNone(asyncio.run(self.store.get_platform_admin(old_admin.id)))
+        self.assertEqual("new@example.org", new_admin.email)
+        self.assertIsNone(
+            asyncio.run(
+                self.store.authenticate_platform_admin(
+                    "new@example.org",
+                    "old complex password",
+                    self.now,
+                )
+            )
+        )
+        restored = asyncio.run(
+            self.store.reconcile_platform_admin_identity(
+                email="old@example.org",
+                display_name="Restored Administrator",
+            )
+        )
+        self.assertEqual(old_admin.id, restored.id)
+        self.assertIsNone(
+            asyncio.run(
+                self.store.authenticate_platform_admin(
+                    "old@example.org",
+                    "old complex password",
+                    self.now,
+                )
+            )
+        )
+
+    def test_password_setup_token_is_single_use_and_expires_after_five_minutes(self):
+        admin = asyncio.run(
+            self.store.reconcile_platform_admin_identity(
+                email="setup@example.org",
+                display_name="Setup Administrator",
+            )
+        )
+        token = asyncio.run(
+            self.store.issue_platform_admin_password_setup(
+                email=admin.email,
+                identity_generation="7",
+                now=self.now,
+            )
+        )
+        configured = asyncio.run(
+            self.store.set_platform_admin_password_from_token(
+                token=token,
+                email=admin.email,
+                identity_generation="7",
+                new_password="new complex password",
+                now=self.now + timedelta(minutes=4, seconds=59),
+            )
+        )
+
+        self.assertEqual(admin.id, configured.id)
+        self.assertIsNone(
+            asyncio.run(
+                self.store.set_platform_admin_password_from_token(
+                    token=token,
+                    email=admin.email,
+                    identity_generation="7",
+                    new_password="another complex password",
+                    now=self.now + timedelta(minutes=5),
+                )
+            )
+        )
+
+        later_token = asyncio.run(
+            self.store.issue_platform_admin_password_setup(
+                email=admin.email,
+                identity_generation="7",
+                now=self.now + timedelta(minutes=6),
+            )
+        )
+        self.assertIsNone(
+            asyncio.run(
+                self.store.set_platform_admin_password_from_token(
+                    token=later_token,
+                    email=admin.email,
+                    identity_generation="7",
+                    new_password="another complex password",
+                    now=self.now + timedelta(minutes=11, seconds=1),
+                )
+            )
+        )
+
+    def test_password_setup_token_is_bound_to_identity_generation(self):
+        admin = asyncio.run(
+            self.store.reconcile_platform_admin_identity(
+                email="setup@example.org",
+                display_name="Setup Administrator",
+            )
+        )
+        token = asyncio.run(
+            self.store.issue_platform_admin_password_setup(
+                email=admin.email,
+                identity_generation="7",
+                now=self.now,
+            )
+        )
+
+        self.assertIsNone(
+            asyncio.run(
+                self.store.set_platform_admin_password_from_token(
+                    token=token,
+                    email=admin.email,
+                    identity_generation="8",
+                    new_password="new complex password",
+                    now=self.now + timedelta(minutes=1),
+                )
+            )
+        )
+
+    def test_designator_and_hostname_are_unique(self):
+        self.create_organization()
+
+        with self.assertRaises(DuplicateOrganizationError):
+            self.create_organization(admin_email="second@example.org")
+
+    def test_owner_can_activate_and_authenticate(self):
+        organization = self.create_organization()
+
+        owner = asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+                self.now,
+            )
+        )
+        self.assertEqual("active", owner.state)
+        self.assertEqual(set(DEFAULT_OWNER_ROLES), set(owner.roles))
+
+        authenticated = asyncio.run(
+            self.store.authenticate_user(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+                self.now,
+            )
+        )
+        self.assertIsNotNone(authenticated)
+        self.assertEqual(owner.id, authenticated.id)
+
+        rejected = asyncio.run(
+            self.store.authenticate_user(
+                organization.designator,
+                organization.primary_admin_email,
+                "incorrect password",
+                self.now,
+            )
+        )
+        self.assertIsNone(rejected)
+
+    def test_enrollment_issues_revocable_device_token_stored_as_hash(self):
+        organization = self.create_organization()
+        invitation = asyncio.run(
+            self.store.get_invitation(
+                organization.designator,
+                organization.primary_admin_email,
+            )
+        )
+        owner = asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+                self.now,
+                activation_nonce=invitation.activation_nonce,
+            )
+        )
+        campaign = asyncio.run(
+            self.store.create_enrollment_campaign(
+                organization_id=organization.id,
+                label="Field tablets",
+                created_by_user_id=owner.id,
+                expires_in_hours=24,
+                max_redemptions=1,
+                now=self.now,
+            )
+        )
+
+        issued = asyncio.run(
+            self.store.issue_device_credential(
+                campaign_id=campaign.id,
+                organization_id=organization.id,
+                device_name="Jerry's iPad",
+                platform="ios",
+                now=self.now,
+            )
+        )
+
+        self.assertTrue(issued.token.startswith("r2c_dev_"))
+        authenticated = asyncio.run(
+            self.store.authenticate_device_token(
+                issued.token,
+                self.now + timedelta(minutes=1),
+            )
+        )
+        self.assertEqual(organization.id, authenticated.organization_id)
+        self.assertEqual("NCSSAR", authenticated.designator)
+        with self.assertRaises(ControlPlaneError):
+            asyncio.run(
+                self.store.issue_device_credential(
+                    campaign_id=campaign.id,
+                    organization_id=organization.id,
+                    device_name="Second tablet",
+                    platform="android",
+                    now=self.now,
+                )
+            )
+
+    def test_video_streams_are_sorted_tenant_isolated_and_require_consent(self):
+        organization = self.create_organization()
+        invitation = asyncio.run(
+            self.store.get_invitation(
+                organization.designator,
+                organization.primary_admin_email,
+            )
+        )
+        owner = asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+                self.now,
+                activation_nonce=invitation.activation_nonce,
+            )
+        )
+        campaign = asyncio.run(
+            self.store.create_enrollment_campaign(
+                organization_id=organization.id,
+                label="Video tablets",
+                created_by_user_id=owner.id,
+                expires_in_hours=24,
+                max_redemptions=1,
+                now=self.now,
+            )
+        )
+        device = asyncio.run(
+            self.store.issue_device_credential(
+                campaign_id=campaign.id,
+                organization_id=organization.id,
+                device_name="Android field tablet",
+                platform="android",
+                now=self.now,
+            )
+        )
+        for session_id, incident, drone in (
+            ("00000000-0000-0000-0000-000000000003", "Zulu", "2B"),
+            ("00000000-0000-0000-0000-000000000001", "Alpha", "10A"),
+            ("00000000-0000-0000-0000-000000000002", "alpha", "2A"),
+        ):
+            asyncio.run(
+                self.store.advertise_video_stream(
+                    organization_id=organization.id,
+                    device_credential_id=device.id,
+                    device_name="Ken's iPad",
+                    session_id=session_id,
+                    incident_name=incident,
+                    drone_designator=drone,
+                    source_width=1920,
+                    source_height=1080,
+                    source_fps=29.97,
+                    source_bitrate_bps=4_000_000,
+                    source_codec="H264",
+                    timezone_name="America/Los_Angeles",
+                    now=self.now,
+                )
+            )
+
+        streams = asyncio.run(
+            self.store.list_active_video_streams(
+                organization.id,
+                self.now + timedelta(seconds=30),
+            )
+        )
+        self.assertEqual(
+            [("Alpha", "10A"), ("alpha", "2A"), ("Zulu", "2B")],
+            [(stream.incident_name, stream.drone_designator) for stream in streams],
+        )
+        self.assertEqual(29.97, streams[0].source_fps)
+        self.assertEqual("Ken's iPad", streams[0].device_name)
+
+        retired = asyncio.run(
+            self.store.reconcile_device_video_streams(
+                organization_id=organization.id,
+                device_credential_id=device.id,
+                active_session_ids=(streams[0].session_id,),
+                now=self.now + timedelta(seconds=31),
+            )
+        )
+        self.assertEqual(2, retired)
+        remaining_streams = asyncio.run(
+            self.store.list_active_video_streams(
+                organization.id,
+                self.now + timedelta(seconds=31),
+            )
+        )
+        self.assertEqual((streams[0].session_id,), tuple(
+            stream.session_id for stream in remaining_streams
+        ))
+
+        request = asyncio.run(
+            self.store.create_video_stream_request(
+                organization_id=organization.id,
+                stream_session_id=streams[0].session_id,
+                requester_user_id=owner.id,
+                now=self.now + timedelta(seconds=30),
+            )
+        )
+        self.assertEqual("Ken's iPad", request.device_name)
+        self.assertEqual("pending", request.state)
+        self.assertEqual("unknown", request.route_kind)
+        self.assertEqual(owner.email, request.requester_email)
+        self.assertEqual("America/Los_Angeles", request.timezone_name)
+        self.assertEqual(2, request.requested_at_local.hour)
+        self.assertEqual("PDT", request.requested_at_local.tzname())
+        with self.assertRaisesRegex(
+            ControlPlaneError,
+            "already in progress",
+        ):
+            asyncio.run(
+                self.store.create_video_stream_request(
+                    organization_id=organization.id,
+                    stream_session_id=streams[0].session_id,
+                    requester_user_id=owner.id,
+                    now=self.now + timedelta(seconds=31),
+                )
+            )
+        pending_for_device = asyncio.run(
+            self.store.list_pending_video_stream_requests_for_device(
+                device_credential_id=device.id,
+                now=self.now + timedelta(seconds=31),
+            )
+        )
+        self.assertEqual([request.id], [item.id for item in pending_for_device])
+        offer_sdp = "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n"
+        exchange = asyncio.run(
+            self.store.start_video_preflight(
+                request_id=request.id,
+                organization_id=organization.id,
+                requester_user_id=owner.id,
+                browser_offer_sdp=offer_sdp,
+                now=self.now + timedelta(seconds=31),
+            )
+        )
+        self.assertEqual("probing", exchange.state)
+        self.assertEqual(offer_sdp, exchange.browser_offer_sdp)
+        pending_offers = asyncio.run(
+            self.store.list_pending_video_preflight_offers_for_device(
+                device_credential_id=device.id,
+                now=self.now + timedelta(seconds=31),
+            )
+        )
+        self.assertEqual([request.id], [item.request_id for item in pending_offers])
+        answer_sdp = "v=0\r\no=- 2 3 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n"
+        answered = asyncio.run(
+            self.store.record_video_preflight_answer(
+                request_id=request.id,
+                device_credential_id=device.id,
+                device_answer_sdp=answer_sdp,
+                now=self.now + timedelta(seconds=31),
+            )
+        )
+        self.assertEqual(answer_sdp, answered.device_answer_sdp)
+        preflight = asyncio.run(
+            self.store.record_video_preflight_result(
+                request_id=request.id,
+                device_credential_id=device.id,
+                route_kind="Direct",
+                estimated_uplink_bps=8_000_000,
+                now=self.now + timedelta(seconds=32),
+            )
+        )
+        self.assertEqual("awaiting_approval", preflight.state)
+        self.assertEqual("direct", preflight.route_kind)
+        self.assertEqual(8_000_000, preflight.estimated_uplink_bps)
+        approved = asyncio.run(
+            self.store.record_video_stream_decision(
+                request_id=request.id,
+                device_credential_id=device.id,
+                decision="approve",
+                selected_width=1920,
+                selected_height=1080,
+                selected_fps=15,
+                selected_bitrate_bps=2_000_000,
+                now=self.now + timedelta(seconds=33),
+            )
+        )
+        self.assertEqual("approved", approved.state)
+        self.assertEqual(1920, approved.selected_width)
+        self.assertEqual(15, approved.selected_fps)
+        self.assertEqual(2_000_000, approved.selected_bitrate_bps)
+        media_offer_sdp = (
+            "v=0\r\n"
+            "o=- 3 4 IN IP4 127.0.0.1\r\n"
+            "s=-\r\n"
+            "t=0 0\r\n"
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n"
+        )
+        media = asyncio.run(
+            self.store.start_video_media(
+                request_id=request.id,
+                organization_id=organization.id,
+                requester_user_id=owner.id,
+                browser_offer_sdp=media_offer_sdp,
+                now=self.now + timedelta(seconds=34),
+            )
+        )
+        self.assertEqual("approved", media.state)
+        self.assertEqual(streams[0].session_id, media.stream_session_id)
+        pending_media = asyncio.run(
+            self.store.list_pending_video_media_offers_for_device(
+                device_credential_id=device.id,
+                now=self.now + timedelta(seconds=34),
+            )
+        )
+        self.assertEqual([request.id], [item.request_id for item in pending_media])
+        media_answer_sdp = (
+            "v=0\r\n"
+            "o=- 4 5 IN IP4 127.0.0.1\r\n"
+            "s=-\r\n"
+            "t=0 0\r\n"
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n"
+        )
+        answered_media = asyncio.run(
+            self.store.record_video_media_answer(
+                request_id=request.id,
+                device_credential_id=device.id,
+                device_answer_sdp=media_answer_sdp,
+                now=self.now + timedelta(seconds=35),
+            )
+        )
+        self.assertEqual(media_answer_sdp, answered_media.device_answer_sdp)
+        streaming = asyncio.run(
+            self.store.mark_video_streaming(
+                request_id=request.id,
+                organization_id=organization.id,
+                requester_user_id=owner.id,
+                now=self.now + timedelta(seconds=36),
+            )
+        )
+        self.assertEqual("streaming", streaming.state)
+        first_metrics = asyncio.run(
+            self.store.record_video_media_metrics(
+                request_id=request.id,
+                organization_id=organization.id,
+                requester_user_id=owner.id,
+                metrics_session_id="browser-session-1",
+                audio_bytes_sent=1_000,
+                audio_bytes_received=2_000,
+                video_bytes_received=3_000_000,
+                now=self.now + timedelta(seconds=37),
+            )
+        )
+        self.assertEqual(3_003_000, first_metrics.total_media_bytes)
+        updated_metrics = asyncio.run(
+            self.store.record_video_media_metrics(
+                request_id=request.id,
+                organization_id=organization.id,
+                requester_user_id=owner.id,
+                metrics_session_id="browser-session-1",
+                audio_bytes_sent=2_000,
+                audio_bytes_received=4_000,
+                video_bytes_received=5_000_000,
+                now=self.now + timedelta(seconds=38),
+            )
+        )
+        self.assertEqual(5_006_000, updated_metrics.total_media_bytes)
+        reconnected_metrics = asyncio.run(
+            self.store.record_video_media_metrics(
+                request_id=request.id,
+                organization_id=organization.id,
+                requester_user_id=owner.id,
+                metrics_session_id="browser-session-2",
+                audio_bytes_sent=500,
+                audio_bytes_received=1_000,
+                video_bytes_received=1_000_000,
+                now=self.now + timedelta(seconds=39),
+            )
+        )
+        self.assertEqual(6_007_500, reconnected_metrics.total_media_bytes)
+        with self.assertRaises(ControlPlaneError):
+            asyncio.run(
+                self.store.stop_video_stream_from_device(
+                    request_id=request.id,
+                    device_credential_id="another-device",
+                    now=self.now + timedelta(seconds=40),
+                )
+            )
+        stopped = asyncio.run(
+            self.store.stop_video_stream_from_device(
+                request_id=request.id,
+                device_credential_id=device.id,
+                reason="source_ended",
+                now=self.now + timedelta(seconds=40),
+            )
+        )
+        self.assertEqual("stopped", stopped.state)
+        self.assertEqual(4, stopped.duration_seconds)
+        self.assertEqual(6_007_500, stopped.total_media_bytes)
+        with self.assertRaises(ControlPlaneError):
+            asyncio.run(
+                self.store.record_video_preflight_result(
+                    request_id=request.id,
+                    device_credential_id="another-device",
+                    route_kind="direct",
+                    estimated_uplink_bps=8_000_000,
+                    now=self.now + timedelta(seconds=34),
+                )
+            )
+        audit_events = asyncio.run(self.store.list_audit_events())
+        self.assertEqual(
+            [
+                "video.stopped_by_device",
+                "video.streaming",
+                "video.media_signaling_started",
+                "video.approved",
+                "video.preflight_completed",
+                "video.preflight_started",
+                "video.requested",
+            ],
+            [event.event_type for event in audit_events[:7]],
+        )
+
+        failed_low_request = asyncio.run(
+            self.store.create_video_stream_request(
+                organization_id=organization.id,
+                stream_session_id=streams[0].session_id,
+                requester_user_id=owner.id,
+                now=self.now + timedelta(seconds=34),
+            )
+        )
+        asyncio.run(
+            self.store.record_video_preflight_result(
+                request_id=failed_low_request.id,
+                device_credential_id=device.id,
+                route_kind="routed",
+                estimated_uplink_bps=100_000,
+                now=self.now + timedelta(seconds=35),
+            )
+        )
+        with self.assertRaisesRegex(
+            ControlPlaneError,
+            "only the 640 px",
+        ):
+            asyncio.run(
+                self.store.record_video_stream_decision(
+                    request_id=failed_low_request.id,
+                    device_credential_id=device.id,
+                    decision="approve",
+                    selected_width=1280,
+                    selected_height=720,
+                    selected_fps=5,
+                    selected_bitrate_bps=180_000,
+                    now=self.now + timedelta(seconds=36),
+                )
+            )
+        fallback_approved = asyncio.run(
+            self.store.record_video_stream_decision(
+                request_id=failed_low_request.id,
+                device_credential_id=device.id,
+                decision="approve",
+                selected_width=640,
+                selected_height=360,
+                selected_fps=5,
+                selected_bitrate_bps=180_000,
+                now=self.now + timedelta(seconds=36),
+            )
+        )
+        self.assertEqual("approved", fallback_approved.state)
+        self.assertEqual(180_000, fallback_approved.selected_bitrate_bps)
+        asyncio.run(
+            self.store.stop_video_stream(
+                request_id=failed_low_request.id,
+                organization_id=organization.id,
+                requester_user_id=owner.id,
+                now=self.now + timedelta(seconds=37),
+            )
+        )
+
+        expiring_request = asyncio.run(
+            self.store.create_video_stream_request(
+                organization_id=organization.id,
+                stream_session_id=streams[0].session_id,
+                requester_user_id=owner.id,
+                now=self.now + timedelta(seconds=34),
+            )
+        )
+        asyncio.run(
+            self.store.start_video_preflight(
+                request_id=expiring_request.id,
+                organization_id=organization.id,
+                requester_user_id=owner.id,
+                browser_offer_sdp=offer_sdp,
+                now=self.now + timedelta(seconds=35),
+            )
+        )
+        self.assertEqual(
+            1,
+            asyncio.run(
+                self.store.cleanup_expired_video_preflight_exchanges(
+                    now=self.now + timedelta(minutes=11),
+                )
+            ),
+        )
+        expired_requests = asyncio.run(
+            self.store.list_video_stream_requests(
+                organization_id=organization.id,
+                requester_user_id=owner.id,
+                now=self.now + timedelta(minutes=11),
+            )
+        )
+        expired = next(
+            item for item in expired_requests if item.id == expiring_request.id
+        )
+        self.assertEqual("expired", expired.state)
+        with self.assertRaises(ControlPlaneError):
+            asyncio.run(
+                self.store.get_video_preflight_exchange_for_requester(
+                    request_id=expiring_request.id,
+                    organization_id=organization.id,
+                    requester_user_id=owner.id,
+                    now=self.now + timedelta(minutes=11),
+                )
+            )
+
+        other = self.create_organization(
+            designator="EXSAR",
+            legal_name="Example SAR",
+            admin_email="admin@exsar.example",
+        )
+        self.assertEqual(
+            (),
+            asyncio.run(
+                self.store.list_active_video_streams(
+                    other.id,
+                    self.now + timedelta(seconds=30),
+                )
+            ),
+        )
+        with self.assertRaises(ControlPlaneError):
+            asyncio.run(
+                self.store.create_video_stream_request(
+                    organization_id=other.id,
+                    stream_session_id=streams[0].session_id,
+                    requester_user_id=owner.id,
+                    now=self.now + timedelta(seconds=30),
+                )
+            )
+        self.assertEqual(
+            (),
+            asyncio.run(
+                self.store.list_active_video_streams(
+                    organization.id,
+                    self.now + timedelta(seconds=46),
+                )
+            ),
+        )
+
+    def test_missing_video_source_closes_pending_request(self):
+        organization = self.create_organization()
+        invitation = asyncio.run(
+            self.store.get_invitation(
+                organization.designator,
+                organization.primary_admin_email,
+            )
+        )
+        owner = asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+                self.now,
+                activation_nonce=invitation.activation_nonce,
+            )
+        )
+        campaign = asyncio.run(
+            self.store.create_enrollment_campaign(
+                organization_id=organization.id,
+                label="Video tablets",
+                created_by_user_id=owner.id,
+                expires_in_hours=24,
+                max_redemptions=1,
+                now=self.now,
+            )
+        )
+        device = asyncio.run(
+            self.store.issue_device_credential(
+                campaign_id=campaign.id,
+                organization_id=organization.id,
+                device_name="Ken's iPad",
+                platform="ios",
+                now=self.now,
+            )
+        )
+        stream = asyncio.run(
+            self.store.advertise_video_stream(
+                organization_id=organization.id,
+                device_credential_id=device.id,
+                device_name="Ken's iPad",
+                session_id="00000000-0000-0000-0000-000000000099",
+                incident_name="Training",
+                drone_designator="NCS1m3",
+                now=self.now,
+            )
+        )
+        request = asyncio.run(
+            self.store.create_video_stream_request(
+                organization_id=organization.id,
+                stream_session_id=stream.session_id,
+                requester_user_id=owner.id,
+                now=self.now + timedelta(seconds=1),
+            )
+        )
+
+        unavailable = asyncio.run(
+            self.store.record_video_stream_unavailable(
+                request_id=request.id,
+                device_credential_id=device.id,
+                stream_session_id=stream.session_id,
+                error_code="e_nosuch_stream",
+                now=self.now + timedelta(seconds=2),
+            )
+        )
+        self.assertEqual("e_nosuch_stream", unavailable.state)
+        self.assertEqual(
+            (),
+            asyncio.run(
+                self.store.list_pending_video_stream_requests_for_device(
+                    device_credential_id=device.id,
+                    now=self.now + timedelta(seconds=3),
+                )
+            ),
+        )
+
+        replacement = asyncio.run(
+            self.store.create_video_stream_request(
+                organization_id=organization.id,
+                stream_session_id=stream.session_id,
+                requester_user_id=owner.id,
+                now=self.now + timedelta(seconds=3),
+            )
+        )
+        retired = asyncio.run(
+            self.store.reconcile_device_video_streams(
+                organization_id=organization.id,
+                device_credential_id=device.id,
+                active_session_ids=(),
+                now=self.now + timedelta(seconds=4),
+            )
+        )
+        self.assertEqual(1, retired)
+        requests = asyncio.run(
+            self.store.list_video_stream_requests(
+                organization_id=organization.id,
+                requester_user_id=owner.id,
+                now=self.now + timedelta(seconds=5),
+            )
+        )
+        retired_request = next(item for item in requests if item.id == replacement.id)
+        self.assertEqual("e_nosuch_stream", retired_request.state)
+
+    def test_repeated_login_failures_temporarily_lock_account(self):
+        organization = self.create_organization()
+        asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+                self.now,
+            )
+        )
+        for attempt in range(5):
+            rejected = asyncio.run(
+                self.store.authenticate_user(
+                    organization.designator,
+                    organization.primary_admin_email,
+                    "incorrect password",
+                    self.now + timedelta(seconds=attempt),
+                )
+            )
+            self.assertIsNone(rejected)
+
+        locked = asyncio.run(
+            self.store.authenticate_user(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+                self.now + timedelta(minutes=1),
+            )
+        )
+        self.assertIsNone(locked)
+
+        unlocked = asyncio.run(
+            self.store.authenticate_user(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+                self.now + timedelta(minutes=16),
+            )
+        )
+        self.assertIsNotNone(unlocked)
+
+    def test_verified_google_email_activates_exact_pending_organization_user(self):
+        organization = self.create_organization()
+
+        authorized = asyncio.run(
+            self.store.authorize_google_user(
+                organization.designator.lower(),
+                organization.primary_admin_email.upper(),
+                self.now + timedelta(minutes=1),
+            )
+        )
+
+        self.assertIsNotNone(authorized)
+        self.assertEqual("active", authorized.state)
+        self.assertIsNone(
+            asyncio.run(
+                self.store.authorize_google_user(
+                    organization.designator,
+                    "other@example.org",
+                    self.now + timedelta(minutes=2),
+                )
+            )
+        )
+
+    def test_ledger_is_idempotent_and_balance_is_organization_visible(self):
+        organization = self.create_organization()
+
+        first = asyncio.run(
+            self.store.append_ledger_entry(
+                organization_id=organization.id,
+                entry_type="credit",
+                amount=Decimal("10.00"),
+                description="Simulation account credit",
+                idempotency_key="simulation-credit-ncssar-1",
+                created_by_type="platform_admin",
+                created_by_id="platform-admin",
+                now=self.now,
+            )
+        )
+        repeated = asyncio.run(
+            self.store.append_ledger_entry(
+                organization_id=organization.id,
+                entry_type="credit",
+                amount=Decimal("10.00"),
+                description="Simulation account credit",
+                idempotency_key="simulation-credit-ncssar-1",
+                created_by_type="platform_admin",
+                created_by_id="platform-admin",
+                now=self.now,
+            )
+        )
+
+        self.assertEqual(first.id, repeated.id)
+        self.assertEqual(
+            Decimal("10.0000"),
+            asyncio.run(self.store.list_organizations())[0].credit_balance,
+        )
+        self.assertEqual(1, len(asyncio.run(self.store.list_ledger(organization.id))))
+
+        with self.assertRaises(ControlPlaneError):
+            asyncio.run(
+                self.store.append_ledger_entry(
+                    organization_id=organization.id,
+                    entry_type="charge",
+                    amount=Decimal("-10.00"),
+                    description="Conflicting retry",
+                    idempotency_key="simulation-credit-ncssar-1",
+                    created_by_type="platform_admin",
+                    created_by_id="platform-admin",
+                    now=self.now,
+                )
+            )
+
+    def test_daily_usage_contains_aggregates_only(self):
+        organization = self.create_organization()
+        asyncio.run(
+            self.store.record_daily_usage(
+                organization_id=organization.id,
+                usage_date="2026-07-30",
+                compute_units=Decimal("3"),
+                compute_cost=Decimal("0.15"),
+                network_bytes=1024,
+                network_cost=Decimal("0.02"),
+                faa_proxy_requests=12,
+                faa_proxy_cost=Decimal("0.01"),
+                turn_relay_bytes=2048,
+                turn_relay_cost=Decimal("0.04"),
+                now=self.now,
+            )
+        )
+
+        costs = asyncio.run(self.store.month_to_date_usage_costs(self.now))
+
+        self.assertEqual(Decimal("0.150000"), costs[organization.id].compute)
+        self.assertEqual(Decimal("0.020000"), costs[organization.id].network)
+        self.assertEqual(Decimal("0.050000"), costs[organization.id].other)
+
+    def test_increment_daily_usage_accumulates_privacy_safe_counters(self):
+        organization = self.create_organization()
+        for _ in range(2):
+            asyncio.run(
+                self.store.increment_daily_usage(
+                    organization_id=organization.id,
+                    usage_date="2026-07-30",
+                    compute_units=Decimal("1"),
+                    network_bytes=1024,
+                    storage_byte_days=256,
+                    database_units=Decimal("0.5"),
+                    faa_proxy_requests=1,
+                    turn_relay_bytes=512,
+                    now=self.now,
+                )
+            )
+
+        usage = asyncio.run(
+            self.store.month_to_date_usage_aggregates(self.now)
+        )[organization.id]
+        self.assertEqual(Decimal("2.000000"), usage.compute_units)
+        self.assertEqual(2048, usage.network_bytes)
+        self.assertEqual(512, usage.storage_byte_days)
+        self.assertEqual(Decimal("1.000000"), usage.database_units)
+        self.assertEqual(2, usage.faa_proxy_requests)
+        self.assertEqual(1024, usage.turn_relay_bytes)
+        column_names = {column.name for column in UsageDaily.__table__.columns}
+        for forbidden in (
+            "flight_id",
+            "incident",
+            "remote_id",
+            "map_id",
+            "user_id",
+            "archive_relpath",
+        ):
+            self.assertNotIn(forbidden, column_names)
+
+
+class ControlPlaneValidationTest(unittest.TestCase):
+    def test_database_pool_recovers_from_idle_server_disconnects(self):
+        store = ControlPlaneStore("sqlite+aiosqlite:///:memory:")
+        try:
+            self.assertTrue(store.engine.pool._pre_ping)
+            self.assertEqual(300, store.engine.pool._recycle)
+        finally:
+            asyncio.run(store.dispose())
+
+    def test_designator_is_normalized_and_restricted(self):
+        self.assertEqual("NCSSAR", normalize_designator(" ncssar "))
+        for value in ("N", "NC-SAR", "../SAR", "SAR agency", ""):
+            with self.subTest(value=value):
+                with self.assertRaises(InvalidOrganizationError):
+                    normalize_designator(value)
+
+    def test_scrypt_password_hash_is_salted_and_verifiable(self):
+        first = hash_password("correct horse battery staple")
+        second = hash_password("correct horse battery staple")
+
+        self.assertNotEqual(first, second)
+        self.assertTrue(verify_password("correct horse battery staple", first))
+        self.assertFalse(verify_password("incorrect password", first))
+        self.assertNotIn("correct horse", first)
+
+    def test_short_password_is_rejected(self):
+        with self.assertRaises(ValueError):
+            hash_password("too short")
+
+    def test_control_plane_cannot_share_tenant_database_url(self):
+        with self.assertRaises(ValueError):
+            require_separate_database(
+                "postgresql+asyncpg://service/control",
+                "postgresql+asyncpg://service/control",
+            )
+        require_separate_database(
+            "postgresql+asyncpg://service/control",
+            "postgresql+asyncpg://service/tenant",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block title %}R2C Platform Administrator Login{% endblock %}
+{% block extra_head %}
+<style>
+  .auth-shell {
+      max-width: 460px;
+      margin: 48px auto;
+      padding: 28px;
+      border: 1px solid #ccd8df;
+      border-radius: 14px;
+      background: white;
+      box-shadow: 0 10px 30px rgba(22, 47, 65, 0.08);
+  }
+  .auth-shell h1 { margin-top: 0; color: #12344d; }
+  .auth-shell p { color: #60717d; line-height: 1.5; }
+  .auth-form { display: grid; gap: 16px; }
+  .auth-form label { display: grid; gap: 6px; font-weight: 700; color: #425764; }
+  .auth-form input {
+      padding: 11px;
+      border: 1px solid #aebdc7;
+      border-radius: 7px;
+      font: inherit;
+  }
+  .auth-form button {
+      padding: 11px 16px;
+      border: 0;
+      border-radius: 7px;
+      background: #17324d;
+      color: white;
+      font: inherit;
+      font-weight: 800;
+      cursor: pointer;
+  }
+  .auth-choice {
+      display: block;
+      padding: 11px 16px;
+      border-radius: 7px;
+      background: #17324d;
+      color: white;
+      text-align: center;
+      text-decoration: none;
+      font-weight: 800;
+  }
+  .auth-divider { text-align: center; color: #60717d; margin: 18px 0; }
+</style>
+{% endblock %}
+{% block content %}
+<section class="auth-shell">
+  <h1>R2C platform administration</h1>
+  <p>
+    Sign in as the administrator selected by the GCI maintainer. Passwords are
+    hashed in the control-plane database and may be generated and saved by your
+    browser.
+  </p>
+  <p><strong>Administrator:</strong> {{ platform_admin_email }}</p>
+  {% if google_login_enabled %}
+  <a class="auth-choice" href="/platform-admin/google/start?next={{ next | urlencode }}">
+    Continue with Google
+  </a>
+  {% endif %}
+  {% if has_password %}
+  {% if google_login_enabled %}<div class="auth-divider">or use your website password</div>{% endif %}
+  <form class="auth-form" method="post" action="/platform-admin/login">
+    <input type="hidden" name="form_token" value="{{ csrf_token }}">
+    <input type="hidden" name="next" value="{{ next }}">
+    <label>
+      Email
+      <input type="email" name="email" required readonly
+             autocomplete="username" inputmode="email"
+             value="{{ platform_admin_email }}">
+    </label>
+    <label>
+      Password
+      <input type="password" name="password" required autofocus
+             autocomplete="current-password">
+    </label>
+    <button type="submit">Sign in</button>
+  </form>
+  {% endif %}
+  {% if email_setup_enabled %}
+  <div class="auth-divider">
+    {% if has_password %}Forgot your password?{% else %}No Google account?{% endif %}
+  </div>
+  <form class="auth-form" method="post" action="/platform-admin/setup/request">
+    <input type="hidden" name="form_token" value="{{ email_csrf_token }}">
+    <label>
+      Administrator email
+      <input type="email" name="email" required autocomplete="username"
+             inputmode="email">
+    </label>
+    <button type="submit">Email a five-minute setup link</button>
+  </form>
+  {% endif %}
+  {% if not google_login_enabled and not has_password and not email_setup_enabled %}
+  <p>Administrator sign-in is not yet configured.</p>
+  {% endif %}
+</section>
+{% endblock %}

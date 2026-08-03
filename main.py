@@ -9,17 +9,21 @@ import tarfile
 import subprocess
 import requests
 import asyncio
+import asyncpg
 import warnings
 import traceback
 import logging
 import secrets
+import hashlib
+from dataclasses import replace
+from decimal import Decimal
 import numpy as np
 from urllib.parse import urlencode
 from pprint import pprint
 from datetime import datetime, date, timedelta, timezone, UTC
 from zoneinfo import ZoneInfo
 from timezonefinder import TimezoneFinder
-from typing import Optional, Annotated
+from typing import Optional, Annotated, Literal
 from contextlib import asynccontextmanager
 
 from fastapi import Security, Depends, FastAPI, Request, HTTPException, Query, Form
@@ -34,13 +38,51 @@ from starlette.middleware.sessions import SessionMiddleware
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, MetaData, Table, select, text
+from pydantic import BaseModel, Field
+from sqlalchemy import create_engine, MetaData, Table, delete, select, text
 from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, DateTime, desc, func, or_, and_
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import sessionmaker, Session
 from suncalc import get_times
 from google.cloud.sql.connector import Connector, IPTypes
+from faa_proxy import FaaNotamProxy, FaaProxyError
+from control_plane import (
+    ControlPlaneError,
+    ControlPlaneStore,
+    DeviceCredentialRecord,
+    DuplicateOrganizationError,
+    InvalidOrganizationError,
+    normalize_video_preflight_answer,
+    require_separate_database,
+)
+from enrollment import (
+    ControlPlaneTokenService,
+    EnrollmentTokenError,
+    public_device_configuration,
+)
+from platform_admin import (
+    AggregateUsage,
+    BigQueryBillingSnapshotProvider,
+    CostBreakdown,
+    OrganizationBillingSummary,
+    build_illustrative_platform_snapshot,
+    build_pending_platform_snapshot,
+    public_snapshot_dict,
+)
+from platform_admin_identity import (
+    PlatformAdminIdentityError,
+    SecretManagerPlatformAdminIdentityProvider,
+)
+from platform_admin_auth import (
+    GoogleOidcClient,
+    PlatformAdminAuthError,
+    SmtpPlatformAdminEmailSender,
+)
+from turn_credentials import (
+    CloudflareTurnCredentialProvider,
+    sanitize_ice_servers,
+)
 
 # --- CONFIGURATION & DATABASE SETUP ---
 DB_URL = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./test.db") # Defaults to local file if no Cloud SQL
@@ -52,7 +94,168 @@ TRACKER_API_KEY = os.environ.get("TRACKER_API_KEY", "replace-with-token")
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 TRACKER_ADMIN_USER = os.environ.get("TRACKER_ADMIN_USER", "admin")
 TRACKER_ADMIN_PASS = os.environ.get("TRACKER_ADMIN_PASS", "replace-with-password")
+PLATFORM_BILLING_SOURCE = os.environ.get(
+    "PLATFORM_BILLING_SOURCE", "illustrative"
+).strip().lower()
+PLATFORM_BILLING_PROJECT = os.environ.get(
+    "PLATFORM_BILLING_PROJECT", "r2c-tracker-platform"
+).strip()
+PLATFORM_BILLING_DATASET = os.environ.get(
+    "PLATFORM_BILLING_DATASET", "r2c_billing_export"
+).strip()
+PLATFORM_BILLING_INCLUDED_PROJECTS = tuple(
+    project_id.strip()
+    for project_id in os.environ.get(
+        "PLATFORM_BILLING_INCLUDED_PROJECTS", ""
+    ).split(",")
+    if project_id.strip()
+)
+CONTROL_PLANE_DATABASE_URL = os.environ.get(
+    "CONTROL_PLANE_DATABASE_URL", ""
+).strip()
+CONTROL_PLANE_SIMULATION = (
+    os.environ.get("CONTROL_PLANE_MODE", "simulation").strip().lower()
+    != "live"
+)
+CONTROL_PLANE_SIGNING_KEY = os.environ.get(
+    "CONTROL_PLANE_SIGNING_KEY", ""
+).strip()
+CONTROL_PLANE_PUBLIC_URL = os.environ.get(
+    "CONTROL_PLANE_PUBLIC_URL", "https://r2c-tracker.com"
+).strip()
+SESSION_COOKIE_HTTPS_ONLY = (
+    os.environ.get("SESSION_COOKIE_HTTPS_ONLY", "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+DEVICE_CREDENTIAL_ISSUANCE_ENABLED = (
+    os.environ.get("DEVICE_CREDENTIAL_ISSUANCE_ENABLED", "false")
+    .strip()
+    .lower()
+    in {"1", "true", "yes", "on"}
+)
+CONTROL_PLANE_TRACKER_BASE_URL = os.environ.get(
+    "CONTROL_PLANE_TRACKER_BASE_URL",
+    CONTROL_PLANE_PUBLIC_URL,
+).strip().rstrip("/")
+VIDEO_ICE_SERVERS_JSON = os.environ.get(
+    "VIDEO_ICE_SERVERS_JSON",
+    "[]",
+).strip()
+CLOUDFLARE_TURN_KEY_ID = os.environ.get(
+    "CLOUDFLARE_TURN_KEY_ID",
+    "",
+).strip()
+CLOUDFLARE_TURN_API_TOKEN = os.environ.get(
+    "CLOUDFLARE_TURN_API_TOKEN",
+    "",
+).strip()
+CLOUDFLARE_TURN_CREDENTIAL_TTL_SECONDS = int(
+    os.environ.get("CLOUDFLARE_TURN_CREDENTIAL_TTL_SECONDS", "3600")
+)
+
+
+class DeviceEnrollmentRedeemRequest(BaseModel):
+    token: str = Field(min_length=24, max_length=4096)
+    device_name: str = Field(min_length=1, max_length=160)
+    platform: Literal["android", "ios"]
+
+
+class BrowserVideoPreflightOffer(BaseModel):
+    sdp: str = Field(min_length=3, max_length=262_144)
+    form_token: str = Field(min_length=16, max_length=512)
+
+
+class BrowserVideoMediaOffer(BaseModel):
+    sdp: str = Field(min_length=3, max_length=262_144)
+    form_token: str = Field(min_length=16, max_length=512)
+
+
+class BrowserVideoMediaState(BaseModel):
+    form_token: str = Field(min_length=16, max_length=512)
+
+
+class BrowserVideoMediaMetrics(BrowserVideoMediaState):
+    metrics_session_id: str = Field(min_length=8, max_length=64)
+    audio_bytes_sent: int = Field(ge=0, le=10_000_000_000_000)
+    audio_bytes_received: int = Field(ge=0, le=10_000_000_000_000)
+    video_bytes_received: int = Field(ge=0, le=10_000_000_000_000)
+
+
+def public_video_ice_servers() -> list[dict[str, object]]:
+    try:
+        configured = json.loads(VIDEO_ICE_SERVERS_JSON)
+    except json.JSONDecodeError:
+        logging.error("VIDEO_ICE_SERVERS_JSON is not valid JSON")
+        return []
+    return sanitize_ice_servers(configured)
+
+
+video_ice_server_provider = CloudflareTurnCredentialProvider(
+    key_id=CLOUDFLARE_TURN_KEY_ID,
+    api_token=CLOUDFLARE_TURN_API_TOKEN,
+    fallback_ice_servers=public_video_ice_servers(),
+    credential_ttl_seconds=CLOUDFLARE_TURN_CREDENTIAL_TTL_SECONDS,
+)
+require_separate_database(CONTROL_PLANE_DATABASE_URL, DB_URL)
+control_plane_store = (
+    ControlPlaneStore(CONTROL_PLANE_DATABASE_URL)
+    if CONTROL_PLANE_DATABASE_URL
+    else None
+)
+platform_admin_identity_provider = (
+    SecretManagerPlatformAdminIdentityProvider()
+    if control_plane_store is not None
+    else None
+)
+google_oidc_client = GoogleOidcClient.from_environment()
+platform_admin_email_sender = SmtpPlatformAdminEmailSender.from_environment()
+control_plane_tokens = (
+    ControlPlaneTokenService(
+        CONTROL_PLANE_SIGNING_KEY,
+        CONTROL_PLANE_PUBLIC_URL,
+    )
+    if CONTROL_PLANE_SIGNING_KEY
+    else None
+)
 SECRET_KEY = os.environ.get("SECRET_KEY", False)
+
+
+def organization_site_ready() -> bool:
+    return bool(
+        control_plane_store is not None
+        and control_plane_tokens is not None
+        and SECRET_KEY
+        and (CONTROL_PLANE_SIMULATION or SESSION_COOKIE_HTTPS_ONLY)
+    )
+
+
+def load_platform_billing_snapshot():
+    if PLATFORM_BILLING_SOURCE != "bigquery":
+        return build_illustrative_platform_snapshot()
+    if not PLATFORM_BILLING_INCLUDED_PROJECTS:
+        return build_pending_platform_snapshot(
+            "Live billing is enabled, but PLATFORM_BILLING_INCLUDED_PROJECTS "
+            "is empty. An explicit allowlist is required so unrelated billing "
+            "account costs cannot enter R2C totals.",
+            source_status="error",
+        )
+    try:
+        from google.cloud import bigquery
+
+        provider = BigQueryBillingSnapshotProvider(
+            client=bigquery.Client(project=PLATFORM_BILLING_PROJECT),
+            export_project=PLATFORM_BILLING_PROJECT,
+            export_dataset=PLATFORM_BILLING_DATASET,
+            included_project_ids=PLATFORM_BILLING_INCLUDED_PROJECTS,
+        )
+        return provider.load_snapshot()
+    except Exception:
+        logging.exception("Unable to load aggregate platform billing data")
+        return build_pending_platform_snapshot(
+            "Google Cloud billing data is temporarily unavailable. No tenant "
+            "operational data was queried.",
+            source_status="error",
+        )
 
 def resolve_tracker_version() -> str:
     override = os.environ.get("TRACKER_VERSION")
@@ -76,6 +279,7 @@ def resolve_tracker_version() -> str:
 TRACKER_VERSION = resolve_tracker_version()
 
 BASE_LOG_DIRECTORY = '/flightlogs-vol'
+faa_notam_proxy = FaaNotamProxy()
 R2C_HEARTBEAT_SEC = int(os.environ.get("R2C_HEARTBEAT_SEC", "15"))
 R2C_LEASE_SEC = int(os.environ.get("R2C_LEASE_SEC", "45"))
 R2C_DB_CLEANUP_SEC = int(os.environ.get("R2C_DB_CLEANUP_SEC", "86400"))
@@ -83,6 +287,10 @@ R2C_HEARTBEAT_ZONE_UPDATE_SEC = int(os.environ.get("R2C_HEARTBEAT_ZONE_UPDATE_SE
 R2C_IDLE_PARK_SEC = int(os.environ.get("R2C_IDLE_PARK_SEC", "120"))
 R2C_RECOMMENDED_APP_VERSION_CODE = int(os.environ.get("R2C_RECOMMENDED_APP_VERSION_CODE", "0") or "0")
 R2C_UPDATE_URL = os.environ.get("R2C_UPDATE_URL", "").strip()
+R2C_RECOMMENDED_IOS_APP_BUILD_NUMBER = int(
+    os.environ.get("R2C_RECOMMENDED_IOS_APP_BUILD_NUMBER", "0") or "0"
+)
+R2C_IOS_UPDATE_URL = os.environ.get("R2C_IOS_UPDATE_URL", "").strip()
 R2C_COORDINATION_MODE_MAP = "map"
 R2C_COORDINATION_MODE_STANDALONE = "standalone"
 
@@ -206,6 +414,7 @@ Base = declarative_base()
 class Flight(Base):
     __tablename__ = "flights"
     id = Column(Integer, primary_key=True)
+    organization_id = Column(String(36), nullable=True, index=True)
     sar_id = Column(String, default="undefined")
     remote_id = Column(String, default="", index=True)
     uas = Column(String, default="")
@@ -393,7 +602,10 @@ async def migrate_flight_archive_schema():
                 await conn.execute(text("ALTER TABLE flights ADD COLUMN archive_relpath VARCHAR DEFAULT ''"))
             if "remote_id" not in columns:
                 await conn.execute(text("ALTER TABLE flights ADD COLUMN remote_id VARCHAR DEFAULT ''"))
+            if "organization_id" not in columns:
+                await conn.execute(text("ALTER TABLE flights ADD COLUMN organization_id VARCHAR(36)"))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_flights_remote_id ON flights (remote_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_flights_organization_id ON flights (organization_id)"))
         elif dialect == "sqlite":
             result = await conn.execute(text("PRAGMA table_info(flights)"))
             columns = {row[1] for row in result.fetchall()}
@@ -407,7 +619,10 @@ async def migrate_flight_archive_schema():
                 await conn.execute(text("ALTER TABLE flights ADD COLUMN archive_relpath TEXT DEFAULT ''"))
             if "remote_id" not in columns:
                 await conn.execute(text("ALTER TABLE flights ADD COLUMN remote_id TEXT DEFAULT ''"))
+            if "organization_id" not in columns:
+                await conn.execute(text("ALTER TABLE flights ADD COLUMN organization_id TEXT"))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_flights_remote_id ON flights (remote_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_flights_organization_id ON flights (organization_id)"))
 
 
 async def init_db():
@@ -424,24 +639,67 @@ AsyncSessionLocal = async_sessionmaker(
 
 if __name__ == "__main__":
     asyncio.run(init_db())
-    
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # startup Create tables
     await init_db()
+    if control_plane_store is not None:
+        await control_plane_store.init()
     await r2c_hub.start()
     yield
     # Shutdown Clean up resources (if needed)
     await r2c_hub.stop()
+    if control_plane_store is not None:
+        await control_plane_store.dispose()
     await engine.dispose()
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     SessionMiddleware,
-    secret_key=SECRET_KEY
+    secret_key=SECRET_KEY,
+    session_cookie="r2c_tracker_session_v2",
+    https_only=SESSION_COOKIE_HTTPS_ONLY,
+    same_site="lax",
 )
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.middleware("http")
+async def protect_control_plane_pages(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith("/static/") and path.endswith(".js"):
+        response.headers["Cache-Control"] = "no-cache, max-age=0"
+    organization_page = re.fullmatch(
+        r"/[a-z0-9]{2,16}/(?:"
+        r"activate|login|google/start|logout|admin|settings|members|"
+        r"streams(?:/status|/[^/]+/request|/requests/[^/]+/"
+        r"(?:cancel|preflight/(?:offer|status)))?|"
+        r"enroll(?:/credential)?|"
+        r"enrollments(?:/[^/]+/(?:revoke|qr\.svg))?"
+        r")",
+        path,
+    )
+    if (
+        path.startswith("/platform-admin/")
+        or path == "/google/callback"
+        or organization_page is not None
+    ):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; "
+            "form-action 'self'; "
+            "frame-ancestors 'none'; "
+            "base-uri 'none'"
+        )
+    return response
 
 
 class ConnectionManager:
@@ -465,9 +723,51 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+class OrganizationStreamEventHub:
+    """Fan out privacy-minimal stream lifecycle changes by organization."""
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._connections: dict[str, set[WebSocket]] = {}
+
+    async def connect(self, organization_id: str, websocket: WebSocket):
+        await websocket.accept()
+        async with self._lock:
+            self._connections.setdefault(organization_id, set()).add(websocket)
+
+    async def disconnect(self, organization_id: str, websocket: WebSocket):
+        async with self._lock:
+            connections = self._connections.get(organization_id)
+            if connections is None:
+                return
+            connections.discard(websocket)
+            if not connections:
+                self._connections.pop(organization_id, None)
+
+    async def broadcast(self, organization_id: str):
+        async with self._lock:
+            connections = tuple(self._connections.get(organization_id, ()))
+        failed = []
+        for websocket in connections:
+            try:
+                await websocket.send_json({"type": "streams_changed"})
+            except Exception:
+                failed.append(websocket)
+        for websocket in failed:
+            await self.disconnect(organization_id, websocket)
+
+
+organization_stream_event_hub = OrganizationStreamEventHub()
+
+
 class R2CZoneConnection:
-    def __init__(self, websocket: Optional[WebSocket]):
+    def __init__(
+        self,
+        websocket: Optional[WebSocket],
+        device_credential: Optional[object] = None,
+    ):
         self.websocket = websocket
+        self.device_credential = device_credential
         self.map_id: Optional[str] = None
         self.reported_map_id: str = ""
         self.coordination_mode: str = "map"
@@ -496,6 +796,9 @@ class R2CCoordinationHub:
     def __init__(self):
         self._lock = asyncio.Lock()
         self._connections: dict[WebSocket, R2CZoneConnection] = {}
+        self._connections_by_device_credential_id: dict[
+            str, R2CZoneConnection
+        ] = {}
         self._zones_by_map: dict[str, dict[str, R2CZoneConnection]] = {}
         self._owners: dict[tuple[str, str], dict] = {}
         self._confirmed_drones_by_map: dict[str, dict[str, dict]] = {}
@@ -504,6 +807,7 @@ class R2CCoordinationHub:
         self._sweep_task: Optional[asyncio.Task] = None
         self._load_task: Optional[asyncio.Task] = None
         self._cleanup_task: Optional[asyncio.Task] = None
+        self._video_notification_task: Optional[asyncio.Task] = None
 
     async def start(self):
         if self._sweep_task is None:
@@ -512,6 +816,13 @@ class R2CCoordinationHub:
             self._load_task = asyncio.create_task(self._load_state_safe())
         if self._cleanup_task is None:
             self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        if (
+            self._video_notification_task is None
+            and CONTROL_PLANE_DATABASE_URL.startswith("postgresql")
+        ):
+            self._video_notification_task = asyncio.create_task(
+                self._video_notification_loop()
+            )
 
     async def stop(self):
         if self._sweep_task is not None:
@@ -535,6 +846,157 @@ class R2CCoordinationHub:
             except asyncio.CancelledError:
                 pass
             self._cleanup_task = None
+        if self._video_notification_task is not None:
+            self._video_notification_task.cancel()
+            try:
+                await self._video_notification_task
+            except asyncio.CancelledError:
+                pass
+            self._video_notification_task = None
+
+    async def _video_notification_loop(self):
+        dsn = re.sub(
+            r"^postgresql\+[^:]+:",
+            "postgresql:",
+            CONTROL_PLANE_DATABASE_URL,
+        )
+        retry_seconds = 1
+        while True:
+            connection = None
+            wake = asyncio.Event()
+
+            def receive_notification(
+                _connection,
+                _process_id,
+                channel,
+                payload,
+            ):
+                if channel == "r2c_stream_change":
+                    asyncio.create_task(
+                        organization_stream_event_hub.broadcast(payload.strip())
+                    )
+                elif channel == "r2c_video_preflight":
+                    asyncio.create_task(
+                        self._deliver_notified_video_preflight_offer(payload)
+                    )
+                elif channel == "r2c_video_media":
+                    asyncio.create_task(
+                        self._deliver_notified_video_media_offer(payload)
+                    )
+                else:
+                    asyncio.create_task(
+                        self._deliver_notified_video_stream_request(payload)
+                    )
+
+            try:
+                connection = await asyncpg.connect(dsn)
+                await connection.add_listener(
+                    "r2c_video_request",
+                    receive_notification,
+                )
+                await connection.add_listener(
+                    "r2c_video_preflight",
+                    receive_notification,
+                )
+                await connection.add_listener(
+                    "r2c_video_media",
+                    receive_notification,
+                )
+                await connection.add_listener(
+                    "r2c_stream_change",
+                    receive_notification,
+                )
+                retry_seconds = 1
+                await wake.wait()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Managed video notification listener disconnected; "
+                    "presence replay remains active",
+                    exc_info=True,
+                )
+                await asyncio.sleep(retry_seconds)
+                retry_seconds = min(retry_seconds * 2, 30)
+            finally:
+                if connection is not None:
+                    try:
+                        await connection.close()
+                    except Exception:
+                        logger.debug(
+                            "Managed video notification connection close failed",
+                            exc_info=True,
+                        )
+
+    async def _deliver_notified_video_stream_request(
+        self,
+        request_id: str,
+    ):
+        if control_plane_store is None:
+            return
+        try:
+            stream_request = (
+                await control_plane_store.get_pending_video_stream_request(
+                    request_id.strip()
+                )
+            )
+        except Exception:
+            logger.warning(
+                "Managed video notification lookup failed",
+                exc_info=True,
+            )
+            return
+        if stream_request is None:
+            return
+        await self.send_video_stream_request(
+            device_credential_id=stream_request.device_credential_id,
+            request_id=stream_request.id,
+            requester_email=stream_request.requester_email,
+            stream_session_id=stream_request.stream_session_id,
+            incident_name=stream_request.incident_name,
+            drone_designator=stream_request.drone_designator,
+            source_width=stream_request.source_width,
+            source_height=stream_request.source_height,
+            source_fps=stream_request.source_fps,
+            source_bitrate_bps=stream_request.source_bitrate_bps,
+            source_codec=stream_request.source_codec,
+            expires_at=stream_request.expires_at,
+        )
+
+    async def _deliver_notified_video_preflight_offer(
+        self,
+        request_id: str,
+    ):
+        if control_plane_store is None:
+            return
+        try:
+            exchange = (
+                await control_plane_store.get_pending_video_preflight_offer(
+                    request_id=request_id,
+                )
+            )
+        except Exception:
+            logger.warning(
+                "Managed video preflight notification lookup failed",
+                exc_info=True,
+            )
+            return
+        if exchange is None:
+            return
+        await self.send_video_preflight_offer(exchange)
+
+    async def _deliver_notified_video_media_offer(self, request_id: str):
+        if control_plane_store is None:
+            return
+        try:
+            exchange = await control_plane_store.get_pending_video_media_offer(
+                request_id=request_id.strip()
+            )
+        except Exception:
+            logger.warning("Managed video media notification lookup failed", exc_info=True)
+            return
+        if exchange is not None:
+            await self.send_video_media_offer(exchange)
 
     @classmethod
     def _is_standalone_reported_map_id(cls, reported_map_id: str) -> bool:
@@ -763,13 +1225,49 @@ class R2CCoordinationHub:
         for event in events:
             await self._send_drone_confirmation_to_zone(zone, event)
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(
+        self,
+        websocket: WebSocket,
+        device_credential: Optional[object] = None,
+    ):
         await websocket.accept()
         now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
         async with self._lock:
-            conn = R2CZoneConnection(websocket)
+            conn = R2CZoneConnection(websocket, device_credential)
             conn.connected_at_ms = now_ms
             self._connections[websocket] = conn
+            if device_credential is not None:
+                self._connections_by_device_credential_id[
+                    device_credential.id
+                ] = conn
+
+    def _device_connections_locked(
+        self,
+        device_credential_id: str,
+    ) -> list[R2CZoneConnection]:
+        """Return every live local connection for an organization device."""
+        preferred = self._connections_by_device_credential_id.get(
+            device_credential_id
+        )
+        matches = []
+        if preferred is not None and preferred.websocket in self._connections:
+            matches.append(preferred)
+        for connection in self._connections.values():
+            credential = connection.device_credential
+            if (
+                credential is not None
+                and credential.id == device_credential_id
+                and connection not in matches
+            ):
+                matches.append(connection)
+        matches.sort(
+            key=lambda connection: (
+                int(getattr(connection, "last_seen_ms", 0) or 0),
+                int(getattr(connection, "connected_at_ms", 0) or 0),
+            ),
+            reverse=True,
+        )
+        return matches
 
     async def disconnect(self, websocket: WebSocket):
         confirmed_owner_expirations: list[tuple[str, str, str]] = []
@@ -777,6 +1275,23 @@ class R2CCoordinationHub:
             conn = self._connections.pop(websocket, None)
             if conn is None:
                 return
+            if (
+                conn.device_credential is not None
+                and self._connections_by_device_credential_id.get(
+                    conn.device_credential.id
+                ) is conn
+            ):
+                self._connections_by_device_credential_id.pop(
+                    conn.device_credential.id,
+                    None,
+                )
+                replacements = self._device_connections_locked(
+                    conn.device_credential.id
+                )
+                if replacements:
+                    self._connections_by_device_credential_id[
+                        conn.device_credential.id
+                    ] = replacements[0]
             map_id = conn.map_id
             zone_guid = conn.guid or ""
             zone_id = conn.zone_id or ""
@@ -874,6 +1389,567 @@ class R2CCoordinationHub:
             await self._handle_drone_confirmed(websocket, payload)
         elif mtype == "idle":
             await self._handle_idle(websocket, payload)
+        elif mtype == "video_stream_advertisement":
+            await self._handle_video_stream_advertisement(websocket, payload)
+        elif mtype == "video_preflight_result":
+            await self._handle_video_preflight_result(websocket, payload)
+        elif mtype == "video_preflight_answer":
+            await self._handle_video_preflight_answer(websocket, payload)
+        elif mtype == "video_stream_decision":
+            await self._handle_video_stream_decision(websocket, payload)
+        elif mtype == "video_stream_unavailable":
+            await self._handle_video_stream_unavailable(websocket, payload)
+        elif mtype == "video_media_answer":
+            await self._handle_video_media_answer(websocket, payload)
+        elif mtype == "video_stream_terminated":
+            await self._handle_video_stream_terminated(websocket, payload)
+
+    async def _handle_video_stream_advertisement(
+        self,
+        websocket: WebSocket,
+        payload: dict,
+    ):
+        async with self._lock:
+            conn = self._connections.get(websocket)
+            credential = conn.device_credential if conn is not None else None
+        if credential is None or control_plane_store is None:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "video_stream_advertisement_ack",
+                        "accepted": False,
+                        "error": "Organization device credential required",
+                    }
+                )
+            )
+            return
+        incident_name = str(payload.get("incidentName", "") or "").strip()
+        timezone_name = str(payload.get("timeZone", "UTC") or "UTC").strip()
+        advertised_streams = payload.get("streams", [])
+        if not isinstance(advertised_streams, list):
+            advertised_streams = []
+        accepted_session_ids: list[str] = []
+        for advertised in advertised_streams[:4]:
+            if not isinstance(advertised, dict):
+                continue
+            try:
+                stream = await control_plane_store.advertise_video_stream(
+                    organization_id=credential.organization_id,
+                    device_credential_id=credential.id,
+                    device_name=str(payload.get("deviceName", "") or ""),
+                    session_id=str(advertised.get("sessionId", "") or ""),
+                    incident_name=incident_name,
+                    drone_designator=str(
+                        advertised.get("droneDesignator", "") or ""
+                    ),
+                    source_width=int(advertised.get("sourceWidth", 0) or 0),
+                    source_height=int(advertised.get("sourceHeight", 0) or 0),
+                    source_fps=float(advertised.get("sourceFps", 0.0) or 0.0),
+                    source_bitrate_bps=int(
+                        advertised.get("sourceBitrateBps", 0) or 0
+                    ),
+                    source_codec=str(advertised.get("sourceCodec", "") or ""),
+                    timezone_name=timezone_name,
+                )
+                accepted_session_ids.append(stream.session_id)
+            except (ControlPlaneError, TypeError, ValueError):
+                logger.warning(
+                    "Rejected managed stream advertisement from device=%s",
+                    credential.id,
+                    exc_info=True,
+                )
+        await control_plane_store.reconcile_device_video_streams(
+            organization_id=credential.organization_id,
+            device_credential_id=credential.id,
+            active_session_ids=accepted_session_ids,
+        )
+        pending_requests = await self._pending_video_stream_requests(
+            credential.id
+        )
+        pending_preflight_offers = await self._pending_video_preflight_offers(
+            credential.id
+        )
+        pending_media_offers = await self._pending_video_media_offers(
+            credential.id
+        )
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "video_stream_advertisement_ack",
+                    "accepted": True,
+                    "sessionIds": accepted_session_ids,
+                    "presenceTtlSec": 45,
+                }
+            )
+        )
+        for stream_request in pending_requests:
+            await self.send_video_stream_request(
+                device_credential_id=stream_request.device_credential_id,
+                request_id=stream_request.id,
+                requester_email=stream_request.requester_email,
+                stream_session_id=stream_request.stream_session_id,
+                incident_name=stream_request.incident_name,
+                drone_designator=stream_request.drone_designator,
+                source_width=stream_request.source_width,
+                source_height=stream_request.source_height,
+                source_fps=stream_request.source_fps,
+                source_bitrate_bps=stream_request.source_bitrate_bps,
+                source_codec=stream_request.source_codec,
+                expires_at=stream_request.expires_at,
+            )
+        for exchange in pending_preflight_offers:
+            await self.send_video_preflight_offer(exchange)
+        for exchange in pending_media_offers:
+            await self.send_video_media_offer(exchange)
+
+    async def _pending_video_stream_requests(
+        self,
+        device_credential_id: str,
+    ) -> tuple:
+        if control_plane_store is None:
+            return ()
+        try:
+            return (
+                await control_plane_store
+                .list_pending_video_stream_requests_for_device(
+                    device_credential_id=device_credential_id,
+                )
+            )
+        except Exception:
+            logger.warning(
+                "Managed video request replay lookup failed for device=%s",
+                device_credential_id,
+                exc_info=True,
+            )
+            return ()
+
+    async def _handle_video_preflight_result(
+        self,
+        websocket: WebSocket,
+        payload: dict,
+    ):
+        async with self._lock:
+            connection = self._connections.get(websocket)
+            credential = (
+                connection.device_credential
+                if connection is not None
+                else None
+            )
+        request_id = str(payload.get("requestId", "") or "").strip()
+        try:
+            if credential is None or control_plane_store is None:
+                raise ControlPlaneError(
+                    "Organization device credential required."
+                )
+            result = await control_plane_store.record_video_preflight_result(
+                request_id=request_id,
+                device_credential_id=credential.id,
+                route_kind=str(payload.get("routeKind", "") or ""),
+                estimated_uplink_bps=int(
+                    payload.get("estimatedUplinkBps", 0) or 0
+                ),
+            )
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "video_preflight_result_ack",
+                        "requestId": result.id,
+                        "accepted": True,
+                        "state": result.state,
+                    }
+                )
+            )
+        except (ControlPlaneError, TypeError, ValueError) as exc:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "video_preflight_result_ack",
+                        "requestId": request_id,
+                        "accepted": False,
+                        "error": str(exc),
+                    }
+                )
+            )
+
+    async def _handle_video_preflight_answer(
+        self,
+        websocket: WebSocket,
+        payload: dict,
+    ):
+        async with self._lock:
+            connection = self._connections.get(websocket)
+            credential = (
+                connection.device_credential
+                if connection is not None
+                else None
+            )
+        request_id = str(payload.get("requestId", "") or "").strip()
+        try:
+            if credential is None or control_plane_store is None:
+                raise ControlPlaneError(
+                    "Organization device credential required."
+                )
+            result = await control_plane_store.record_video_preflight_answer(
+                request_id=request_id,
+                device_credential_id=credential.id,
+                device_answer_sdp=str(payload.get("sdp", "") or ""),
+            )
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "video_preflight_answer_ack",
+                        "requestId": result.request_id,
+                        "accepted": True,
+                    }
+                )
+            )
+        except (ControlPlaneError, TypeError, ValueError) as exc:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "video_preflight_answer_ack",
+                        "requestId": request_id,
+                        "accepted": False,
+                        "error": str(exc),
+                    }
+                )
+            )
+
+    async def _handle_video_stream_decision(
+        self,
+        websocket: WebSocket,
+        payload: dict,
+    ):
+        async with self._lock:
+            connection = self._connections.get(websocket)
+            credential = (
+                connection.device_credential
+                if connection is not None
+                else None
+            )
+        request_id = str(payload.get("requestId", "") or "").strip()
+        try:
+            if credential is None or control_plane_store is None:
+                raise ControlPlaneError(
+                    "Organization device credential required."
+                )
+            result = await control_plane_store.record_video_stream_decision(
+                request_id=request_id,
+                device_credential_id=credential.id,
+                decision=str(payload.get("decision", "") or ""),
+                selected_width=int(payload.get("selectedWidth", 0) or 0),
+                selected_height=int(payload.get("selectedHeight", 0) or 0),
+                selected_fps=float(payload.get("selectedFps", 0.0) or 0.0),
+                selected_bitrate_bps=int(
+                    payload.get("selectedBitrateBps", 0) or 0
+                ),
+            )
+            await websocket.send_text(json.dumps({
+                "type": "video_stream_decision_ack",
+                "requestId": result.id,
+                "accepted": True,
+                "state": result.state,
+            }))
+        except (ControlPlaneError, TypeError, ValueError) as exc:
+            await websocket.send_text(json.dumps({
+                "type": "video_stream_decision_ack",
+                "requestId": request_id,
+                "accepted": False,
+                "error": str(exc),
+            }))
+
+    async def _handle_video_stream_unavailable(
+        self,
+        websocket: WebSocket,
+        payload: dict,
+    ):
+        async with self._lock:
+            connection = self._connections.get(websocket)
+            credential = (
+                connection.device_credential
+                if connection is not None
+                else None
+            )
+        request_id = str(payload.get("requestId", "") or "").strip()
+        try:
+            if credential is None or control_plane_store is None:
+                raise ControlPlaneError(
+                    "Organization device credential required."
+                )
+            result = await control_plane_store.record_video_stream_unavailable(
+                request_id=request_id,
+                device_credential_id=credential.id,
+                stream_session_id=str(
+                    payload.get("streamSessionId", "") or ""
+                ),
+                error_code=str(
+                    payload.get("errorCode", "e_nosuch_stream")
+                    or "e_nosuch_stream"
+                ),
+            )
+            await websocket.send_text(json.dumps({
+                "type": "video_stream_unavailable_ack",
+                "requestId": result.id,
+                "accepted": True,
+                "state": result.state,
+            }))
+        except (ControlPlaneError, TypeError, ValueError) as exc:
+            await websocket.send_text(json.dumps({
+                "type": "video_stream_unavailable_ack",
+                "requestId": request_id,
+                "accepted": False,
+                "error": str(exc),
+            }))
+
+    async def _handle_video_media_answer(self, websocket: WebSocket, payload: dict):
+        async with self._lock:
+            connection = self._connections.get(websocket)
+            credential = connection.device_credential if connection is not None else None
+        request_id = str(payload.get("requestId", "") or "").strip()
+        try:
+            if credential is None or control_plane_store is None:
+                raise ControlPlaneError("Organization device credential required.")
+            result = await control_plane_store.record_video_media_answer(
+                request_id=request_id,
+                device_credential_id=credential.id,
+                device_answer_sdp=str(payload.get("sdp", "") or ""),
+            )
+            await websocket.send_text(json.dumps({
+                "type": "video_media_answer_ack",
+                "requestId": result.request_id,
+                "accepted": True,
+            }))
+        except (ControlPlaneError, TypeError, ValueError) as exc:
+            await websocket.send_text(json.dumps({
+                "type": "video_media_answer_ack",
+                "requestId": request_id,
+                "accepted": False,
+                "error": str(exc),
+            }))
+
+    async def _handle_video_stream_terminated(self, websocket: WebSocket, payload: dict):
+        async with self._lock:
+            connection = self._connections.get(websocket)
+            credential = connection.device_credential if connection is not None else None
+        request_id = str(payload.get("requestId", "") or "").strip()
+        try:
+            if credential is None or control_plane_store is None:
+                raise ControlPlaneError("Organization device credential required.")
+            result = await control_plane_store.stop_video_stream_from_device(
+                request_id=request_id,
+                device_credential_id=credential.id,
+                reason=str(payload.get("reason", "device_terminated") or "device_terminated"),
+            )
+            await websocket.send_text(json.dumps({
+                "type": "video_stream_terminated_ack",
+                "requestId": result.id,
+                "accepted": True,
+                "state": result.state,
+            }))
+        except (ControlPlaneError, TypeError, ValueError) as exc:
+            await websocket.send_text(json.dumps({
+                "type": "video_stream_terminated_ack",
+                "requestId": request_id,
+                "accepted": False,
+                "error": str(exc),
+            }))
+
+    async def _pending_video_preflight_offers(
+        self,
+        device_credential_id: str,
+    ) -> tuple:
+        if control_plane_store is None:
+            return ()
+        try:
+            return (
+                await control_plane_store
+                .list_pending_video_preflight_offers_for_device(
+                    device_credential_id=device_credential_id,
+                )
+            )
+        except Exception:
+            logger.warning(
+                "Managed video preflight replay lookup failed for device=%s",
+                device_credential_id,
+                exc_info=True,
+            )
+            return ()
+
+    async def _pending_video_media_offers(self, device_credential_id: str) -> tuple:
+        if control_plane_store is None:
+            return ()
+        try:
+            return await control_plane_store.list_pending_video_media_offers_for_device(
+                device_credential_id=device_credential_id
+            )
+        except Exception:
+            logger.warning(
+                "Managed video media replay lookup failed for device=%s",
+                device_credential_id,
+                exc_info=True,
+            )
+            return ()
+
+    async def send_video_preflight_offer(self, exchange) -> bool:
+        ice_servers = await video_ice_server_provider.get_ice_servers()
+        async with self._lock:
+            connections = self._device_connections_locked(
+                exchange.device_credential_id
+            )
+            connection = connections[0] if connections else None
+            websocket = connection.websocket if connection is not None else None
+        if websocket is None:
+            logger.info(
+                "Managed video preflight offer pending: request=%s device=%s websocket=offline",
+                exchange.request_id,
+                exchange.device_credential_id,
+            )
+            return False
+        try:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "video_preflight_offer",
+                        "requestId": exchange.request_id,
+                        "sdp": exchange.browser_offer_sdp,
+                        "iceServers": ice_servers,
+                        "expiresAt": exchange.expires_at.isoformat(),
+                        "probeDurationMs": 2000,
+                    }
+                )
+            )
+            logger.info(
+                "Managed video preflight offer delivered: request=%s device=%s",
+                exchange.request_id,
+                exchange.device_credential_id,
+            )
+            return True
+        except Exception:
+            logger.warning(
+                "Managed video preflight offer delivery failed",
+                exc_info=True,
+            )
+            return False
+
+    async def send_video_media_offer(self, exchange) -> bool:
+        ice_servers = await video_ice_server_provider.get_ice_servers()
+        async with self._lock:
+            connections = self._device_connections_locked(
+                exchange.device_credential_id
+            )
+            connection = connections[0] if connections else None
+            websocket = connection.websocket if connection is not None else None
+        if websocket is None:
+            logger.info(
+                "Managed video media offer pending: request=%s device=%s websocket=offline",
+                exchange.request_id,
+                exchange.device_credential_id,
+            )
+            return False
+        try:
+            await websocket.send_text(json.dumps({
+                "type": "video_media_offer",
+                "requestId": exchange.request_id,
+                "streamSessionId": exchange.stream_session_id,
+                "sdp": exchange.browser_offer_sdp,
+                "iceServers": ice_servers,
+                "expiresAt": exchange.expires_at.isoformat(),
+            }))
+            logger.info(
+                "Managed video media offer delivered: request=%s device=%s",
+                exchange.request_id,
+                exchange.device_credential_id,
+            )
+            return True
+        except Exception:
+            logger.warning("Managed video media offer delivery failed", exc_info=True)
+            return False
+
+    async def send_video_stream_request(
+        self,
+        *,
+        device_credential_id: str,
+        request_id: str,
+        requester_email: str,
+        stream_session_id: str,
+        incident_name: str,
+        drone_designator: str,
+        source_width: int,
+        source_height: int,
+        source_fps: float,
+        source_bitrate_bps: int,
+        source_codec: str,
+        expires_at: datetime,
+    ) -> bool:
+        async with self._lock:
+            connections = self._device_connections_locked(
+                device_credential_id
+            )
+            connection = connections[0] if connections else None
+            websocket = connection.websocket if connection is not None else None
+        if websocket is None:
+            return False
+        try:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "video_stream_request",
+                        "requestId": request_id,
+                        "requesterEmail": requester_email,
+                        "streamSessionId": stream_session_id,
+                        "incidentName": incident_name,
+                        "droneDesignator": drone_designator,
+                        "sourceWidth": source_width,
+                        "sourceHeight": source_height,
+                        "sourceFps": source_fps,
+                        "sourceBitrateBps": source_bitrate_bps,
+                        "sourceCodec": source_codec,
+                        "expiresAt": expires_at.isoformat(),
+                        "consentRequired": True,
+                    }
+                )
+            )
+            return True
+        except Exception:
+            logger.warning(
+                "Managed video request delivery failed for device=%s",
+                device_credential_id,
+                exc_info=True,
+            )
+            return False
+
+    async def send_video_stream_request_cancelled(
+        self,
+        *,
+        device_credential_id: str,
+        request_id: str,
+    ) -> bool:
+        async with self._lock:
+            connections = self._device_connections_locked(
+                device_credential_id
+            )
+            connection = connections[0] if connections else None
+            websocket = connection.websocket if connection is not None else None
+        if websocket is None:
+            return False
+        try:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "video_stream_request_cancelled",
+                        "requestId": request_id,
+                        "reason": "requester_cancelled",
+                    }
+                )
+            )
+            return True
+        except Exception:
+            logger.warning(
+                "Managed video cancellation delivery failed for device=%s",
+                device_credential_id,
+                exc_info=True,
+            )
+            return False
 
     async def _handle_hello(self, websocket: WebSocket, payload: dict):
         reported_map_id = (payload.get("mapId", "") or "").strip()
@@ -948,10 +2024,18 @@ class R2CCoordinationHub:
             "idleRecommended": True,
             "idleParkSec": R2C_IDLE_PARK_SEC
         }
-        if R2C_RECOMMENDED_APP_VERSION_CODE > 0:
-            hello_ack["recommendedAppVersionCode"] = R2C_RECOMMENDED_APP_VERSION_CODE
-        if R2C_UPDATE_URL:
-            hello_ack["updateUrl"] = R2C_UPDATE_URL
+        app_platform = str(payload.get("appPlatform", "") or "").strip().lower()
+        if app_platform in {"ios", "ipados"}:
+            recommended_version_code = R2C_RECOMMENDED_IOS_APP_BUILD_NUMBER
+            update_url = R2C_IOS_UPDATE_URL
+        else:
+            # Clients predating appPlatform are Android clients.
+            recommended_version_code = R2C_RECOMMENDED_APP_VERSION_CODE
+            update_url = R2C_UPDATE_URL
+        if recommended_version_code > 0:
+            hello_ack["recommendedAppVersionCode"] = recommended_version_code
+        if update_url:
+            hello_ack["updateUrl"] = update_url
         await websocket.send_text(json.dumps(hello_ack))
         await self.broadcast_zone_update(map_id)
         await self._send_recent_drone_confirmations(websocket, map_id, now_ms)
@@ -1528,12 +2612,25 @@ class R2CCoordinationHub:
                 deleted_sighting_count += 1
 
             await session.commit()
-        if deleted_zone_count or deleted_owner_count or deleted_sighting_count:
+        deleted_preflight_count = 0
+        if control_plane_store is not None:
+            deleted_preflight_count = (
+                await control_plane_store
+                .cleanup_expired_video_preflight_exchanges()
+            )
+        if (
+            deleted_zone_count
+            or deleted_owner_count
+            or deleted_sighting_count
+            or deleted_preflight_count
+        ):
             logger.info(
-                "R2C persisted-state cleanup removed zones=%s owners=%s sightings=%s",
+                "R2C persisted-state cleanup removed zones=%s owners=%s "
+                "sightings=%s video_preflights=%s",
                 deleted_zone_count,
                 deleted_owner_count,
                 deleted_sighting_count,
+                deleted_preflight_count,
             )
 
     async def _expiry_loop(self):
@@ -1905,6 +3002,24 @@ async def get_db():
         yield session
         
 security = HTTPBasic()
+
+
+def clear_platform_admin_session(request: Request) -> None:
+    """Remove platform-admin authentication without signing out an org user."""
+    prefixes = ("platform_admin_", "_platform_", "_csrf_platform_")
+    for key in tuple(request.session):
+        if key.startswith(prefixes):
+            request.session.pop(key, None)
+
+
+def clear_organization_session(request: Request) -> None:
+    """Remove organization authentication without signing out the platform admin."""
+    prefixes = ("organization_", "_organization_", "_csrf_organization_")
+    for key in tuple(request.session):
+        if key.startswith(prefixes):
+            request.session.pop(key, None)
+
+
 def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
     if credentials is None:
         return False
@@ -1916,6 +3031,148 @@ def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
             headers={"WWW-Authenticate": "Basic"}
         )
     return credentials.username
+
+
+async def check_platform_admin(request: Request):
+    if control_plane_store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Platform administration is not configured.",
+        )
+    identity, authoritative_user = await current_platform_admin_identity()
+    user_id = request.session.get("platform_admin_user_id")
+    session_generation = request.session.get("platform_admin_identity_generation")
+    user = (
+        await control_plane_store.get_platform_admin(user_id)
+        if isinstance(user_id, str)
+        else None
+    )
+    if (
+        user is None
+        or user.id != authoritative_user.id
+        or user.email != identity.email
+        or session_generation != identity.generation
+    ):
+        clear_platform_admin_session(request)
+        raise HTTPException(
+            status_code=status.HTTP_303_SEE_OTHER,
+            headers={
+                "Location": (
+                    "/platform-admin/login?"
+                    + urlencode({"next": request.url.path})
+                )
+            },
+        )
+    return user
+
+
+async def current_platform_admin_identity():
+    if control_plane_store is None or platform_admin_identity_provider is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Platform administration is not configured.",
+        )
+    try:
+        identity = await platform_admin_identity_provider.get_current()
+        user = await control_plane_store.reconcile_platform_admin_identity(
+            email=identity.email,
+            display_name=identity.display_name,
+        )
+        return identity, user
+    except (PlatformAdminIdentityError, ControlPlaneError, ValueError):
+        logging.exception("Platform administrator identity is unavailable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Platform administrator identity is temporarily unavailable.",
+        )
+
+
+async def require_organization_user(
+        request: Request,
+        designator: str,
+        required_roles: tuple[str, ...] = (),
+        redirect_to_login: bool = False,
+        login_next: str = ""):
+    if not organization_site_ready():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Organization administration is not configured.",
+        )
+    organization = await control_plane_store.get_organization(designator)
+    user_id = request.session.get("organization_user_id")
+    session_designator = request.session.get("organization_designator")
+    if (
+        organization is None
+        or not user_id
+        or session_designator != organization.designator
+    ):
+        if redirect_to_login and organization is not None:
+            raise HTTPException(
+                status_code=status.HTTP_303_SEE_OTHER,
+                headers={
+                    "Location": f"/{organization.designator.lower()}/login"
+                    + ("?" + urlencode({"next": login_next}) if login_next else "")
+                },
+            )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Organization administrator login required.",
+        )
+    user = await control_plane_store.get_user(user_id)
+    if (
+        user is None
+        or user.state != "active"
+        or user.organization_id != organization.id
+    ):
+        request.session.pop("organization_user_id", None)
+        request.session.pop("organization_designator", None)
+        if redirect_to_login:
+            raise HTTPException(
+                status_code=status.HTTP_303_SEE_OTHER,
+                headers={
+                    "Location": f"/{organization.designator.lower()}/login"
+                    + ("?" + urlencode({"next": login_next}) if login_next else "")
+                },
+            )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Organization administrator login required.",
+        )
+    if required_roles and not set(required_roles).intersection(user.roles):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your organization role does not permit this action.",
+        )
+    return organization, user
+
+
+async def organization_page_identity(
+        request: Request,
+        designator: str) -> str:
+    """Return the current member name for an organization page, or Guest."""
+    if control_plane_store is None:
+        return "Guest"
+    try:
+        organization = await control_plane_store.get_organization(designator)
+    except InvalidOrganizationError:
+        return "Guest"
+    if organization is None:
+        return "Guest"
+    user_id = request.session.get("organization_user_id")
+    session_designator = request.session.get("organization_designator")
+    if not user_id or session_designator != organization.designator:
+        return "Guest"
+    user = await control_plane_store.get_user(user_id)
+    if (
+        user is None
+        or user.state != "active"
+        or user.organization_id != organization.id
+    ):
+        request.session.pop("organization_user_id", None)
+        request.session.pop("organization_designator", None)
+        return "Guest"
+    return user.display_name
+
 
 def opt_check_admin(credentials: HTTPBasicCredentials = Depends(security)):
     if credentials is None:
@@ -1948,7 +3205,7 @@ def get_time_of_day(start_ts_sec, lat, lng):
         (sun_times['nautical_dusk'].timestamp(), "Nautical Dusk"),
         (sun_times['night'].timestamp(), "Night")
     ]
-    
+
     
     phases.sort(key=lambda x: x[0]) ;# Sort by the datetime value
     timeofday_str = "Night"  # Default for times before the first phase (early AM)
@@ -2138,16 +3395,66 @@ def compute_distance(coords):
     # Convert km to miles w/~50' resolution:
     return round(total_dist_km * 0.621371, 2)
 
-async def get_api_key(header_value: str = Depends(api_key_header)):
-    if _normalize_tracker_token(header_value) == _normalize_tracker_token(TRACKER_API_KEY):
-        return header_value
-    else:
-        raise HTTPException(
-            status_code=HTTP_403_FORBIDDEN, detail="Could not validate credentials"
-            )
+async def authenticate_tracker_token(token: Optional[str]) -> bool:
+    valid, _credential = await authenticate_tracker_session(token)
+    return valid
 
-async def archive_flight_log(title, flight_timestamp, geojson_data, flight_id: int):
-    relpath = archive_relpath_for_flight(flight_id, title, flight_timestamp)
+
+async def authenticate_tracker_session(
+    token: Optional[str],
+) -> tuple[bool, Optional[DeviceCredentialRecord]]:
+    normalized = _normalize_tracker_token(token)
+    if normalized == _normalize_tracker_token(TRACKER_API_KEY):
+        return True, None
+    if control_plane_store is None or not normalized.startswith("r2c_dev_"):
+        return False, None
+    credential = await control_plane_store.authenticate_device_token(normalized)
+    return credential is not None, credential
+
+
+async def get_api_key(
+    header_value: str = Depends(api_key_header),
+) -> Optional[DeviceCredentialRecord]:
+    authenticated, credential = await authenticate_tracker_session(header_value)
+    if authenticated:
+        return credential
+    raise HTTPException(
+        status_code=HTTP_403_FORBIDDEN,
+        detail="Could not validate credentials",
+    )
+
+
+async def meter_organization_usage(
+    credential: Optional[DeviceCredentialRecord],
+    **increments,
+) -> None:
+    """Record delayed aggregate usage without affecting the client request."""
+    if credential is None or control_plane_store is None:
+        return
+    try:
+        await control_plane_store.increment_daily_usage(
+            organization_id=credential.organization_id,
+            **increments,
+        )
+    except Exception:
+        logger.exception(
+            "Unable to record aggregate organization usage: organization=%s",
+            credential.organization_id,
+        )
+
+async def archive_flight_log(
+    title,
+    flight_timestamp,
+    geojson_data,
+    flight_id: int,
+    organization_designator: Optional[str] = None,
+):
+    relpath = archive_relpath_for_flight(
+        flight_id,
+        title,
+        flight_timestamp,
+        organization_designator,
+    )
     target_directory = os.path.join(BASE_LOG_DIRECTORY, os.path.dirname(relpath))
     os.makedirs(target_directory, exist_ok=True)
 
@@ -2235,7 +3542,12 @@ async def extract_flight_inputs_from_geojson(data: dict):
     }
 
 
-async def create_flight_and_archive(db: AsyncSession, data: dict, flight_inputs: dict):
+async def create_flight_and_archive(
+    db: AsyncSession,
+    data: dict,
+    flight_inputs: dict,
+    credential: Optional[DeviceCredentialRecord] = None,
+):
     spec = flight_inputs["spec"]
     title = flight_inputs["title"]
     start_time = flight_inputs["start_time"]
@@ -2248,6 +3560,7 @@ async def create_flight_and_archive(db: AsyncSession, data: dict, flight_inputs:
         end_time,
         remote_id=remote_id,
         sar_id=spec['sar_id'],
+        organization_id=(credential.organization_id if credential else None),
     )
     existing = result.scalars().first()
     if existing:
@@ -2262,6 +3575,7 @@ async def create_flight_and_archive(db: AsyncSession, data: dict, flight_inputs:
 
     data['r2c-tracker'] = flight_inputs["processing_comments"]
     new_flight = Flight(
+        organization_id=(credential.organization_id if credential else None),
         sar_id=spec['sar_id'].upper(),
         remote_id=remote_id,
         start_time=start_time,
@@ -2291,12 +3605,18 @@ async def create_flight_and_archive(db: AsyncSession, data: dict, flight_inputs:
         flight_inputs["localized_start_time"],
         data,
         new_flight.id,
+        credential.designator if credential else None,
     )
     new_flight.archive_relpath = archive_relpath
     return new_flight, archive_path
 
 
-async def create_imported_flight_and_archive(db: AsyncSession, data: dict, flight_inputs: dict):
+async def create_imported_flight_and_archive(
+        db: AsyncSession,
+        data: dict,
+        flight_inputs: dict,
+        organization_id: Optional[str] = None,
+        organization_designator: Optional[str] = None):
     spec = flight_inputs["spec"]
     remote_id = normalize_remote_id(spec.get('rid'))
     timeofday_str = get_time_of_day(
@@ -2307,6 +3627,7 @@ async def create_imported_flight_and_archive(db: AsyncSession, data: dict, fligh
 
     data['r2c-tracker'] = flight_inputs["processing_comments"]
     new_flight = Flight(
+        organization_id=organization_id,
         sar_id=spec['sar_id'].upper(),
         remote_id=remote_id,
         start_time=flight_inputs["start_time"],
@@ -2336,6 +3657,7 @@ async def create_imported_flight_and_archive(db: AsyncSession, data: dict, fligh
         flight_inputs["localized_start_time"],
         data,
         new_flight.id,
+        organization_designator,
     )
     new_flight.archive_relpath = archive_relpath
     return new_flight, archive_path
@@ -2359,6 +3681,28 @@ def format_duration_hours(value: Optional[float]) -> str:
     minutes, seconds = divmod(rem, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
+def format_duration_seconds(value: Optional[int]) -> str:
+    if value is None:
+        return "—"
+    try:
+        total_seconds = max(int(value), 0)
+    except (TypeError, ValueError):
+        return "—"
+    hours, rem = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def format_media_bytes(value: Optional[int]) -> str:
+    byte_count = max(0, int(value or 0))
+    if byte_count >= 1_000_000:
+        return f"{byte_count / 1_000_000:.1f} MB"
+    if byte_count >= 1_000:
+        return f"{byte_count / 1_000:.1f} KB"
+    return f"{byte_count} B"
+
 def datetime_from_format(fmtstr):
     return datetime.strptime(fmtstr, '%d%b%y@%H:%M:%S-%Z')
 
@@ -2370,13 +3714,68 @@ def to_iso_naive(dt):
 def get_flashed_messages(request: Request):
     return request.session.pop("_messages") if "_messages" in request.session else []
 
-templates.env.globals.update(get_flashed_messages=get_flashed_messages)
+
+def template_navigation(request, organization_designator=None):
+    """Keep shared navigation inside the current authentication/data scope."""
+    designator = str(organization_designator or "").strip().lower()
+    if designator:
+        return {
+            "scope": "organization",
+            "home_url": f"/{designator}",
+            "designator": designator,
+        }
+    try:
+        path = request.url.path
+    except AttributeError:
+        path = ""
+    if path.startswith("/platform-admin"):
+        return {
+            "scope": "platform_admin",
+            "home_url": "/platform-admin/organizations",
+            "designator": "",
+        }
+    if path in {"/", "/versions"}:
+        return {
+            "scope": "public",
+            "home_url": "/",
+            "designator": "",
+        }
+    return {"scope": "legacy", "home_url": "/", "designator": ""}
+
+
+templates.env.globals.update(
+    get_flashed_messages=get_flashed_messages,
+    template_navigation=template_navigation,
+)
 templates.env.globals["tracker_version"] = TRACKER_VERSION
 
 def flash(request: Request, message: str, category: str = "info"):
     if "_messages" not in request.session:
         request.session["_messages"] = []
     request.session["_messages"].append({"message": message, "category": category})
+
+
+def csrf_token(request: Request, namespace: str) -> str:
+    key = f"_csrf_{namespace}"
+    token = request.session.get(key)
+    if not token:
+        token = secrets.token_urlsafe(32)
+        request.session[key] = token
+    return token
+
+
+def verify_csrf(request: Request, namespace: str, submitted: str) -> None:
+    expected = request.session.get(f"_csrf_{namespace}", "")
+    if (
+        not submitted
+        or not expected
+        or not secrets.compare_digest(submitted, expected)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid or expired form token.",
+        )
+
 
 def admin_url(start_date: Optional[date] = None, end_date: Optional[date] = None, **extra_params) -> str:
     params = {}
@@ -2386,6 +3785,23 @@ def admin_url(start_date: Optional[date] = None, end_date: Optional[date] = None
         params["end_date"] = end_date.isoformat()
     params.update({key: value for key, value in extra_params.items() if value is not None})
     return f"/admin?{urlencode(params)}" if params else "/admin"
+
+
+def organization_flight_admin_url(
+        designator: str,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        **extra_params) -> str:
+    params = {}
+    if start_date:
+        params["start_date"] = start_date.isoformat()
+    if end_date:
+        params["end_date"] = end_date.isoformat()
+    params.update(
+        {key: value for key, value in extra_params.items() if value is not None}
+    )
+    base_url = f"/{designator.lower()}/admin/flights"
+    return f"{base_url}?{urlencode(params)}" if params else base_url
 
 def export_url(start_date: Optional[date] = None, end_date: Optional[date] = None) -> str:
     params = {}
@@ -2494,6 +3910,9 @@ def build_r2c_snapshot(zones, owners, now_ms: int):
             "coordination_mode": "standalone" if map_id.startswith("Standalone_") else "map",
             "zones": zone_entries,
             "zone_count": len(zone_entries),
+            "active_zone_count": sum(
+                zone["status"] == "online" for zone in zone_entries
+            ),
             "owned_drone_count": sum(zone["owned_drone_count"] for zone in zone_entries),
         })
 
@@ -2501,6 +3920,9 @@ def build_r2c_snapshot(zones, owners, now_ms: int):
         "maps": snapshot_maps,
         "map_count": len(snapshot_maps),
         "zone_count": sum(entry["zone_count"] for entry in snapshot_maps),
+        "active_zone_count": sum(
+            entry["active_zone_count"] for entry in snapshot_maps
+        ),
         "owned_drone_count": sum(entry["owned_drone_count"] for entry in snapshot_maps),
     }
 
@@ -2607,10 +4029,24 @@ def archive_filename_for_flight(flight_id: int, title: str, flight_timestamp: da
     return f"flightlog_{flight_id}_{filename_timestamp}-{safe_title}.json"
 
 
-def archive_relpath_for_flight(flight_id: int, title: str, flight_timestamp: datetime) -> str:
+def archive_relpath_for_flight(
+    flight_id: int,
+    title: str,
+    flight_timestamp: datetime,
+    organization_designator: Optional[str] = None,
+) -> str:
     year = flight_timestamp.strftime("%Y")
     month = flight_timestamp.strftime("%m")
     filename = archive_filename_for_flight(flight_id, title, flight_timestamp)
+    if organization_designator:
+        safe_designator = re.sub(
+            r"[^a-z0-9]",
+            "",
+            organization_designator.strip().lower(),
+        )
+        if not safe_designator:
+            raise ValueError("Organization designator is invalid for log storage.")
+        return os.path.join("organizations", safe_designator, year, month, filename)
     return os.path.join(year, month, filename)
 
 
@@ -2638,7 +4074,14 @@ def localize_flight_time(dt, lat, lng):
     return dt_utc
 
 
-async def find_overlap(db, start_time, end_time, remote_id: Optional[str] = None, sar_id: Optional[str] = None):
+async def find_overlap(
+    db,
+    start_time,
+    end_time,
+    remote_id: Optional[str] = None,
+    sar_id: Optional[str] = None,
+    organization_id: Optional[str] = None,
+):
     # Make sure a flight doesn't overlap an existing flight for the same aircraft identity.
     remote_id, sar_id, fallback_to_sar = resolve_overlap_identity(remote_id, sar_id)
 
@@ -2655,7 +4098,12 @@ async def find_overlap(db, start_time, end_time, remote_id: Optional[str] = None
     else:
         return await db.execute(select(Flight).where(text("1 = 0")))
 
-    stmt = select(Flight).filter(or_(*identity_filters)).filter(
+    organization_filter = (
+        Flight.organization_id == organization_id
+        if organization_id
+        else Flight.organization_id.is_(None)
+    )
+    stmt = select(Flight).filter(organization_filter).filter(or_(*identity_filters)).filter(
         or_(
             # New start falls inside an existing flight
             and_(Flight.start_time <= start_time, Flight.end_time > start_time),
@@ -2663,29 +4111,94 @@ async def find_overlap(db, start_time, end_time, remote_id: Optional[str] = None
             and_(Flight.start_time < end_time, Flight.end_time >= end_time),
             # New flight completely swallows an existing flight
             and_(Flight.start_time >= start_time, Flight.end_time <= end_time)
-        ) 
+        )
     )
     return await db.execute(stmt)
-    
-    
+
+
 
 templates.env.filters["localize_flight_time"] = localize_flight_time
 templates.env.filters["fmt_datetime"] = format_datetime
 templates.env.filters["duration_hms"] = format_duration_hours
+templates.env.filters["duration_clock"] = format_duration_seconds
+templates.env.filters["media_bytes"] = format_media_bytes
 
 # --- ROUTES ---
+@app.get("/faa/notams", response_class=Response)
+async def faa_notams(
+        latitude: float = Query(...),
+        longitude: float = Query(...),
+        radius: float = Query(...),
+        lastUpdatedDate: Optional[str] = Query(None),
+        credential: Optional[DeviceCredentialRecord] = Depends(get_api_key)):
+    """
+    Return nearby FAA NOTAM GeoJSON without exposing FAA credentials to R2C.
+
+    Full queries use a small, safety-expanded geographic cache. Incremental
+    queries containing lastUpdatedDate bypass the cache.
+    """
+    try:
+        result = await faa_notam_proxy.fetch_notams(
+            latitude=latitude,
+            longitude=longitude,
+            radius_nm=radius,
+            last_updated_date=lastUpdatedDate,
+        )
+    except FaaProxyError as exc:
+        logger.warning("FAA proxy request failed: %s", exc)
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    response_bytes = (
+        len(result.body)
+        if isinstance(result.body, bytes)
+        else len(str(result.body).encode("utf-8"))
+    )
+    await meter_organization_usage(
+        credential,
+        compute_units=Decimal("1"),
+        network_bytes=response_bytes,
+        faa_proxy_requests=1,
+    )
+    return Response(
+        content=result.body,
+        media_type="application/json",
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-R2C-FAA-Cache": result.cache_status,
+            "X-R2C-FAA-Cache-Age": str(result.age_seconds),
+        },
+    )
+
+
+def require_scoped_upload_credential(
+        designator: str,
+        credential: Optional[DeviceCredentialRecord],
+) -> DeviceCredentialRecord:
+    """Bind an organization upload URL to its issued device credential."""
+    normalized = designator.strip().lower()
+    if credential is None or credential.designator.strip().lower() != normalized:
+        raise HTTPException(
+            status_code=HTTP_403_FORBIDDEN,
+            detail="Device credential does not belong to this organization",
+        )
+    return credential
+
+
 @app.put("/upload")
+@app.put("/{designator}/upload")
 async def upload(
         request: Request,
-        db: AsyncSession = Depends(get_db)):
-    api_key: str = Depends(get_api_key) # activate the token check.
+        designator: Optional[str] = None,
+        db: AsyncSession = Depends(get_db),
+        credential: Optional[DeviceCredentialRecord] = Depends(get_api_key)):
+    if designator is not None:
+        credential = require_scoped_upload_credential(designator, credential)
     raw_body = await request.body()
     try:
         data = await request.json()
         if not data:
             raise ValueError("No data received in payload")
         sar_id = data.get("sar_id", "unknown")
-        
+
     except ValueError as ve:
         logger.warning(f"Validation Error: {ve}")
         raise HTTPException(status_code=400, detail=str(ve))
@@ -2698,10 +4211,23 @@ async def upload(
             flight_inputs["spec"].get("rid"),
             flight_inputs["spec"].get("sar_id"),
     ):
-        new_flight, archive_path = await create_flight_and_archive(db, data, flight_inputs)
+        new_flight, archive_path = await create_flight_and_archive(
+            db,
+            data,
+            flight_inputs,
+            credential,
+        )
         await db.commit()
 
     await manager.broadcast("refresh") # Tell everyone to reload
+    archive_size = os.path.getsize(archive_path) if os.path.exists(archive_path) else 0
+    await meter_organization_usage(
+        credential,
+        compute_units=Decimal("1"),
+        database_units=Decimal("1"),
+        network_bytes=len(raw_body),
+        storage_byte_days=archive_size,
+    )
     return {"status": "Logged",
             "hours": flight_inputs["duration_hrs"],
             "timeofday": new_flight.timeofday,
@@ -2719,16 +4245,53 @@ async def upload(
             }
 
 @app.get("/", response_class=HTMLResponse)
-async def public_dashboard(
+async def organization_directory(
+        request: Request,
+        response: Response):
+    response.headers["X-Robots-Tag"] = "noindex, nofollow"
+    organizations = ()
+    if control_plane_store is not None:
+        organizations = tuple(
+            sorted(
+                await control_plane_store.list_organizations(),
+                key=lambda organization: (
+                    organization.legal_name.casefold(),
+                    organization.designator,
+                ),
+            )
+        )
+    return templates.TemplateResponse(
+        request=request,
+        name="organization_directory.html",
+        context={
+            "request": request,
+            "enable_live_refresh": False,
+            "include_leaflet": False,
+            "organizations": organizations,
+        },
+    )
+
+
+async def render_public_dashboard(
         request: Request,
         response: Response,
-        db: AsyncSession = Depends(get_db),
-        start_date: Optional[date] = None,
-        end_date: Optional[date] = None):
+        db: AsyncSession,
+        start_date: Optional[date],
+        end_date: Optional[date],
+        organization=None):
     response.headers["X-Robots-Tag"] = "noindex, nofollow"
 
     # Base query:
-    stmt = apply_date_filter(select(Flight), start_date, end_date)
+    organization_filter = (
+        Flight.organization_id == organization.id
+        if organization is not None
+        else Flight.organization_id.is_(None)
+    )
+    stmt = apply_date_filter(
+        select(Flight).where(organization_filter),
+        start_date,
+        end_date,
+    )
 
     # Group by pilot, sum hours
     subq_totals = stmt.with_only_columns(
@@ -2751,7 +4314,7 @@ async def public_dashboard(
     ).subquery()
 
     leaderboard_stmt = select(
-        subq_totals.c.sar_id,        
+        subq_totals.c.sar_id,
         subq_totals.c.total_hours,
         subq_totals.c.total_miles,
         subq_totals.c.last_active,
@@ -2780,7 +4343,16 @@ async def public_dashboard(
             "timezone" : ZoneInfo("America/Los_Angeles"),
             "leaderboard": leaderboard,
             "start_date" : start_date,
-            "end_date" : end_date
+            "end_date" : end_date,
+            "dashboard_url": (
+                f"/{organization.designator.lower()}" if organization else "/"
+            ),
+            "organization_page_designator": (
+                organization.designator if organization else None
+            ),
+            "organization_legal_name": (
+                organization.legal_name if organization else None
+            ),
         },
     )
 
@@ -2848,6 +4420,2459 @@ async def version_history(request: Request):
         },
     )
 
+
+@app.get("/platform-admin/login", response_class=HTMLResponse)
+async def platform_admin_login_page(
+        request: Request,
+        next: str = "/platform-admin/organizations"):
+    identity, authoritative_user = await current_platform_admin_identity()
+    existing_id = request.session.get("platform_admin_user_id")
+    if isinstance(existing_id, str):
+        existing = await control_plane_store.get_platform_admin(existing_id)
+        if (
+            existing is not None
+            and existing.id == authoritative_user.id
+            and request.session.get("platform_admin_identity_generation")
+            == identity.generation
+        ):
+            return RedirectResponse(
+                url="/platform-admin/organizations",
+                status_code=status.HTTP_303_SEE_OTHER,
+            )
+    safe_next = (
+        next
+        if next.startswith("/platform-admin/") and not next.startswith("//")
+        else "/platform-admin/organizations"
+    )
+    has_password = await control_plane_store.platform_admin_has_password(
+        authoritative_user.id
+    )
+    return templates.TemplateResponse(
+        request=request,
+        name="platform_admin_login.html",
+        context={
+            "request": request,
+            "enable_live_refresh": False,
+            "include_leaflet": False,
+            "include_datetime_script": False,
+            "csrf_token": csrf_token(request, "platform_admin_login"),
+            "email_csrf_token": csrf_token(
+                request,
+                "platform_admin_setup_request",
+            ),
+            "next": safe_next,
+            "platform_admin_email": identity.email,
+            "has_password": has_password,
+            "google_login_enabled": google_oidc_client.is_configured,
+            "email_setup_enabled": platform_admin_email_sender.is_configured,
+        },
+    )
+
+
+@app.post("/platform-admin/login")
+async def platform_admin_login(
+        request: Request,
+        email: Annotated[str, Form()],
+        password: Annotated[str, Form()],
+        form_token: Annotated[str, Form()],
+        next: Annotated[str, Form()] = "/platform-admin/organizations"):
+    verify_csrf(request, "platform_admin_login", form_token)
+    identity, authoritative_user = await current_platform_admin_identity()
+    try:
+        user = (
+            await control_plane_store.authenticate_platform_admin(
+                identity.email,
+                password,
+            )
+            if secrets.compare_digest(email.strip().lower(), identity.email)
+            else None
+        )
+    except InvalidOrganizationError:
+        user = None
+    if user is None:
+        flash(request, "Incorrect email or password.", "warning")
+        return RedirectResponse(
+            url="/platform-admin/login",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    clear_platform_admin_session(request)
+    if user.id != authoritative_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Platform administrator identity changed during login.",
+        )
+    request.session["platform_admin_user_id"] = user.id
+    request.session["platform_admin_identity_generation"] = identity.generation
+    safe_next = (
+        next
+        if next.startswith("/platform-admin/") and not next.startswith("//")
+        else "/platform-admin/organizations"
+    )
+    return RedirectResponse(
+        url=safe_next,
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+def platform_admin_google_redirect_uri() -> str:
+    return (
+        CONTROL_PLANE_PUBLIC_URL.rstrip("/")
+        + "/platform-admin/google/callback"
+    )
+
+
+@app.get("/platform-admin/google/start")
+async def platform_admin_google_start(
+        request: Request,
+        next: str = "/platform-admin/organizations"):
+    identity, _user = await current_platform_admin_identity()
+    safe_next = (
+        next
+        if next.startswith("/platform-admin/") and not next.startswith("//")
+        else "/platform-admin/organizations"
+    )
+    try:
+        authorization_url, flow = google_oidc_client.authorization_request(
+            platform_admin_google_redirect_uri()
+        )
+    except PlatformAdminAuthError as exc:
+        flash(request, str(exc), "warning")
+        return RedirectResponse(
+            url="/platform-admin/login",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    request.session["platform_admin_google_flow"] = {
+        **flow,
+        "identity_generation": identity.generation,
+        "next": safe_next,
+    }
+    return RedirectResponse(
+        url=authorization_url,
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.get("/platform-admin/google/callback")
+async def platform_admin_google_callback(
+        request: Request,
+        code: str = "",
+        state: str = "",
+        error: str = ""):
+    flow = request.session.pop("platform_admin_google_flow", None)
+    if (
+        error
+        or not isinstance(flow, dict)
+        or not code
+        or not state
+        or not secrets.compare_digest(state, str(flow.get("state", "")))
+    ):
+        flash(request, "Google sign-in was canceled or could not be verified.", "warning")
+        return RedirectResponse(
+            url="/platform-admin/login",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    identity, user = await current_platform_admin_identity()
+    if not secrets.compare_digest(
+        identity.generation,
+        str(flow.get("identity_generation", "")),
+    ):
+        flash(request, "The authorized administrator changed. Sign in again.", "warning")
+        return RedirectResponse(
+            url="/platform-admin/login",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    try:
+        google_identity = await asyncio.to_thread(
+            google_oidc_client.exchange_code,
+            code=code,
+            redirect_uri=platform_admin_google_redirect_uri(),
+            verifier=str(flow.get("verifier", "")),
+            expected_nonce=str(flow.get("nonce", "")),
+        )
+    except PlatformAdminAuthError as exc:
+        logging.warning("Google platform-admin login failed: %s", exc)
+        flash(request, "Google sign-in could not be verified.", "warning")
+        return RedirectResponse(
+            url="/platform-admin/login",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    if not secrets.compare_digest(google_identity.email, identity.email):
+        logging.warning(
+            "Google platform-admin login rejected for non-authoritative email"
+        )
+        flash(request, "That Google account is not the authorized administrator.", "warning")
+        return RedirectResponse(
+            url="/platform-admin/login",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    clear_platform_admin_session(request)
+    request.session["platform_admin_user_id"] = user.id
+    request.session["platform_admin_identity_generation"] = identity.generation
+    request.session["platform_admin_google_subject"] = google_identity.subject
+    return RedirectResponse(
+        url=str(flow.get("next", "/platform-admin/organizations")),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post("/platform-admin/setup/request")
+async def platform_admin_setup_request(
+        request: Request,
+        email: Annotated[str, Form()],
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "platform_admin_setup_request", form_token)
+    identity, _user = await current_platform_admin_identity()
+    if (
+        platform_admin_email_sender.is_configured
+        and secrets.compare_digest(email.strip().lower(), identity.email)
+    ):
+        token = await control_plane_store.issue_platform_admin_password_setup(
+            email=identity.email,
+            identity_generation=identity.generation,
+        )
+        if token:
+            setup_url = (
+                CONTROL_PLANE_PUBLIC_URL.rstrip("/")
+                + "/platform-admin/setup#"
+                + urlencode({"token": token})
+            )
+            try:
+                await asyncio.to_thread(
+                    platform_admin_email_sender.send_password_setup,
+                    recipient=identity.email,
+                    setup_url=setup_url,
+                )
+            except PlatformAdminAuthError:
+                logging.exception("Unable to send platform-admin setup email")
+    flash(
+        request,
+        "If that address is authorized, a five-minute setup link has been sent.",
+        "info",
+    )
+    return RedirectResponse(
+        url="/platform-admin/login",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.get("/platform-admin/setup", response_class=HTMLResponse)
+async def platform_admin_setup_page(request: Request):
+    await current_platform_admin_identity()
+    return platform_admin_setup_response(request)
+
+
+def platform_admin_setup_response(
+        request: Request,
+        setup_token: str = "",
+        status_code: int = status.HTTP_200_OK):
+    return templates.TemplateResponse(
+        request=request,
+        name="platform_admin_setup.html",
+        context={
+            "request": request,
+            "enable_live_refresh": False,
+            "include_leaflet": False,
+            "include_datetime_script": False,
+            "csrf_token": csrf_token(request, "platform_admin_password_setup"),
+            "setup_token": setup_token,
+        },
+        status_code=status_code,
+    )
+
+
+@app.post("/platform-admin/setup")
+async def platform_admin_setup_password(
+        request: Request,
+        setup_token: Annotated[str, Form()],
+        new_password: Annotated[str, Form()],
+        new_password_confirm: Annotated[str, Form()],
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "platform_admin_password_setup", form_token)
+    identity, _authoritative_user = await current_platform_admin_identity()
+    if new_password != new_password_confirm:
+        flash(request, "Passwords do not match.", "warning")
+        return platform_admin_setup_response(
+            request,
+            setup_token,
+            status.HTTP_400_BAD_REQUEST,
+        )
+    try:
+        user = await control_plane_store.set_platform_admin_password_from_token(
+            token=setup_token,
+            email=identity.email,
+            identity_generation=identity.generation,
+            new_password=new_password,
+        )
+    except ValueError as exc:
+        flash(request, str(exc), "warning")
+        return platform_admin_setup_response(
+            request,
+            setup_token,
+            status.HTTP_400_BAD_REQUEST,
+        )
+    if user is None:
+        flash(request, "That setup link is invalid, expired, or already used.", "warning")
+        return RedirectResponse(
+            url="/platform-admin/login",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    clear_platform_admin_session(request)
+    request.session["platform_admin_user_id"] = user.id
+    request.session["platform_admin_identity_generation"] = identity.generation
+    flash(request, "Administrator password saved.", "success")
+    return RedirectResponse(
+        url="/platform-admin/organizations",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post("/platform-admin/logout")
+async def platform_admin_logout(
+        request: Request,
+        form_token: Annotated[str, Form()],
+        _user=Depends(check_platform_admin)):
+    verify_csrf(request, "platform_admin_account", form_token)
+    clear_platform_admin_session(request)
+    return RedirectResponse(
+        url="/platform-admin/login",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.get("/platform-admin/account", response_class=HTMLResponse)
+async def platform_admin_account(
+        request: Request,
+        user=Depends(check_platform_admin)):
+    return templates.TemplateResponse(
+        request=request,
+        name="platform_admin_account.html",
+        context={
+            "request": request,
+            "enable_live_refresh": False,
+            "include_leaflet": False,
+            "include_datetime_script": False,
+            "platform_admin": user,
+            "csrf_token": csrf_token(request, "platform_admin_password"),
+        },
+    )
+
+
+@app.post("/platform-admin/account/password")
+async def platform_admin_change_password(
+        request: Request,
+        current_password: Annotated[str, Form()],
+        new_password: Annotated[str, Form()],
+        new_password_confirm: Annotated[str, Form()],
+        form_token: Annotated[str, Form()],
+        user=Depends(check_platform_admin)):
+    verify_csrf(request, "platform_admin_password", form_token)
+    try:
+        if new_password != new_password_confirm:
+            raise ControlPlaneError("New passwords do not match.")
+        await control_plane_store.change_platform_admin_password(
+            user_id=user.id,
+            current_password=current_password,
+            new_password=new_password,
+        )
+        flash(request, "Platform administrator password changed.", "success")
+    except (ControlPlaneError, ValueError) as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(
+        url="/platform-admin/account",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.get("/platform-admin/organizations", response_class=HTMLResponse)
+async def platform_admin_organizations(
+        request: Request,
+        user=Depends(check_platform_admin)):
+    snapshot = await asyncio.to_thread(load_platform_billing_snapshot)
+    activation_url = request.session.pop("_platform_activation_url", None)
+    provisioning_jobs = ()
+    audit_events = ()
+    ledger_nonces = {}
+    if control_plane_store is not None:
+        (
+            records,
+            usage_costs,
+            usage_aggregates,
+            provisioning_jobs,
+            audit_events,
+            collected_mtd,
+        ) = await asyncio.gather(
+            control_plane_store.list_organizations(),
+            control_plane_store.month_to_date_usage_costs(),
+            control_plane_store.month_to_date_usage_aggregates(),
+            control_plane_store.list_provisioning_jobs(),
+            control_plane_store.list_audit_events(),
+            control_plane_store.collected_month_to_date(),
+        )
+        organizations = tuple(
+            OrganizationBillingSummary(
+                legal_name=record.legal_name,
+                designator=record.designator,
+                hostname=record.hostname,
+                primary_admin_name=record.primary_admin_name,
+                primary_admin_email=record.primary_admin_email,
+                account_status=record.lifecycle_state,
+                provisioning_status=record.provisioning_state,
+                billing_mode=record.billing_mode,
+                trial_ends_at=record.trial_ends_at,
+                credit_balance=record.credit_balance,
+                month_to_date_cost=(
+                    CostBreakdown(
+                        compute=usage_costs[record.id].compute,
+                        network=usage_costs[record.id].network,
+                        storage=usage_costs[record.id].storage,
+                        database=usage_costs[record.id].database,
+                        other=usage_costs[record.id].other,
+                    )
+                    if (
+                        snapshot.source_status == "ready"
+                        and record.id in usage_costs
+                    )
+                    else CostBreakdown()
+                ),
+                primary_admin_postal_address=(
+                    record.primary_admin_postal_address
+                ),
+                aggregate_usage=(
+                    AggregateUsage(
+                        requests=usage_aggregates[record.id].faa_proxy_requests,
+                        network_bytes=usage_aggregates[record.id].network_bytes,
+                        storage_byte_days=(
+                            usage_aggregates[record.id].storage_byte_days
+                        ),
+                        compute_units=usage_aggregates[record.id].compute_units,
+                        database_units=usage_aggregates[record.id].database_units,
+                        turn_relay_bytes=usage_aggregates[record.id].turn_relay_bytes,
+                    )
+                    if record.id in usage_aggregates
+                    else AggregateUsage()
+                ),
+            )
+            for record in records
+        )
+        attributed = sum(
+            (
+                organization.month_to_date_cost.total
+                for organization in organizations
+            ),
+            Decimal("0.00"),
+        )
+        snapshot = replace(
+            snapshot,
+            organizations=organizations,
+            attributed_cost_mtd=attributed,
+            unallocated_cost_mtd=snapshot.actual_cost_mtd - attributed,
+            collected_mtd=collected_mtd,
+            organizations_are_illustrative=False,
+        )
+        if CONTROL_PLANE_SIMULATION:
+            ledger_nonces = {
+                record.designator: secrets.token_urlsafe(24)
+                for record in records
+            }
+    return templates.TemplateResponse(
+        request=request,
+        name="platform_admin.html",
+        context={
+            "request": request,
+            "enable_live_refresh": False,
+            "include_leaflet": False,
+            "include_datetime_script": False,
+            "platform_snapshot": public_snapshot_dict(snapshot),
+            "control_plane_enabled": (
+                control_plane_store is not None
+                and control_plane_tokens is not None
+            ),
+            "control_plane_simulation": CONTROL_PLANE_SIMULATION,
+            "email_delivery_configured": (
+                platform_admin_email_sender.is_configured
+            ),
+            "live_provisioning_ready": bool(
+                organization_site_ready()
+                and platform_admin_email_sender.is_configured
+                and SESSION_COOKIE_HTTPS_ONLY
+            ),
+            "csrf_token": csrf_token(request, "platform_organizations"),
+            "activation_url": activation_url,
+            "provisioning_jobs": provisioning_jobs,
+            "audit_events": audit_events,
+            "ledger_nonces": ledger_nonces,
+            "platform_admin": user,
+            "account_csrf_token": csrf_token(
+                request,
+                "platform_admin_account",
+            ),
+        },
+    )
+
+
+@app.post("/platform-admin/organizations")
+async def platform_admin_create_organization(
+        request: Request,
+        legal_name: Annotated[str, Form()],
+        designator: Annotated[str, Form()],
+        admin_name: Annotated[str, Form()],
+        admin_email: Annotated[str, Form()],
+        postal_address: Annotated[str, Form()],
+        form_token: Annotated[str, Form()],
+        pilot_acknowledged: Annotated[Optional[str], Form()] = None,
+        user=Depends(check_platform_admin)):
+    verify_csrf(request, "platform_organizations", form_token)
+    if pilot_acknowledged != "yes":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Confirm that the organization understands this is an "
+                "unpriced pilot before creating the account."
+            ),
+        )
+    if control_plane_store is None or control_plane_tokens is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The control-plane database and signing key are required.",
+        )
+    if not CONTROL_PLANE_SIMULATION and not platform_admin_email_sender.is_configured:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Live organization provisioning requires the configured "
+                "STARTTLS email sender."
+            ),
+        )
+    try:
+        organization = await control_plane_store.create_organization(
+            legal_name=legal_name,
+            designator=designator,
+            admin_name=admin_name,
+            admin_email=admin_email,
+            postal_address=postal_address,
+            actor_id=user.id,
+            simulation=CONTROL_PLANE_SIMULATION,
+            pilot_acknowledged=True,
+        )
+        invitation = await control_plane_store.get_invitation(
+            organization.designator,
+            organization.primary_admin_email,
+        )
+        if invitation is None:
+            raise ControlPlaneError(
+                "Organization created, but its administrator invitation is unavailable."
+            )
+        if CONTROL_PLANE_SIMULATION:
+            request.session["_platform_activation_url"] = (
+                control_plane_tokens.activation_url(invitation)
+            )
+        else:
+            activation_url = control_plane_tokens.activation_url(invitation)
+            await asyncio.to_thread(
+                platform_admin_email_sender.send_organization_activation,
+                recipient=organization.primary_admin_email,
+                administrator_name=organization.primary_admin_name,
+                organization_name=organization.legal_name,
+                designator=organization.designator,
+                activation_url=activation_url,
+            )
+            await control_plane_store.mark_organization_invitation_sent(
+                organization_id=organization.id,
+                actor_id=user.id,
+            )
+        flash(
+            request,
+            (
+                f"{organization.designator} created in "
+                f"{'simulation' if CONTROL_PLANE_SIMULATION else 'live'} mode."
+            ),
+            "success",
+        )
+    except (
+        ControlPlaneError,
+        DuplicateOrganizationError,
+        InvalidOrganizationError,
+        PlatformAdminAuthError,
+        ValueError,
+    ) as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(
+        url="/platform-admin/organizations",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post("/platform-admin/organizations/{designator}/credit")
+async def platform_admin_add_simulation_credit(
+        request: Request,
+        designator: str,
+        amount: Annotated[Decimal, Form()],
+        idempotency_key: Annotated[str, Form()],
+        form_token: Annotated[str, Form()],
+        user=Depends(check_platform_admin)):
+    verify_csrf(request, "platform_organizations", form_token)
+    if not CONTROL_PLANE_SIMULATION:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Manual credit entry is available only in simulation mode.",
+        )
+    if control_plane_store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Control-plane database is not configured.",
+        )
+    organization = await control_plane_store.get_organization(designator)
+    if organization is None:
+        raise HTTPException(status_code=404, detail="Organization not found.")
+    try:
+        if amount <= 0 or amount > Decimal("100000"):
+            raise ControlPlaneError(
+                "Simulation credit must be greater than zero and no more than $100,000."
+            )
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,160}", idempotency_key):
+            raise ControlPlaneError("Invalid simulation credit request.")
+        await control_plane_store.append_ledger_entry(
+            organization_id=organization.id,
+            entry_type="credit",
+            amount=amount,
+            description="Simulation prepaid account credit",
+            idempotency_key=f"ui-{organization.id}-{idempotency_key}",
+            created_by_type="platform_admin",
+            created_by_id=user.id,
+        )
+        flash(
+            request,
+            f"Recorded ${amount:.2f} simulation credit for {organization.designator}.",
+            "success",
+        )
+    except ControlPlaneError as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(
+        url="/platform-admin/organizations",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post("/platform-admin/organizations/{designator}/send-invitation")
+async def platform_admin_send_organization_invitation(
+        request: Request,
+        designator: str,
+        form_token: Annotated[str, Form()],
+        user=Depends(check_platform_admin)):
+    verify_csrf(request, "platform_organizations", form_token)
+    if CONTROL_PLANE_SIMULATION:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Email invitations are disabled in simulation mode.",
+        )
+    if (
+        control_plane_store is None
+        or control_plane_tokens is None
+        or not platform_admin_email_sender.is_configured
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Live invitation email is not configured.",
+        )
+    try:
+        organization = await control_plane_store.get_organization(designator)
+        if organization is None:
+            raise ControlPlaneError("Organization not found.")
+        invitation = await control_plane_store.renew_invitation(
+            organization.designator,
+            organization.primary_admin_email,
+        )
+        await asyncio.to_thread(
+            platform_admin_email_sender.send_organization_activation,
+            recipient=organization.primary_admin_email,
+            administrator_name=organization.primary_admin_name,
+            organization_name=organization.legal_name,
+            designator=organization.designator,
+            activation_url=control_plane_tokens.activation_url(invitation),
+        )
+        await control_plane_store.mark_organization_invitation_sent(
+            organization_id=organization.id,
+            actor_id=user.id,
+        )
+        flash(
+            request,
+            f"Activation invitation sent to {organization.primary_admin_email}.",
+            "success",
+        )
+    except (ControlPlaneError, InvalidOrganizationError, PlatformAdminAuthError) as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(
+        url="/platform-admin/organizations",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.get("/{designator}/activate", response_class=HTMLResponse)
+async def organization_activate_page(
+        request: Request,
+        designator: str,
+        token: str):
+    if not organization_site_ready():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Organization administration is not configured.",
+        )
+    identity_name = await organization_page_identity(request, designator)
+    try:
+        claims = control_plane_tokens.decode_activation(token)
+        if claims.designator.lower() != designator.lower():
+            raise EnrollmentTokenError("Administrator activation link is invalid.")
+        invitation = await control_plane_store.get_invitation(
+            claims.designator,
+            claims.email,
+        )
+        if (
+            invitation is None
+            or invitation.user_id != claims.user_id
+            or invitation.organization_id != claims.organization_id
+            or not secrets.compare_digest(
+                invitation.activation_nonce,
+                claims.nonce,
+            )
+        ):
+            raise EnrollmentTokenError(
+                "Administrator activation link is invalid or already used."
+            )
+    except (ControlPlaneError, EnrollmentTokenError, InvalidOrganizationError) as exc:
+        return templates.TemplateResponse(
+            request=request,
+            name="organization_activate.html",
+            context={
+                "request": request,
+                "enable_live_refresh": False,
+                "include_leaflet": False,
+                "include_datetime_script": False,
+                "activation_error": str(exc),
+                "organization_page_designator": designator.upper(),
+                "organization_identity_name": identity_name,
+            },
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+    return templates.TemplateResponse(
+        request=request,
+        name="organization_activate.html",
+        context={
+            "request": request,
+            "enable_live_refresh": False,
+            "include_leaflet": False,
+            "include_datetime_script": False,
+            "activation_error": None,
+            "designator": claims.designator,
+            "email": claims.email,
+            "token": token,
+            "csrf_token": csrf_token(request, "organization_activation"),
+            "organization_page_designator": claims.designator,
+            "organization_identity_name": identity_name,
+        },
+    )
+
+
+@app.post("/{designator}/activate")
+async def organization_activate(
+        request: Request,
+        designator: str,
+        token: Annotated[str, Form()],
+        password: Annotated[str, Form()],
+        password_confirm: Annotated[str, Form()],
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_activation", form_token)
+    if not organization_site_ready():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Organization administration is not configured.",
+        )
+    try:
+        claims = control_plane_tokens.decode_activation(token)
+        if (
+            claims.designator.lower() != designator.lower()
+            or password != password_confirm
+        ):
+            raise ControlPlaneError(
+                "The activation link is invalid or the passwords do not match."
+            )
+        invitation = await control_plane_store.get_invitation(
+            claims.designator,
+            claims.email,
+        )
+        if (
+            invitation is None
+            or invitation.user_id != claims.user_id
+            or invitation.organization_id != claims.organization_id
+        ):
+            raise ControlPlaneError(
+                "The administrator invitation is invalid or already used."
+            )
+        user = await control_plane_store.activate_owner(
+            claims.designator,
+            claims.email,
+            password,
+            activation_nonce=claims.nonce,
+        )
+    except (
+        ControlPlaneError,
+        EnrollmentTokenError,
+        InvalidOrganizationError,
+        ValueError,
+    ) as exc:
+        flash(request, str(exc), "warning")
+        return RedirectResponse(
+            url=(
+                f"/{designator.lower()}/activate?"
+                f"{urlencode({'token': token})}"
+            ),
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    clear_organization_session(request)
+    request.session["organization_user_id"] = user.id
+    request.session["organization_designator"] = claims.designator
+    flash(request, "Administrator account activated.", "success")
+    return RedirectResponse(
+        url=f"/{claims.designator.lower()}/admin",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.get("/{designator}/login", response_class=HTMLResponse)
+async def organization_login_page(
+        request: Request,
+        designator: str,
+        next: str = ""):
+    if not organization_site_ready():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Organization administration is not configured.",
+        )
+    organization = await control_plane_store.get_organization(designator)
+    if organization is None:
+        raise HTTPException(status_code=404, detail="Organization not found.")
+    identity_name = await organization_page_identity(
+        request,
+        organization.designator,
+    )
+    dashboard_path = f"/{organization.designator.lower()}"
+    next_path = dashboard_path if next == dashboard_path else ""
+    return templates.TemplateResponse(
+        request=request,
+        name="organization_login.html",
+        context={
+            "request": request,
+            "enable_live_refresh": False,
+            "include_leaflet": False,
+            "include_datetime_script": False,
+            "organization": organization,
+            "csrf_token": csrf_token(request, "organization_login"),
+            "google_login_enabled": google_oidc_client.is_configured,
+            "google_start_url": (
+                f"/{organization.designator.lower()}/google/start"
+                + ("?" + urlencode({"next": next_path}) if next_path else "")
+            ),
+            "next_path": next_path,
+            "organization_page_designator": organization.designator,
+            "organization_identity_name": identity_name,
+        },
+    )
+
+
+@app.post("/{designator}/login")
+async def organization_login(
+        request: Request,
+        designator: str,
+        email: Annotated[str, Form()],
+        password: Annotated[str, Form()],
+        form_token: Annotated[str, Form()],
+        next: Annotated[str, Form()] = ""):
+    verify_csrf(request, "organization_login", form_token)
+    if not organization_site_ready():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Organization administration is not configured.",
+        )
+    try:
+        user = await control_plane_store.authenticate_user(
+            designator,
+            email,
+            password,
+        )
+    except InvalidOrganizationError:
+        user = None
+    if user is None:
+        flash(request, "Incorrect email or password.", "warning")
+        login_path = f"/{designator.lower()}/login"
+        return RedirectResponse(
+            url=(
+                login_path + "?" + urlencode({"next": next})
+                if next == f"/{designator.lower()}"
+                else login_path
+            ),
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    organization = await control_plane_store.get_organization(designator)
+    clear_organization_session(request)
+    request.session["organization_user_id"] = user.id
+    request.session["organization_designator"] = organization.designator
+    dashboard_path = f"/{organization.designator.lower()}"
+    return RedirectResponse(
+        url=dashboard_path if next == dashboard_path else f"{dashboard_path}/admin",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+def organization_google_redirect_uri() -> str:
+    return (
+        CONTROL_PLANE_PUBLIC_URL.rstrip("/")
+        + "/google/callback"
+    )
+
+
+@app.get("/{designator}/google/start")
+async def organization_google_start(
+        request: Request,
+        designator: str,
+        next: str = ""):
+    if not organization_site_ready():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Organization administration is not configured.",
+        )
+    try:
+        organization = await control_plane_store.get_organization(designator)
+    except InvalidOrganizationError:
+        organization = None
+    if organization is None:
+        raise HTTPException(status_code=404, detail="Organization not found.")
+    try:
+        authorization_url, flow = google_oidc_client.authorization_request(
+            organization_google_redirect_uri()
+        )
+    except PlatformAdminAuthError as exc:
+        flash(request, str(exc), "warning")
+        return RedirectResponse(
+            url=f"/{organization.designator.lower()}/login",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    request.session["organization_google_flow"] = {
+        **flow,
+        "organization_id": organization.id,
+        "designator": organization.designator,
+        "next": (
+            f"/{organization.designator.lower()}"
+            if next == f"/{organization.designator.lower()}"
+            else ""
+        ),
+    }
+    return RedirectResponse(
+        url=authorization_url,
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.get("/google/callback")
+async def organization_google_callback(
+        request: Request,
+        code: str = "",
+        state: str = "",
+        error: str = ""):
+    flow = request.session.pop("organization_google_flow", None)
+    fallback_designator = (
+        str(flow.get("designator", "")).lower()
+        if isinstance(flow, dict)
+        else ""
+    )
+    fallback_url = (
+        f"/{fallback_designator}/login"
+        if fallback_designator
+        else "/"
+    )
+    if (
+        error
+        or not isinstance(flow, dict)
+        or not code
+        or not state
+        or not secrets.compare_digest(state, str(flow.get("state", "")))
+    ):
+        flash(request, "Google sign-in was canceled or could not be verified.", "warning")
+        return RedirectResponse(
+            url=fallback_url,
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    try:
+        organization = await control_plane_store.get_organization(
+            str(flow.get("designator", ""))
+        )
+    except InvalidOrganizationError:
+        organization = None
+    if (
+        organization is None
+        or not secrets.compare_digest(
+            organization.id,
+            str(flow.get("organization_id", "")),
+        )
+    ):
+        flash(request, "The organization changed. Sign in again.", "warning")
+        return RedirectResponse(
+            url=fallback_url,
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    try:
+        google_identity = await asyncio.to_thread(
+            google_oidc_client.exchange_code,
+            code=code,
+            redirect_uri=organization_google_redirect_uri(),
+            verifier=str(flow.get("verifier", "")),
+            expected_nonce=str(flow.get("nonce", "")),
+        )
+        user = await control_plane_store.authorize_google_user(
+            organization.designator,
+            google_identity.email,
+        )
+    except (PlatformAdminAuthError, InvalidOrganizationError) as exc:
+        logging.warning("Google organization login failed: %s", exc)
+        user = None
+    if user is None:
+        logging.warning(
+            "Google organization login rejected for unauthorized email"
+        )
+        flash(
+            request,
+            "That Google account is not an active administrator for this organization.",
+            "warning",
+        )
+        return RedirectResponse(
+            url=f"/{organization.designator.lower()}/login",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    clear_organization_session(request)
+    request.session["organization_user_id"] = user.id
+    request.session["organization_designator"] = organization.designator
+    request.session["organization_google_subject"] = google_identity.subject
+    dashboard_path = f"/{organization.designator.lower()}"
+    return RedirectResponse(
+        url=(
+            dashboard_path
+            if flow.get("next") == dashboard_path
+            else f"{dashboard_path}/admin"
+        ),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post("/{designator}/logout")
+async def organization_logout(
+        request: Request,
+        designator: str,
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_admin", form_token)
+    clear_organization_session(request)
+    return RedirectResponse(
+        url=f"/{designator.lower()}/login",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.get("/{designator}/admin", response_class=HTMLResponse)
+async def organization_admin(request: Request, designator: str):
+    organization, user = await require_organization_user(
+        request,
+        designator,
+        redirect_to_login=True,
+    )
+    invitation_url = request.session.pop("_organization_invitation_url", None)
+    users, campaigns, ledger_entries = await asyncio.gather(
+        control_plane_store.list_users(organization.id),
+        control_plane_store.list_enrollment_campaigns(organization.id),
+        control_plane_store.list_ledger(organization.id),
+    )
+    return templates.TemplateResponse(
+        request=request,
+        name="organization_admin.html",
+        context={
+            "request": request,
+            "enable_live_refresh": False,
+            "include_leaflet": False,
+            "include_datetime_script": False,
+            "organization": organization,
+            "organization_user": user,
+            "organization_users": users,
+            "enrollment_campaigns": campaigns,
+            "ledger_entries": ledger_entries,
+            "csrf_token": csrf_token(request, "organization_admin"),
+            "simulation": CONTROL_PLANE_SIMULATION,
+            "invitation_url": invitation_url,
+            "invitation_email_enabled": (
+                platform_admin_email_sender.is_configured
+            ),
+            "organization_page_designator": organization.designator,
+            "organization_identity_name": user.display_name,
+        },
+    )
+
+
+async def require_organization_records_admin(
+        request: Request,
+        designator: str):
+    return await require_organization_user(
+        request,
+        designator,
+        required_roles=("organization_owner", "records_admin"),
+        redirect_to_login=True,
+    )
+
+
+def organization_admin_csv_response(
+        flights,
+        designator: str) -> Response:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Flight", "Sar Id", "Remote Id", "UAS", "Incident", "Op Period",
+        "Map Id", "Start Time", "End Time", "Start Lattitude",
+        "Start Longitude", "Hours", "Distance (mi)", "Temp (F)",
+        "Rel Humidity (%)", "Dew Pt (F)", "Precip (in)", "Wind (mph)",
+        "Gusts (mph)", "Cloud Cover (%)", "Time Of Day", "Archive Path",
+    ])
+    for flight in flights:
+        writer.writerow([
+            flight.id,
+            flight.sar_id.upper(),
+            (flight.remote_id or "").upper(),
+            flight.uas.lower(),
+            flight.incident,
+            flight.op_period,
+            flight.map_id.upper(),
+            format_datetime(flight.start_time.replace(tzinfo=UTC)),
+            format_datetime(flight.end_time.replace(tzinfo=UTC)),
+            flight.start_lat,
+            flight.start_lng,
+            flight.hours,
+            flight.distance_mi,
+            flight.temp_f,
+            flight.rhum_pct,
+            flight.dewpt_f,
+            flight.precip_in,
+            flight.wind_mph,
+            flight.gusts_mph,
+            flight.cloudcvr_pct,
+            flight.timeofday,
+            flight.archive_relpath or "",
+        ])
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"r2c_{designator.lower()}_audit_full_{timestamp}.csv"
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.get("/{designator}/admin/flights", response_class=HTMLResponse)
+async def organization_flight_admin(
+        request: Request,
+        designator: str,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        db: AsyncSession = Depends(get_db)):
+    organization, user = await require_organization_records_admin(
+        request,
+        designator,
+    )
+    stmt = apply_date_filter(
+        select(Flight).where(Flight.organization_id == organization.id),
+        start_date,
+        end_date,
+    ).order_by(Flight.start_time.desc())
+    if not start_date and not end_date:
+        stmt = stmt.limit(50)
+    result = await db.execute(stmt)
+    base_url = f"/{organization.designator.lower()}/admin/flights"
+    return templates.TemplateResponse(
+        request=request,
+        name="admin.html",
+        context={
+            "request": request,
+            "flights": result.scalars().all(),
+            "start_date": start_date.isoformat() if start_date else "",
+            "end_date": end_date.isoformat() if end_date else "",
+            "export_url": organization_flight_admin_url(
+                organization.designator,
+                start_date,
+                end_date,
+            ).replace("/admin/flights", "/admin/flights/export", 1),
+            "archive_export_url": f"{base_url}/archive",
+            "admin_title": f"{organization.designator} Flight Administration",
+            "admin_heading": f"{organization.designator} Flight Log Editor",
+            "dashboard_url": f"/{organization.designator.lower()}",
+            "admin_base_url": base_url,
+            "batch_url": f"{base_url}/batch",
+            "import_url": f"{base_url}/import",
+            "archive_import_url": f"{base_url}/import-archive",
+            "backfill_url": f"{base_url}/backfill-csv",
+            "delete_all_url": f"{base_url}/delete",
+            "delete_all_label": (
+                f"Delete All {organization.designator} Flights "
+                "(do you have a recent export/archive to restore from?)"
+            ),
+            "form_token": csrf_token(request, "organization_records_admin"),
+            "organization_page_designator": organization.designator,
+            "organization_identity_name": user.display_name,
+        },
+    )
+
+
+@app.get("/{designator}/admin/flights/export", response_class=Response)
+async def organization_flight_export(
+        request: Request,
+        designator: str,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        db: AsyncSession = Depends(get_db)):
+    organization, _user = await require_organization_records_admin(
+        request,
+        designator,
+    )
+    stmt = apply_date_filter(
+        select(Flight).where(Flight.organization_id == organization.id),
+        start_date,
+        end_date,
+    ).order_by(Flight.start_time)
+    result = await db.execute(stmt)
+    return organization_admin_csv_response(
+        result.scalars().all(),
+        organization.designator,
+    )
+
+
+@app.get("/{designator}/admin/flights/archive", response_class=FileResponse)
+async def organization_flight_archive_export(
+        request: Request,
+        designator: str,
+        bg_tasks: BackgroundTasks,
+        db: AsyncSession = Depends(get_db)):
+    organization, _user = await require_organization_records_admin(
+        request,
+        designator,
+    )
+    result = await db.execute(
+        select(Flight.archive_relpath).where(
+            Flight.organization_id == organization.id,
+            Flight.archive_relpath != "",
+        )
+    )
+    scope_prefix = f"organizations/{organization.designator.lower()}/"
+    archive_files = []
+    for relpath in result.scalars().all():
+        normalized = os.path.normpath(relpath or "")
+        if not normalized.startswith(scope_prefix):
+            continue
+        filepath = os.path.join(BASE_LOG_DIRECTORY, normalized)
+        if os.path.isfile(filepath):
+            archive_files.append((filepath, normalized[len(scope_prefix):]))
+    if not archive_files:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No {organization.designator} flight logs to archive.",
+        )
+
+    archive_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_filename = (
+        f"r2c-{organization.designator.lower()}-flightlogs-"
+        f"{archive_timestamp}.tgz"
+    )
+    tmp_dir = os.path.join(BASE_LOG_DIRECTORY, "tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    temp_archive_path = os.path.join(
+        tmp_dir,
+        f"{secrets.token_hex(8)}-{archive_filename}",
+    )
+    try:
+        with tarfile.open(temp_archive_path, "w:gz") as archive:
+            for filepath, archive_name in sorted(archive_files):
+                archive.add(filepath, arcname=archive_name)
+    except Exception:
+        try:
+            if os.path.exists(temp_archive_path):
+                os.unlink(temp_archive_path)
+        except OSError:
+            pass
+        raise
+    bg_tasks.add_task(os.unlink, temp_archive_path)
+    return FileResponse(
+        temp_archive_path,
+        media_type="application/gzip",
+        filename=archive_filename,
+    )
+
+
+@app.post("/{designator}/admin/flights/batch")
+async def organization_batch_update_flights(
+        request: Request,
+        designator: str,
+        start_date: Annotated[Optional[date], Form()] = None,
+        end_date: Annotated[Optional[date], Form()] = None,
+        form_token: Annotated[str, Form()] = "",
+        db: AsyncSession = Depends(get_db)):
+    organization, _user = await require_organization_records_admin(
+        request,
+        designator,
+    )
+    verify_csrf(request, "organization_records_admin", form_token)
+    redirect_url = organization_flight_admin_url(
+        organization.designator,
+        start_date,
+        end_date,
+    )
+    form_data = await request.form()
+    action, flight_ids, delete_ids, updates = parse_admin_batch_form(form_data)
+    if not flight_ids:
+        flash(request, "No flights were submitted.", "info")
+        return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+
+    result = await db.execute(
+        select(Flight).where(
+            Flight.id.in_(flight_ids),
+            Flight.organization_id == organization.id,
+        )
+    )
+    flights = {flight.id: flight for flight in result.scalars().all()}
+    missing_ids = [flight_id for flight_id in flight_ids if flight_id not in flights]
+
+    if action == "delete_selected":
+        deleted_ids = []
+        for flight_id in flight_ids:
+            flight = flights.get(flight_id)
+            if flight_id in delete_ids and flight is not None:
+                await db.delete(flight)
+                deleted_ids.append(flight_id)
+        if deleted_ids:
+            await db.commit()
+            flash(
+                request,
+                f"Deleted {len(deleted_ids)} flight(s): "
+                + ", ".join(str(flight_id) for flight_id in deleted_ids),
+                "success",
+            )
+        else:
+            flash(request, "No organization flights were selected for deletion.", "info")
+    else:
+        changed_ids = []
+        for flight_id in flight_ids:
+            flight = flights.get(flight_id)
+            if flight is None:
+                continue
+            submitted = updates[flight_id]
+            new_sar_id = submitted["sar_id"]
+            new_uas = submitted["uas"]
+            if flight.sar_id == new_sar_id and flight.uas == new_uas:
+                continue
+            overlap_result = await find_overlap(
+                db,
+                flight.start_time,
+                flight.end_time,
+                remote_id=flight.remote_id,
+                sar_id=new_sar_id,
+                organization_id=organization.id,
+            )
+            overlap = overlap_result.scalars().first()
+            if overlap and overlap.id != flight.id:
+                flash(
+                    request,
+                    f"Flight {flight_id} edit rejected. Change would overlap "
+                    f"with flight record {overlap.id}.",
+                    "warning",
+                )
+                continue
+            flight.sar_id = new_sar_id
+            flight.uas = new_uas
+            changed_ids.append(flight_id)
+        if changed_ids:
+            await db.commit()
+            flash(request, f"Saved changes for {len(changed_ids)} flight(s).", "success")
+        else:
+            flash(request, "No field changes were detected.", "info")
+
+    if missing_ids:
+        flash(
+            request,
+            "Skipped flights outside this organization or no longer present: "
+            + ", ".join(str(flight_id) for flight_id in missing_ids),
+            "warning",
+        )
+    return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/{designator}/admin/flights/delete")
+async def organization_reset_flights(
+        request: Request,
+        designator: str,
+        start_date: Annotated[Optional[date], Form()] = None,
+        end_date: Annotated[Optional[date], Form()] = None,
+        form_token: Annotated[str, Form()] = "",
+        db: AsyncSession = Depends(get_db)):
+    organization, _user = await require_organization_records_admin(request, designator)
+    verify_csrf(request, "organization_records_admin", form_token)
+    await db.execute(delete(Flight).where(Flight.organization_id == organization.id))
+    await db.commit()
+    flash(request, f"All {organization.designator} flights were deleted.", "success")
+    return RedirectResponse(
+        url=organization_flight_admin_url(organization.designator, start_date, end_date),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post("/{designator}/admin/flights/import")
+async def organization_import_csv(
+        request: Request,
+        designator: str,
+        file: UploadFile = File(...),
+        start_date: Annotated[Optional[date], Form()] = None,
+        end_date: Annotated[Optional[date], Form()] = None,
+        form_token: Annotated[str, Form()] = "",
+        db: AsyncSession = Depends(get_db)):
+    organization, _user = await require_organization_records_admin(request, designator)
+    verify_csrf(request, "organization_records_admin", form_token)
+    redirect_url = organization_flight_admin_url(
+        organization.designator,
+        start_date,
+        end_date,
+    )
+    try:
+        reader = csv.DictReader(io.StringIO((await file.read()).decode("utf-8")))
+        rows = list(reader)
+        if not rows or not rows[0].get("Start Lattitude"):
+            raise ValueError("Import requires the full administrator CSV export.")
+        for row in rows:
+            db.add(Flight(
+                organization_id=organization.id,
+                sar_id=row.get("Sar Id", "").upper(),
+                remote_id=normalize_remote_id(row.get("Remote Id", "")),
+                uas=row.get("UAS", "").lower(),
+                incident=row.get("Incident", ""),
+                op_period=row.get("Op Period", ""),
+                map_id=row.get("Map Id", "").upper(),
+                start_time=datetime_from_format(row.get("Start Time", None)),
+                end_time=datetime_from_format(row.get("End Time", None)),
+                start_lat=float(row.get("Start Lattitude", 0.0)),
+                start_lng=float(row.get("Start Longitude", 0.0)),
+                hours=float(row.get("Hours", 0.0)),
+                distance_mi=float(row.get("Distance (mi)", 0.0)),
+                temp_f=float(row.get("Temp (F)", 0.0)),
+                rhum_pct=float(row.get("Rel Humidity (%)", 0.0)),
+                dewpt_f=float(row.get("Dew Pt (F)", 0.0)),
+                precip_in=float(row.get("Precip (in)", 0.0)),
+                wind_mph=float(row.get("Wind (mph)", 0.0)),
+                gusts_mph=float(row.get("Gusts (mph)", 0.0)),
+                cloudcvr_pct=float(row.get("Cloud Cover (%)", 0.0)),
+                timeofday=row.get("Time Of Day", ""),
+                archive_relpath="",
+            ))
+        await db.commit()
+        flash(request, f"Imported {len(rows)} {organization.designator} flight(s) from CSV.", "success")
+    except Exception as exc:
+        await db.rollback()
+        flash(request, f"CSV import failed: {exc}", "warning")
+    return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/{designator}/admin/flights/backfill-csv")
+async def organization_backfill_csv(
+        request: Request,
+        designator: str,
+        file: UploadFile = File(...),
+        start_date: Annotated[Optional[date], Form()] = None,
+        end_date: Annotated[Optional[date], Form()] = None,
+        form_token: Annotated[str, Form()] = "",
+        db: AsyncSession = Depends(get_db)):
+    organization, _user = await require_organization_records_admin(request, designator)
+    verify_csrf(request, "organization_records_admin", form_token)
+    redirect_url = organization_flight_admin_url(
+        organization.designator,
+        start_date,
+        end_date,
+    )
+    rows = list(csv.DictReader(io.StringIO((await file.read()).decode("utf-8"))))
+    if not rows or not rows[0].get("Start Lattitude"):
+        flash(request, "Backfill requires a non-empty full administrator CSV export.", "warning")
+        return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+
+    result = await db.execute(
+        select(Flight).where(Flight.organization_id == organization.id)
+    )
+    flights = result.scalars().all()
+    unmatched_flights = list(flights)
+    used_flight_ids = set()
+    flight_lookup = {}
+    for flight in flights:
+        key = (
+            normalize_csv_value(flight.sar_id).upper(),
+            normalize_remote_id(flight.remote_id),
+            normalize_csv_value(flight.uas).lower(),
+            normalize_match_datetime(flight.start_time),
+            normalize_match_datetime(flight.end_time),
+        )
+        flight_lookup.setdefault(key, []).append(flight)
+
+    updated_count = 0
+    missing_count = 0
+    for row in rows:
+        start_time = datetime_from_format(row.get("Start Time", None))
+        end_time = datetime_from_format(row.get("End Time", None))
+        key = (
+            normalize_csv_value(row.get("Sar Id", "")).upper(),
+            normalize_remote_id(row.get("Remote Id", "")),
+            normalize_csv_value(row.get("UAS", "")).lower(),
+            normalize_match_datetime(start_time),
+            normalize_match_datetime(end_time),
+        )
+        matches = flight_lookup.get(key, [])
+        while matches and matches[0].id in used_flight_ids:
+            matches.pop(0)
+        flight = matches.pop(0) if matches else None
+        if flight is None:
+            csv_start_lat = parse_csv_float(row.get("Start Lattitude", 0.0))
+            csv_start_lng = parse_csv_float(row.get("Start Longitude", 0.0))
+            candidates = [
+                candidate for candidate in unmatched_flights
+                if datetime_match_within_seconds(candidate.start_time, start_time)
+                and datetime_match_within_seconds(candidate.end_time, end_time)
+                and coordinates_match(
+                    candidate.start_lat,
+                    candidate.start_lng,
+                    csv_start_lat,
+                    csv_start_lng,
+                )
+            ]
+            flight = candidates[0] if len(candidates) == 1 else None
+        if flight is None:
+            missing_count += 1
+            continue
+        used_flight_ids.add(flight.id)
+        if flight in unmatched_flights:
+            unmatched_flights.remove(flight)
+        flight.incident = normalize_csv_value(row.get("Incident", ""))
+        flight.op_period = normalize_csv_value(row.get("Op Period", ""))
+        remote_id = normalize_remote_id(row.get("Remote Id", ""))
+        if remote_id:
+            flight.remote_id = remote_id
+        flight.map_id = normalize_csv_value(row.get("Map Id", "")).upper()
+        flight.start_lat = parse_csv_float(row.get("Start Lattitude", 0.0))
+        flight.start_lng = parse_csv_float(row.get("Start Longitude", 0.0))
+        flight.hours = parse_csv_float(row.get("Hours", 0.0))
+        flight.distance_mi = parse_csv_float(row.get("Distance (mi)", 0.0))
+        flight.temp_f = parse_csv_float(row.get("Temp (F)", 0.0))
+        flight.rhum_pct = parse_csv_float(row.get("Rel Humidity (%)", 0.0))
+        flight.dewpt_f = parse_csv_float(row.get("Dew Pt (F)", 0.0))
+        flight.precip_in = parse_csv_float(row.get("Precip (in)", 0.0))
+        flight.wind_mph = parse_csv_float(row.get("Wind (mph)", 0.0))
+        flight.gusts_mph = parse_csv_float(row.get("Gusts (mph)", 0.0))
+        flight.cloudcvr_pct = parse_csv_float(row.get("Cloud Cover (%)", 0.0))
+        flight.timeofday = normalize_csv_value(row.get("Time Of Day", ""), "day")
+        updated_count += 1
+    await db.commit()
+    flash(request, f"Backfilled {updated_count} {organization.designator} flight(s) from CSV.", "success")
+    if missing_count:
+        flash(request, f"Could not match {missing_count} CSV row(s).", "warning")
+    return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/{designator}/admin/flights/import-archive")
+async def organization_import_flight_archive(
+        request: Request,
+        designator: str,
+        file: UploadFile = File(...),
+        start_date: Annotated[Optional[date], Form()] = None,
+        end_date: Annotated[Optional[date], Form()] = None,
+        form_token: Annotated[str, Form()] = "",
+        db: AsyncSession = Depends(get_db)):
+    organization, _user = await require_organization_records_admin(request, designator)
+    verify_csrf(request, "organization_records_admin", form_token)
+    redirect_url = organization_flight_admin_url(
+        organization.designator,
+        start_date,
+        end_date,
+    )
+    existing_count = await db.scalar(
+        select(func.count()).select_from(Flight).where(
+            Flight.organization_id == organization.id
+        )
+    )
+    if existing_count:
+        flash(
+            request,
+            f"Archive import requires {organization.designator} to have no flights; other organizations are unaffected.",
+            "warning",
+        )
+        return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+
+    written_paths = []
+    skipped_files = []
+    try:
+        archive_bytes = io.BytesIO(await file.read())
+        with tarfile.open(fileobj=archive_bytes, mode="r:*") as tar:
+            members = sorted(
+                (
+                    member for member in tar.getmembers()
+                    if member.isfile()
+                    and member.name.endswith(".json")
+                    and "flightlog_" in os.path.basename(member.name)
+                ),
+                key=lambda member: member.name,
+            )
+            for member in members:
+                extracted = tar.extractfile(member)
+                if extracted is None:
+                    skipped_files.append(f"{member.name}: unreadable")
+                    continue
+                try:
+                    async with db.begin_nested():
+                        data = json.load(extracted)
+                        flight_inputs = await extract_flight_inputs_from_geojson(data)
+                        _flight, archive_path = await create_imported_flight_and_archive(
+                            db,
+                            data,
+                            flight_inputs,
+                            organization_id=organization.id,
+                            organization_designator=organization.designator,
+                        )
+                    written_paths.append(archive_path)
+                except Exception as exc:
+                    skipped_files.append(f"{member.name}: {exc}")
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        for archive_path in written_paths:
+            try:
+                if os.path.exists(archive_path):
+                    os.unlink(archive_path)
+            except OSError:
+                pass
+        flash(request, f"Archive import failed: {exc}", "warning")
+        return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+
+    imported_count = len(written_paths)
+    if imported_count:
+        flash(
+            request,
+            f"Imported {imported_count} {organization.designator} flight log(s) from archive.",
+            "success",
+        )
+    else:
+        flash(request, "No flight logs were imported from the archive.", "warning")
+    if skipped_files:
+        flash(
+            request,
+            f"Skipped {len(skipped_files)} file(s). First issue: {skipped_files[0]}",
+            "warning",
+        )
+    return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.get("/{designator}/streams", response_class=HTMLResponse)
+async def organization_streams(request: Request, designator: str):
+    organization, user = await require_organization_user(
+        request,
+        designator,
+        ("video_requester",),
+        redirect_to_login=True,
+    )
+    streams, requests, organization_requests, video_ice_servers = (
+        await asyncio.gather(
+            control_plane_store.list_active_video_streams(organization.id),
+            control_plane_store.list_video_stream_requests(
+                organization_id=organization.id,
+                requester_user_id=user.id,
+            ),
+            control_plane_store.list_video_stream_requests(
+                organization_id=organization.id,
+            ),
+            video_ice_server_provider.get_ice_servers(),
+        )
+    )
+    session_preflight = request.session.pop(
+        "organization_video_preflight_request", None
+    )
+    session_preflight_id = ""
+    if (
+        isinstance(session_preflight, dict)
+        and session_preflight.get("designator") == organization.designator
+    ):
+        session_preflight_id = str(session_preflight.get("request_id", ""))
+    requested_preflight_id = (
+        request.query_params.get("preflight", "").strip()
+        or session_preflight_id.strip()
+    )
+    active_preflight_request_id = next(
+        (
+            stream_request.id
+            for stream_request in requests
+            if stream_request.id == requested_preflight_id
+            and stream_request.state in {"pending", "probing"}
+        ),
+        "",
+    )
+    active_media_request = next(
+        (
+            stream_request
+            for stream_request in requests
+            if stream_request.state in {"approved", "streaming"}
+        ),
+        None,
+    )
+    active_media_request_id = (
+        active_media_request.id if active_media_request is not None else ""
+    )
+    request_in_progress_session_ids = {
+        stream_request.stream_session_id
+        for stream_request in organization_requests
+        if stream_request.state in {
+            "pending",
+            "probing",
+            "awaiting_approval",
+            "approved",
+            "streaming",
+        }
+        and stream_request.expires_at >= datetime.now(UTC)
+    }
+    stream_status = organization_stream_status(
+        streams,
+        organization_requests,
+    )
+    return templates.TemplateResponse(
+        request=request,
+        name="organization_streams.html",
+        context={
+            "request": request,
+            "enable_live_refresh": False,
+            "include_leaflet": False,
+            "include_datetime_script": False,
+            "organization": organization,
+            "organization_user": user,
+            "streams": streams,
+            "stream_requests": requests,
+            "csrf_token": csrf_token(request, "organization_streams"),
+            "logout_csrf_token": csrf_token(request, "organization_admin"),
+            "organization_page_designator": organization.designator,
+            "organization_identity_name": user.display_name,
+            "active_preflight_request_id": active_preflight_request_id,
+            "active_media_request_id": active_media_request_id,
+            "active_media_request": active_media_request,
+            "request_in_progress_session_ids": (
+                request_in_progress_session_ids
+            ),
+            "video_ice_servers": video_ice_servers,
+            "stream_status_active": stream_status["active"],
+            "stream_status_revision": stream_status["revision"],
+        },
+        headers={
+            "Cache-Control": "private, no-store",
+            "Referrer-Policy": "no-referrer",
+        },
+    )
+
+
+def organization_stream_status(streams, requests) -> dict:
+    """Return privacy-minimal lifecycle state and its next expiry boundary."""
+    stream_values = [
+        {
+            "id": stream.id,
+            "device": stream.device_name,
+            "incident": stream.incident_name,
+            "drone": stream.drone_designator,
+            "width": stream.source_width,
+            "height": stream.source_height,
+            "fps": stream.source_fps,
+            "bitrate": stream.source_bitrate_bps,
+            "codec": stream.source_codec,
+        }
+        for stream in streams
+    ]
+    request_values = [
+        {
+            "id": stream_request.id,
+            "device": stream_request.device_name,
+            "state": stream_request.state,
+            "route": stream_request.route_kind,
+            "uplink": stream_request.estimated_uplink_bps,
+            "selectedWidth": stream_request.selected_width,
+            "selectedHeight": stream_request.selected_height,
+            "selectedFps": stream_request.selected_fps,
+            "selectedBitrate": stream_request.selected_bitrate_bps,
+        }
+        for stream_request in requests
+    ]
+    encoded = json.dumps(
+        {"streams": stream_values, "requests": request_values},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    nonterminal_states = {
+        "pending", "probing", "awaiting_approval", "approved", "streaming"
+    }
+    expiry_boundaries = [stream.expires_at for stream in streams]
+    expiry_boundaries.extend(
+        item.expires_at
+        for item in requests
+        if item.state in nonterminal_states
+    )
+    return {
+        "revision": hashlib.sha256(encoded).hexdigest()[:20],
+        # Passive page refresh is driven by an advertised R2C stream, not by a
+        # request that can outlive the tablet which advertised it.  Explicit
+        # preflight/media scripts continue to own their active operations.
+        "active": bool(streams),
+        "next_expiry": min(expiry_boundaries) if expiry_boundaries else None,
+    }
+
+
+@app.post("/{designator}/streams/{session_id}/request")
+async def organization_request_stream(
+        request: Request,
+        designator: str,
+        session_id: str,
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_streams", form_token)
+    organization, user = await require_organization_user(
+        request,
+        designator,
+        ("video_requester",),
+    )
+    preflight_request_id = ""
+    try:
+        stream_request = await control_plane_store.create_video_stream_request(
+            organization_id=organization.id,
+            stream_session_id=session_id,
+            requester_user_id=user.id,
+        )
+        delivered = await r2c_hub.send_video_stream_request(
+            device_credential_id=stream_request.device_credential_id,
+            request_id=stream_request.id,
+            requester_email=stream_request.requester_email,
+            stream_session_id=stream_request.stream_session_id,
+            incident_name=stream_request.incident_name,
+            drone_designator=stream_request.drone_designator,
+            source_width=stream_request.source_width,
+            source_height=stream_request.source_height,
+            source_fps=stream_request.source_fps,
+            source_bitrate_bps=stream_request.source_bitrate_bps,
+            source_codec=stream_request.source_codec,
+            expires_at=stream_request.expires_at,
+        )
+        preflight_request_id = stream_request.id
+        request.session["organization_video_preflight_request"] = {
+            "designator": organization.designator,
+            "request_id": stream_request.id,
+        }
+        flash(
+            request,
+            (
+                "Stream request sent to the drone team. "
+                if delivered
+                else "Stream request recorded; device delivery is pending. "
+            )
+            + "Video will remain off until the pilot or visual observer "
+            "approves it.",
+            "success",
+        )
+    except ControlPlaneError as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(
+        url=(
+            f"/{organization.designator.lower()}/streams"
+            + (
+                f"?{urlencode({'preflight': preflight_request_id})}"
+                if preflight_request_id
+                else ""
+            )
+        ),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post("/{designator}/streams/requests/{request_id}/cancel")
+async def organization_cancel_stream_request(
+        request: Request,
+        designator: str,
+        request_id: str,
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_streams", form_token)
+    organization, user = await require_organization_user(
+        request,
+        designator,
+        ("video_requester",),
+    )
+    try:
+        stream_request = await control_plane_store.cancel_video_stream_request(
+            request_id=request_id,
+            organization_id=organization.id,
+            requester_user_id=user.id,
+        )
+        delivered = await r2c_hub.send_video_stream_request_cancelled(
+            device_credential_id=stream_request.device_credential_id,
+            request_id=stream_request.id,
+        )
+        flash(
+            request,
+            (
+                "Stream request cancelled and the tablet was notified."
+                if delivered
+                else "Stream request cancelled. The tablet is currently offline."
+            ),
+            "success",
+        )
+    except ControlPlaneError as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(
+        url=f"/{organization.designator.lower()}/streams",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post(
+    "/{designator}/streams/requests/{request_id}/preflight/offer"
+)
+async def organization_start_video_preflight(
+        request: Request,
+        designator: str,
+        request_id: str,
+        payload: BrowserVideoPreflightOffer):
+    verify_csrf(request, "organization_streams", payload.form_token)
+    organization, user = await require_organization_user(
+        request,
+        designator,
+        ("video_requester",),
+    )
+    try:
+        exchange = await control_plane_store.start_video_preflight(
+            request_id=request_id,
+            organization_id=organization.id,
+            requester_user_id=user.id,
+            browser_offer_sdp=payload.sdp,
+        )
+        delivered = await r2c_hub.send_video_preflight_offer(exchange)
+        return {
+            "accepted": True,
+            "delivered": delivered,
+            "state": exchange.state,
+        }
+    except ControlPlaneError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+
+
+@app.get(
+    "/{designator}/streams/requests/{request_id}/preflight/status"
+)
+async def organization_video_preflight_status(
+        request: Request,
+        designator: str,
+        request_id: str):
+    organization, user = await require_organization_user(
+        request,
+        designator,
+        ("video_requester",),
+    )
+    try:
+        exchange = (
+            await control_plane_store
+            .get_video_preflight_exchange_for_requester(
+                request_id=request_id,
+                organization_id=organization.id,
+                requester_user_id=user.id,
+            )
+        )
+        return {
+            "requestId": exchange.request_id,
+            "state": exchange.state,
+            # Long-lived tablet WebSockets can remain attached to the previous
+            # Cloud Run revision during a rolling deployment.  Normalize again
+            # at the browser boundary so an answer written by an older revision
+            # is still safe for the current browser to consume.
+            "answerSdp": (
+                normalize_video_preflight_answer(exchange.device_answer_sdp)
+                if exchange.device_answer_sdp
+                else ""
+            ),
+            "routeKind": exchange.route_kind,
+            "estimatedUplinkBps": exchange.estimated_uplink_bps,
+            "expiresAt": exchange.expires_at.isoformat(),
+        }
+    except ControlPlaneError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+
+
+@app.post("/{designator}/streams/requests/{request_id}/media/offer")
+async def organization_start_video_media(
+        request: Request, designator: str, request_id: str,
+        payload: BrowserVideoMediaOffer):
+    verify_csrf(request, "organization_streams", payload.form_token)
+    organization, user = await require_organization_user(
+        request, designator, ("video_requester",)
+    )
+    try:
+        exchange = await control_plane_store.start_video_media(
+            request_id=request_id,
+            organization_id=organization.id,
+            requester_user_id=user.id,
+            browser_offer_sdp=payload.sdp,
+        )
+        delivered = await r2c_hub.send_video_media_offer(exchange)
+        return {"accepted": True, "delivered": delivered, "state": exchange.state}
+    except ControlPlaneError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/{designator}/streams/requests/{request_id}/media/status")
+async def organization_video_media_status(
+        request: Request, designator: str, request_id: str):
+    organization, user = await require_organization_user(
+        request, designator, ("video_requester",)
+    )
+    try:
+        exchange = await control_plane_store.get_video_media_exchange_for_requester(
+            request_id=request_id,
+            organization_id=organization.id,
+            requester_user_id=user.id,
+        )
+        return {
+            "requestId": exchange.request_id,
+            "state": exchange.state,
+            "answerSdp": exchange.device_answer_sdp,
+            "expiresAt": exchange.expires_at.isoformat(),
+        }
+    except ControlPlaneError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/{designator}/streams/requests/{request_id}/media/started")
+async def organization_video_media_started(
+        request: Request, designator: str, request_id: str,
+        payload: BrowserVideoMediaState):
+    verify_csrf(request, "organization_streams", payload.form_token)
+    organization, user = await require_organization_user(
+        request, designator, ("video_requester",)
+    )
+    try:
+        result = await control_plane_store.mark_video_streaming(
+            request_id=request_id,
+            organization_id=organization.id,
+            requester_user_id=user.id,
+        )
+        return {"accepted": True, "state": result.state}
+    except ControlPlaneError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/{designator}/streams/requests/{request_id}/media/ended")
+async def organization_video_media_ended(
+        request: Request, designator: str, request_id: str,
+        payload: BrowserVideoMediaState):
+    verify_csrf(request, "organization_streams", payload.form_token)
+    organization, user = await require_organization_user(
+        request, designator, ("video_requester",)
+    )
+    try:
+        result = await control_plane_store.stop_video_stream(
+            request_id=request_id,
+            organization_id=organization.id,
+            requester_user_id=user.id,
+        )
+        await r2c_hub.send_video_stream_request_cancelled(
+            device_credential_id=result.device_credential_id,
+            request_id=result.id,
+        )
+        return {"accepted": True, "state": result.state}
+    except ControlPlaneError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/{designator}/streams/requests/{request_id}/media/metrics")
+async def organization_video_media_metrics(
+        request: Request, designator: str, request_id: str,
+        payload: BrowserVideoMediaMetrics):
+    verify_csrf(request, "organization_streams", payload.form_token)
+    organization, user = await require_organization_user(
+        request, designator, ("video_requester",)
+    )
+    try:
+        result = await control_plane_store.record_video_media_metrics(
+            request_id=request_id,
+            organization_id=organization.id,
+            requester_user_id=user.id,
+            metrics_session_id=payload.metrics_session_id,
+            audio_bytes_sent=payload.audio_bytes_sent,
+            audio_bytes_received=payload.audio_bytes_received,
+            video_bytes_received=payload.video_bytes_received,
+        )
+        return {"accepted": True, "totalBytes": result.total_media_bytes}
+    except ControlPlaneError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/{designator}/streams/requests/{request_id}/stop")
+async def organization_stop_video_stream(
+        request: Request, designator: str, request_id: str,
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_streams", form_token)
+    organization, user = await require_organization_user(
+        request, designator, ("video_requester",)
+    )
+    try:
+        result = await control_plane_store.stop_video_stream(
+            request_id=request_id,
+            organization_id=organization.id,
+            requester_user_id=user.id,
+        )
+        await r2c_hub.send_video_stream_request_cancelled(
+            device_credential_id=result.device_credential_id,
+            request_id=result.id,
+        )
+        flash(request, "Video stream stopped.", "success")
+    except ControlPlaneError as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(
+        url=f"/{organization.designator.lower()}/streams",
+        status_code=303,
+    )
+
+
+@app.post("/{designator}/settings")
+async def organization_update_settings(
+        request: Request,
+        designator: str,
+        records_visibility: Annotated[str, Form()],
+        record_retention_days: Annotated[int, Form()],
+        log_retention_days: Annotated[int, Form()],
+        notification_email: Annotated[str, Form()],
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_admin", form_token)
+    organization, user = await require_organization_user(
+        request,
+        designator,
+        ("organization_owner",),
+    )
+    try:
+        await control_plane_store.update_settings(
+            organization_id=organization.id,
+            records_visibility=records_visibility,
+            record_retention_days=record_retention_days,
+            log_retention_days=log_retention_days,
+            notification_email=notification_email,
+            actor_id=user.id,
+        )
+        flash(request, "Organization settings updated.", "success")
+    except ControlPlaneError as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(
+        url=f"/{organization.designator.lower()}/admin",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post("/{designator}/members")
+async def organization_add_member(
+        request: Request,
+        designator: str,
+        display_name: Annotated[str, Form()],
+        email: Annotated[str, Form()],
+        roles: Annotated[list[str], Form()],
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_admin", form_token)
+    organization, user = await require_organization_user(
+        request,
+        designator,
+        ("organization_owner", "user_admin"),
+    )
+    try:
+        member = await control_plane_store.add_user(
+            organization_id=organization.id,
+            display_name=display_name,
+            email=email,
+            roles=tuple(roles),
+            actor_id=user.id,
+        )
+        invitation = await control_plane_store.get_invitation(
+            organization.designator,
+            member.email,
+        )
+        if CONTROL_PLANE_SIMULATION and invitation is not None:
+            request.session["_organization_invitation_url"] = (
+                control_plane_tokens.activation_url(invitation)
+            )
+        flash(
+            request,
+            (
+                f"Added pending member {member.email}. "
+                "They can activate with the matching verified Google account."
+            ),
+            "success",
+        )
+    except (ControlPlaneError, InvalidOrganizationError, ValueError) as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(
+        url=f"/{organization.designator.lower()}/admin",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post("/{designator}/enrollments")
+async def organization_create_enrollment(
+        request: Request,
+        designator: str,
+        label: Annotated[str, Form()],
+        expires_in_hours: Annotated[int, Form()],
+        max_redemptions: Annotated[int, Form()],
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_admin", form_token)
+    organization, user = await require_organization_user(
+        request,
+        designator,
+        ("organization_owner", "user_admin"),
+    )
+    try:
+        campaign = await control_plane_store.create_enrollment_campaign(
+            organization_id=organization.id,
+            label=label,
+            created_by_user_id=user.id,
+            expires_in_hours=expires_in_hours,
+            max_redemptions=max_redemptions,
+        )
+        flash(request, f"Enrollment QR “{campaign.label}” created.", "success")
+    except ControlPlaneError as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(
+        url=f"/{organization.designator.lower()}/admin",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post("/{designator}/enrollments/{campaign_id}/revoke")
+async def organization_revoke_enrollment(
+        request: Request,
+        designator: str,
+        campaign_id: str,
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_admin", form_token)
+    organization, user = await require_organization_user(
+        request,
+        designator,
+        ("organization_owner", "user_admin"),
+    )
+    await control_plane_store.revoke_enrollment_campaign(
+        campaign_id=campaign_id,
+        organization_id=organization.id,
+        actor_id=user.id,
+    )
+    flash(request, "Enrollment QR revoked.", "success")
+    return RedirectResponse(
+        url=f"/{organization.designator.lower()}/admin",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.get(
+    "/{designator}/enrollments/{campaign_id}/qr.svg",
+    response_class=Response,
+)
+async def organization_enrollment_qr(
+        request: Request,
+        designator: str,
+        campaign_id: str):
+    organization, user = await require_organization_user(
+        request,
+        designator,
+        ("organization_owner", "user_admin"),
+    )
+    campaign = await control_plane_store.get_enrollment_campaign(campaign_id)
+    if (
+        campaign is None
+        or campaign.organization_id != organization.id
+        or not campaign.is_usable()
+    ):
+        raise HTTPException(status_code=404, detail="Active enrollment not found.")
+    import qrcode
+    from qrcode.image.svg import SvgPathImage
+
+    enrollment_url = control_plane_tokens.enrollment_url(
+        organization,
+        campaign,
+    )
+    image = qrcode.make(
+        enrollment_url,
+        image_factory=SvgPathImage,
+        box_size=8,
+        border=4,
+    )
+    return Response(
+        content=image.to_string(),
+        media_type="image/svg+xml",
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": (
+                f'inline; filename="{organization.designator}-'
+                f'enrollment-{campaign.id}.svg"'
+            ),
+        },
+    )
+
+
+@app.get("/{designator}/enroll", response_class=HTMLResponse)
+async def organization_enrollment_landing(
+        request: Request,
+        designator: str,
+        token: str):
+    if not organization_site_ready():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Device enrollment is not configured.",
+        )
+    identity_name = await organization_page_identity(request, designator)
+    enrollment_error = None
+    organization = None
+    campaign = None
+    try:
+        claims = control_plane_tokens.decode_enrollment(token)
+        if claims.designator.lower() != designator.lower():
+            raise EnrollmentTokenError("Device enrollment code is invalid.")
+        organization = await control_plane_store.get_organization(designator)
+        campaign = await control_plane_store.get_enrollment_campaign(
+            claims.campaign_id
+        )
+        if (
+            organization is None
+            or campaign is None
+            or claims.organization_id != organization.id
+            or campaign.organization_id != organization.id
+            or not campaign.is_usable()
+        ):
+            raise EnrollmentTokenError(
+                "Device enrollment code is inactive or revoked."
+            )
+    except (
+        ControlPlaneError,
+        EnrollmentTokenError,
+        InvalidOrganizationError,
+    ) as exc:
+        enrollment_error = str(exc)
+    return templates.TemplateResponse(
+        request=request,
+        name="organization_enroll.html",
+        context={
+            "request": request,
+            "enable_live_refresh": False,
+            "include_leaflet": False,
+            "include_datetime_script": False,
+            "organization": organization,
+            "campaign": campaign,
+            "enrollment_error": enrollment_error,
+            "simulation": CONTROL_PLANE_SIMULATION,
+            "device_credential_issuance_enabled": (
+                DEVICE_CREDENTIAL_ISSUANCE_ENABLED
+            ),
+            "public_configuration": (
+                public_device_configuration(
+                    organization,
+                    tracker_base_url=(
+                        CONTROL_PLANE_TRACKER_BASE_URL.rstrip("/")
+                        + "/"
+                        + organization.designator.lower()
+                    ),
+                    credential_issuance_enabled=(
+                        DEVICE_CREDENTIAL_ISSUANCE_ENABLED
+                    ),
+                )
+                if organization is not None
+                else None
+            ),
+            "organization_page_designator": designator.upper(),
+            "organization_identity_name": identity_name,
+        },
+        status_code=(
+            status.HTTP_400_BAD_REQUEST
+            if enrollment_error
+            else status.HTTP_200_OK
+        ),
+    )
+
+
+@app.post("/api/v1/device-enrollment/redeem")
+async def redeem_device_enrollment(payload: DeviceEnrollmentRedeemRequest):
+    if (
+        not organization_site_ready()
+        or not DEVICE_CREDENTIAL_ISSUANCE_ENABLED
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Device credential issuance is not enabled.",
+        )
+    try:
+        claims = control_plane_tokens.decode_enrollment(payload.token)
+        organization = await control_plane_store.get_organization(
+            claims.designator
+        )
+        campaign = await control_plane_store.get_enrollment_campaign(
+            claims.campaign_id
+        )
+        if (
+            organization is None
+            or campaign is None
+            or claims.organization_id != organization.id
+            or campaign.organization_id != organization.id
+        ):
+            raise EnrollmentTokenError("Device enrollment code is invalid.")
+        credential = await control_plane_store.issue_device_credential(
+            campaign_id=campaign.id,
+            organization_id=organization.id,
+            device_name=payload.device_name,
+            platform=payload.platform,
+        )
+    except (
+        ControlPlaneError,
+        EnrollmentTokenError,
+        InvalidOrganizationError,
+    ) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    return Response(
+        content=json.dumps(
+            {
+                "schema_version": 1,
+                "organization": {
+                    "designator": organization.designator,
+                    "name": organization.legal_name,
+                },
+                "tracker": {
+                    "base_url": (
+                        CONTROL_PLANE_TRACKER_BASE_URL.rstrip("/")
+                        + "/"
+                        + organization.designator.lower()
+                    ),
+                    "api_key": credential.token,
+                    "faa_proxy_url": (
+                        CONTROL_PLANE_TRACKER_BASE_URL + "/faa/notams"
+                    ),
+                },
+                "credential": {
+                    "id": credential.id,
+                    "expires_at": credential.expires_at.isoformat(),
+                    "revocable": True,
+                },
+            }
+        ),
+        media_type="application/json",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 # List the admin page
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_dashboard(
@@ -2858,7 +6883,11 @@ async def admin_dashboard(
         end_date: Optional[date] = None):
 
     # Base query:
-    stmt = apply_date_filter(select(Flight), start_date, end_date)
+    stmt = apply_date_filter(
+        select(Flight).where(Flight.organization_id.is_(None)),
+        start_date,
+        end_date,
+    )
     stmt = stmt.order_by(Flight.start_time.desc())
     if not start_date and not end_date:
         stmt = stmt.limit(50)
@@ -2886,8 +6915,13 @@ async def edit_flight(
         end_date: Annotated[Optional[date], Form()] = None,
         db: AsyncSession = Depends(get_db),
         user: str = Depends(check_admin)):
-    
-    result = await db.execute(select(Flight).filter(Flight.id == flight_id))
+
+    result = await db.execute(
+        select(Flight).filter(
+            Flight.id == flight_id,
+            Flight.organization_id.is_(None),
+        )
+    )
     flight = result.scalar_one_or_none()
     if not flight:
         return {"error": f"Flight {flight_id} undefined"}
@@ -2924,12 +6958,17 @@ async def delete_flight(
         db: AsyncSession = Depends(get_db),
         user: str = Depends(check_admin)):
 
-    result = await db.execute(select(Flight).filter(Flight.id == flight_id))
+    result = await db.execute(
+        select(Flight).filter(
+            Flight.id == flight_id,
+            Flight.organization_id.is_(None),
+        )
+    )
     flight = result.scalar_one_or_none()
     if not flight:
         flash(request, f"Flight {flight_id} not found", "warning")
         return RedirectResponse(url=admin_url(start_date, end_date, error="not_found"), status_code=status.HTTP_303_SEE_OTHER)
-    
+
     await db.delete(flight)
     await db.commit()
     flash(request, f"Flight {flight_id} deleted successfully", "success")
@@ -2951,7 +6990,12 @@ async def batch_update_flights(
         flash(request, "No flights were submitted.", "info")
         return RedirectResponse(url=admin_url(start_date, end_date), status_code=status.HTTP_303_SEE_OTHER)
 
-    result = await db.execute(select(Flight).where(Flight.id.in_(flight_ids)))
+    result = await db.execute(
+        select(Flight).where(
+            Flight.id.in_(flight_ids),
+            Flight.organization_id.is_(None),
+        )
+    )
     flights = {flight.id: flight for flight in result.scalars().all()}
     missing_ids = [flight_id for flight_id in flight_ids if flight_id not in flights]
 
@@ -3036,7 +7080,7 @@ async def reset_table(
         user: str = Depends(check_admin),
         db: AsyncSession = Depends(get_db)):
     
-    await db.execute(text("TRUNCATE TABLE flights RESTART IDENTITY CASCADE;"))
+    await db.execute(delete(Flight).where(Flight.organization_id.is_(None)))
     await db.commit()
     flash(request, f"flights table successfully cleaned.", "success")
     return RedirectResponse(url=admin_url(start_date, end_date), status_code=status.HTTP_303_SEE_OTHER)
@@ -3056,7 +7100,11 @@ async def export(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # Base query:
-    stmt = apply_date_filter(select(Flight), start_date, end_date)
+    stmt = apply_date_filter(
+        select(Flight).where(Flight.organization_id.is_(None)),
+        start_date,
+        end_date,
+    )
 
     stmt = stmt.order_by(Flight.start_time)
 
@@ -3188,7 +7236,9 @@ async def backfill_csv(
         flash(request, "Backfill requires the full admin CSV export.", "warning")
         return RedirectResponse(url=admin_url(start_date, end_date), status_code=status.HTTP_303_SEE_OTHER)
 
-    result = await db.execute(select(Flight))
+    result = await db.execute(
+        select(Flight).where(Flight.organization_id.is_(None))
+    )
     flights = result.scalars().all()
 
     unmatched_flights = []
@@ -3376,7 +7426,11 @@ async def list_flight_logs(
         search_path = os.path.join(search_path, datetime.now().strftime("%Y"))
         search_path = os.path.join(search_path, month)
 
-    flight_result = await db.execute(select(Flight.id, Flight.archive_relpath))
+    flight_result = await db.execute(
+        select(Flight.id, Flight.archive_relpath).where(
+            Flight.organization_id.is_(None)
+        )
+    )
     archive_lookup = {
         (archive_relpath or ""): flight_id
         for flight_id, archive_relpath in flight_result.all()
@@ -3503,7 +7557,22 @@ async def download_all_flight_logs_archive(
         os.makedirs(tmp_dir, exist_ok=True)
         temp_archive_path = os.path.join(tmp_dir, archive_filename)
         with tarfile.open(temp_archive_path, "w:gz") as tar:
-            tar.add(BASE_LOG_DIRECTORY, arcname=os.path.basename(BASE_LOG_DIRECTORY))
+            legacy_years = [
+                name
+                for name in os.listdir(BASE_LOG_DIRECTORY)
+                if re.fullmatch(r"\d{4}", name)
+                and os.path.isdir(os.path.join(BASE_LOG_DIRECTORY, name))
+            ]
+            if not legacy_years:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No legacy flight logs to archive.",
+                )
+            for year_name in sorted(legacy_years):
+                tar.add(
+                    os.path.join(BASE_LOG_DIRECTORY, year_name),
+                    arcname=year_name,
+                )
         bg_tasks.add_task(os.unlink, temp_archive_path)
         return FileResponse(temp_archive_path, media_type="application/gzip", filename=archive_filename)
 
@@ -3568,21 +7637,114 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 
-@app.websocket("/ws/r2c")
-async def r2c_websocket_endpoint(websocket: WebSocket):
+@app.websocket("/{designator}/streams/events")
+async def organization_stream_events(websocket: WebSocket, designator: str):
+    """Notify an authenticated viewer only when stream lifecycle state changes."""
+    if not organization_site_ready():
+        await websocket.close(code=1013, reason="Organization site unavailable")
+        return
+    organization = await control_plane_store.get_organization(designator)
+    user_id = websocket.session.get("organization_user_id")
+    session_designator = websocket.session.get("organization_designator")
+    user = await control_plane_store.get_user(user_id) if user_id else None
+    if (
+        organization is None
+        or user is None
+        or user.state != "active"
+        or user.organization_id != organization.id
+        or session_designator != organization.designator
+        or "video_requester" not in user.roles
+    ):
+        await websocket.close(code=1008, reason="Organization login required")
+        return
+
+    async def current_status():
+        streams, requests = await asyncio.gather(
+            control_plane_store.list_active_video_streams(organization.id),
+            control_plane_store.list_video_stream_requests(
+                organization_id=organization.id,
+                requester_user_id=user.id,
+            ),
+        )
+        return organization_stream_status(streams, requests)
+
+    await organization_stream_event_hub.connect(organization.id, websocket)
+    try:
+        status_snapshot = await current_status()
+        await websocket.send_json({
+            "type": "ready",
+            "active": status_snapshot["active"],
+            "revision": status_snapshot["revision"],
+        })
+        while True:
+            expiry = status_snapshot["next_expiry"]
+            # PostgreSQL notifications are the fast path.  Reconcile over the
+            # already-open focused-page socket as a bounded fallback so a
+            # missed notification or a Cloud Run revision handoff repairs
+            # itself without another connection or operator refresh.
+            timeout_seconds = 30.0
+            if expiry is not None:
+                expiry = expiry if expiry.tzinfo else expiry.replace(tzinfo=UTC)
+                timeout_seconds = min(
+                    timeout_seconds,
+                    max(
+                        0.25,
+                        (expiry.astimezone(UTC) - datetime.now(UTC)).total_seconds(),
+                    ),
+                )
+            try:
+                await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                current = await current_status()
+                if current["revision"] != status_snapshot["revision"]:
+                    await websocket.send_json({"type": "streams_changed"})
+                    return
+                status_snapshot = current
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await organization_stream_event_hub.disconnect(
+            organization.id, websocket
+        )
+
+
+async def serve_r2c_websocket(
+        websocket: WebSocket,
+        organization_designator: Optional[str] = None):
     token = websocket.headers.get(API_KEY_NAME)
-    if _normalize_tracker_token(token) != _normalize_tracker_token(TRACKER_API_KEY):
+    authenticated, device_credential = await authenticate_tracker_session(token)
+    organization_mismatch = (
+        organization_designator is not None
+        and (
+            device_credential is None
+            or device_credential.designator.lower()
+            != organization_designator.strip().lower()
+        )
+    )
+    if not authenticated or organization_mismatch:
         client_host = websocket.client.host if websocket.client else "unknown"
         logger.warning(
-            "r2c websocket auth rejected: client=%s user_agent=%s %s",
+            "r2c websocket auth rejected: client=%s organization=%s "
+            "user_agent=%s %s",
             client_host,
+            organization_designator or "legacy",
             websocket.headers.get("user-agent", ""),
             _describe_tracker_token_mismatch(token, TRACKER_API_KEY),
         )
-        await websocket.close(code=1008, reason="Invalid tracker token")
+        await websocket.close(
+            code=1008,
+            reason=(
+                "Organization credential mismatch"
+                if organization_mismatch
+                else "Invalid tracker token"
+            ),
+        )
         return
     client_host = websocket.client.host if websocket.client else "unknown"
-    await r2c_hub.connect(websocket)
+    await r2c_hub.connect(websocket, device_credential)
     logger.debug(
         "r2c websocket connected: client=%s user_agent=%s",
         client_host,
@@ -3629,3 +7791,57 @@ async def r2c_websocket_endpoint(websocket: WebSocket):
             conn_info.get("last_seen_age_ms", ""),
         )
         await r2c_hub.disconnect(websocket)
+
+
+@app.websocket("/{designator}/ws/r2c")
+async def organization_r2c_websocket_endpoint(
+        websocket: WebSocket,
+        designator: str):
+    """Serve organization-bound R2C clients on the managed tracker path."""
+    await serve_r2c_websocket(websocket, designator)
+
+
+@app.websocket("/ws/r2c")
+async def r2c_websocket_endpoint(websocket: WebSocket):
+    """Retain the unscoped endpoint for previously configured clients."""
+    await serve_r2c_websocket(websocket)
+
+
+@app.get("/{designator}", response_class=HTMLResponse)
+async def organization_public_dashboard(
+        designator: str,
+        request: Request,
+        response: Response,
+        db: AsyncSession = Depends(get_db),
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None):
+    """Render a public dashboard or require an organization records login."""
+    if control_plane_store is None:
+        raise HTTPException(status_code=404, detail="Organization not found.")
+    try:
+        organization = await control_plane_store.get_organization(designator)
+    except InvalidOrganizationError:
+        organization = None
+    if organization is None:
+        raise HTTPException(status_code=404, detail="Organization not found.")
+    if organization.records_visibility != "public":
+        organization, _user = await require_organization_user(
+            request,
+            organization.designator,
+            required_roles=(
+                "organization_owner",
+                "records_admin",
+                "records_viewer",
+            ),
+            redirect_to_login=True,
+            login_next=f"/{organization.designator.lower()}",
+        )
+        response.headers["Cache-Control"] = "no-store"
+    return await render_public_dashboard(
+        request=request,
+        response=response,
+        db=db,
+        start_date=start_date,
+        end_date=end_date,
+        organization=organization,
+    )

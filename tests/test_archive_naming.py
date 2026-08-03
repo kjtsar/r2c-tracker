@@ -41,6 +41,20 @@ class ArchiveNamingHelpersTest(unittest.TestCase):
         relpath = archive_relpath_for_flight(608, "1SAR118djav2_track", ts)
         self.assertEqual("2026/04/flightlog_608_20Apr2026_164528_UTC-1SAR118djav2_track.json", relpath)
 
+    def test_managed_archive_is_namespaced_by_organization(self):
+        ts = datetime(2026, 4, 20, 16, 45, 28, tzinfo=UTC)
+        relpath = archive_relpath_for_flight(
+            608,
+            "1SAR118djav2_track",
+            ts,
+            "NCSSAR",
+        )
+        self.assertEqual(
+            "organizations/ncssar/2026/04/"
+            "flightlog_608_20Apr2026_164528_UTC-1SAR118djav2_track.json",
+            relpath,
+        )
+
     def test_parse_flight_id_from_archive_filename(self):
         self.assertEqual(608, parse_flight_id_from_archive_filename("flightlog_608_20Apr2026_164528-foo.json"))
         self.assertIsNone(parse_flight_id_from_archive_filename("flightlog_20Apr2026_164528-foo.json"))

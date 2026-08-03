@@ -1,0 +1,399 @@
+{% extends "base.html" %}
+{% block title %}{{ organization.designator }} Organization Administration{% endblock %}
+{% block extra_head %}
+<style>
+  :root {
+      --org-navy: #12344d;
+      --org-teal: #0b6680;
+      --org-line: #cfdae1;
+      --org-muted: #61737f;
+  }
+  body { background: #eef3f6; }
+  .org-shell {
+      min-width: 0;
+      max-width: 1180px;
+      margin: 0 auto;
+      display: grid;
+      gap: 20px;
+  }
+  .org-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 24px;
+      padding: 26px;
+      border-radius: 14px;
+      background: linear-gradient(125deg, #12344d, #0b6680);
+      color: white;
+  }
+  .org-header h1 { margin: 0 0 8px; }
+  .org-header p { margin: 0; color: #dbeaf0; }
+  .org-header form { align-self: center; }
+  .org-header button,
+  .primary-button {
+      padding: 10px 14px;
+      border: 0;
+      border-radius: 7px;
+      background: #f3a712;
+      color: #24343e;
+      font: inherit;
+      font-weight: 800;
+      cursor: pointer;
+  }
+  .org-banner {
+      padding: 14px 17px;
+      border: 1px solid #e3c572;
+      border-radius: 10px;
+      background: #fff8df;
+      color: #684900;
+      line-height: 1.5;
+      overflow-wrap: anywhere;
+  }
+  .org-banner a { color: inherit; font-weight: 700; }
+  .org-grid {
+      min-width: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 20px;
+  }
+  .org-panel {
+      min-width: 0;
+      padding: 22px;
+      border: 1px solid var(--org-line);
+      border-radius: 12px;
+      background: white;
+      box-shadow: 0 6px 20px rgba(24, 52, 70, 0.05);
+  }
+  .org-panel.wide { grid-column: 1 / -1; }
+  .org-panel h2 { margin-top: 0; color: var(--org-navy); }
+  .org-panel p { color: var(--org-muted); line-height: 1.5; }
+  .org-form { display: grid; gap: 13px; }
+  .org-form.two-column { grid-template-columns: 1fr 1fr; }
+  .org-form label {
+      display: grid;
+      gap: 6px;
+      color: #435865;
+      font-size: 0.85rem;
+      font-weight: 750;
+  }
+  .org-form input,
+  .org-form select {
+      box-sizing: border-box;
+      width: 100%;
+      padding: 10px;
+      border: 1px solid #afbec7;
+      border-radius: 7px;
+      background: white;
+      font: inherit;
+  }
+  .span-all { grid-column: 1 / -1; }
+  .role-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+  }
+  .role-grid label { display: flex; align-items: center; gap: 7px; }
+  .role-grid input { width: auto; }
+  .org-table { width: 100%; box-shadow: none; }
+  .org-table th { background: #edf3f6; color: #526672; }
+  .org-table td, .org-table th { white-space: normal; vertical-align: top; }
+  .role-chip {
+      display: inline-block;
+      margin: 2px 3px 2px 0;
+      padding: 3px 7px;
+      border-radius: 999px;
+      background: #e5f0f3;
+      color: #24576a;
+      font-size: 0.76rem;
+  }
+  .campaign-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 14px;
+      margin-top: 18px;
+  }
+  .campaign-card {
+      padding: 15px;
+      border: 1px solid var(--org-line);
+      border-radius: 10px;
+      background: #f9fbfc;
+  }
+  .campaign-card img {
+      display: block;
+      width: 180px;
+      max-width: 100%;
+      margin: 10px auto;
+      background: white;
+  }
+  .danger-button {
+      padding: 8px 11px;
+      border: 1px solid #b54b4b;
+      border-radius: 7px;
+      background: white;
+      color: #8b2525;
+      font-weight: 750;
+      cursor: pointer;
+  }
+  .qr-download {
+      display: inline-block;
+      margin: 0 8px 10px 0;
+      color: var(--org-teal);
+      font-weight: 750;
+  }
+  @media (max-width: 760px) {
+      .org-header { flex-direction: column; }
+      .org-grid { grid-template-columns: 1fr; }
+      .org-panel.wide { grid-column: auto; }
+      .org-form.two-column { grid-template-columns: 1fr; }
+      .span-all { grid-column: auto; }
+      .role-grid { grid-template-columns: 1fr; }
+  }
+</style>
+{% endblock %}
+{% block content %}
+{% set can_manage_users = "organization_owner" in organization_user.roles or "user_admin" in organization_user.roles %}
+<div class="org-shell">
+  <header class="org-header">
+    <div>
+      <h1>{{ organization.designator }} administration</h1>
+      <p>{{ organization.legal_name }} · {{ organization.hostname }}</p>
+    </div>
+    <form method="post" action="/{{ organization.designator|lower }}/logout">
+      <input type="hidden" name="form_token" value="{{ csrf_token }}">
+      <button type="submit">Sign out {{ organization_user.display_name }}</button>
+    </form>
+  </header>
+
+  {% if simulation %}
+  <div class="org-banner" role="status">
+    <strong>Simulation mode:</strong>
+    settings, invitations, and enrollment campaigns are stored locally, but no
+    tenant infrastructure, email, payments, or app credentials are created.
+  </div>
+  {% endif %}
+  {% if invitation_url %}
+  <div class="org-banner" role="status">
+    <strong>Simulation invitation link:</strong>
+    <a href="{{ invitation_url }}">{{ invitation_url }}</a>
+  </div>
+  {% endif %}
+
+  <div class="org-grid">
+    {% if "organization_owner" in organization_user.roles or "records_admin" in organization_user.roles %}
+    <section class="org-panel wide">
+      <h2>Flight records &amp; migration</h2>
+      <p>
+        Review this organization's flight records, import a legacy archive,
+        and backfill its weather and metadata from a full administrator CSV.
+      </p>
+      <p>
+        <a class="primary-button"
+           href="/{{ organization.designator|lower }}/admin/flights">
+          Manage flight records
+        </a>
+      </p>
+    </section>
+    {% endif %}
+    <section class="org-panel">
+      <h2>Privacy &amp; retention</h2>
+      <p>
+        These are organization-owned policy settings. The platform super-admin
+        cannot view flight records or logs.
+      </p>
+      {% if "organization_owner" in organization_user.roles %}
+      <form class="org-form two-column" method="post"
+            action="/{{ organization.designator|lower }}/settings">
+        <input type="hidden" name="form_token" value="{{ csrf_token }}">
+        <label>
+          Flight-record visibility
+          <select name="records_visibility">
+            <option value="restricted" {% if organization.records_visibility == "restricted" %}selected{% endif %}>
+              Authenticated users only
+            </option>
+            <option value="public" {% if organization.records_visibility == "public" %}selected{% endif %}>
+              Public
+            </option>
+          </select>
+        </label>
+        <label>
+          Notification email
+          <input type="email" name="notification_email" required
+                 value="{{ organization.notification_email }}">
+        </label>
+        <label>
+          Flight-record retention (days)
+          <input type="number" name="record_retention_days" min="30" max="3650"
+                 value="{{ organization.record_retention_days }}" required>
+        </label>
+        <label>
+          Raw flight-log retention (days)
+          <input type="number" name="log_retention_days" min="1" max="730"
+                 value="{{ organization.log_retention_days }}" required>
+        </label>
+        <div class="span-all">
+          <button class="primary-button" type="submit">Save policies</button>
+        </div>
+      </form>
+      {% else %}
+      <p>Only the organization owner can change these policies.</p>
+      {% endif %}
+    </section>
+
+    <section class="org-panel">
+      <h2>Service status</h2>
+      <p><strong>Account:</strong> {{ organization.lifecycle_state }}</p>
+      <p><strong>Provisioning:</strong> {{ organization.provisioning_state }}</p>
+      <p><strong>Billing:</strong> {{ organization.billing_mode }}</p>
+      <p><strong>Credit balance:</strong> ${{ "%.2f"|format(organization.credit_balance) }}</p>
+      {% if organization.trial_ends_at %}
+      <p><strong>Trial ends:</strong> {{ organization.trial_ends_at.strftime("%d %b %Y") }}</p>
+      {% endif %}
+      <p>
+        Command staff with the <code>video_requester</code> role may request a
+        stream, but pilot approval is always required.
+      </p>
+      {% if "video_requester" in organization_user.roles %}
+      <p>
+        <a class="primary-button"
+           href="/{{ organization.designator|lower }}/streams">
+          View active streams
+        </a>
+      </p>
+      {% endif %}
+      {% if "organization_owner" in organization_user.roles or "billing_admin" in organization_user.roles %}
+      <h3>Recent account activity</h3>
+      {% for entry in ledger_entries %}
+      <p>
+        {{ entry.created_at.strftime("%d %b %Y") }} · {{ entry.entry_type }} ·
+        ${{ "%.2f"|format(entry.amount) }}<br>
+        {{ entry.description }}
+      </p>
+      {% else %}
+      <p>No charges or payments have been recorded.</p>
+      {% endfor %}
+      {% endif %}
+    </section>
+
+    <section class="org-panel wide">
+      <h2>Members &amp; delegated roles</h2>
+      <p>
+        A pending member can activate access by choosing Google on the
+        organization login page and using the exact email address shown here.
+        {% if not invitation_email_enabled %}
+        Outbound member email is not configured, so no invitation email is
+        sent.
+        {% endif %}
+      </p>
+      <div style="overflow-x:auto">
+        <table class="org-table">
+          <thead>
+            <tr><th>Member</th><th>Status</th><th>Roles</th></tr>
+          </thead>
+          <tbody>
+          {% for member in organization_users %}
+            <tr>
+              <td><strong>{{ member.display_name }}</strong><br>{{ member.email }}</td>
+              <td>
+                {% if member.state == "invited" %}
+                Pending activation
+                {% else %}
+                {{ member.state }}
+                {% endif %}
+              </td>
+              <td>
+                {% for role in member.roles %}
+                <span class="role-chip">{{ role }}</span>
+                {% endfor %}
+              </td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% if can_manage_users %}
+      <form class="org-form two-column" method="post"
+            action="/{{ organization.designator|lower }}/members">
+        <input type="hidden" name="form_token" value="{{ csrf_token }}">
+        <label>
+          Member name
+          <input name="display_name" maxlength="160" required>
+        </label>
+        <label>
+          Email
+          <input type="email" name="email" maxlength="320" required>
+        </label>
+        <div class="role-grid span-all">
+          {% for role in ["billing_admin", "user_admin", "records_admin", "records_viewer", "video_requester"] %}
+          <label><input type="checkbox" name="roles" value="{{ role }}"> {{ role }}</label>
+          {% endfor %}
+        </div>
+        <div class="span-all">
+          <button class="primary-button" type="submit">Add pending member</button>
+        </div>
+      </form>
+      {% endif %}
+    </section>
+
+    <section class="org-panel wide">
+      <h2>Drone-team enrollment QR codes</h2>
+      <p>
+        Each QR contains a signed organization locator and a revocable,
+        expiring enrollment capability. It never embeds FAA credentials,
+        administrator passwords, or an unrestricted tracker upload secret.
+      </p>
+      {% if can_manage_users %}
+      <form class="org-form two-column" method="post"
+            action="/{{ organization.designator|lower }}/enrollments">
+        <input type="hidden" name="form_token" value="{{ csrf_token }}">
+        <label>
+          Enrollment label
+          <input name="label" maxlength="160" required placeholder="Spring training team">
+        </label>
+        <label>
+          Valid for (hours)
+          <input type="number" name="expires_in_hours" min="1" max="720"
+                 value="168" required>
+        </label>
+        <label>
+          Maximum device enrollments
+          <input type="number" name="max_redemptions" min="1" max="500"
+                 value="25" required>
+        </label>
+        <div style="align-self:end">
+          <button class="primary-button" type="submit">Create enrollment QR</button>
+        </div>
+      </form>
+      {% endif %}
+
+      <div class="campaign-grid">
+      {% for campaign in enrollment_campaigns %}
+        <article class="campaign-card">
+          <strong>{{ campaign.label }}</strong>
+          <p>
+            {{ campaign.state }} · {{ campaign.redemption_count }}/{{ campaign.max_redemptions }}
+            uses · expires {{ campaign.expires_at.strftime("%d %b %Y %H:%M UTC") }}
+          </p>
+          {% if campaign.state == "active" %}
+          <img src="/{{ organization.designator|lower }}/enrollments/{{ campaign.id }}/qr.svg"
+               alt="Enrollment QR for {{ campaign.label }}">
+          {% if can_manage_users %}
+          <a class="qr-download"
+             href="/{{ organization.designator|lower }}/enrollments/{{ campaign.id }}/qr.svg"
+             download="{{ organization.designator }}-enrollment-{{ campaign.id }}.svg">
+            Download SVG
+          </a>
+          <form method="post"
+                action="/{{ organization.designator|lower }}/enrollments/{{ campaign.id }}/revoke">
+            <input type="hidden" name="form_token" value="{{ csrf_token }}">
+            <button class="danger-button" type="submit">Revoke QR</button>
+          </form>
+          {% endif %}
+          {% endif %}
+        </article>
+      {% else %}
+        <p>No enrollment campaigns have been created.</p>
+      {% endfor %}
+      </div>
+    </section>
+  </div>
+</div>
+{% endblock %}

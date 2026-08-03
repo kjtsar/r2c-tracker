@@ -2,7 +2,7 @@
 
 {% block content %}
   <div style="background: #ecf0f1; padding: 20px; border-radius: 8px; margin-bottom: 30px;">
-    <form action="/" method="get" style="display: flex; gap: 20px; align-items: center;">
+    <form action="{{ dashboard_url | default('/') }}" method="get" style="display: flex; gap: 20px; align-items: center;">
       <div>
         <label><strong>From:</strong></label>
         <input type="date" name="start_date" value="{{ start_date }}">
@@ -14,7 +14,7 @@
       <button type="submit" style="background: #27ae60; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer;">
         Update Report
       </button>
-      <a href="/" style="text-decoration: none; color: #7f8c8d; font-size: 0.9em;">Clear Filters</a>
+      <a href="{{ dashboard_url | default('/') }}" style="text-decoration: none; color: #7f8c8d; font-size: 0.9em;">Clear Filters</a>
     </form>
   </div>
 
@@ -23,6 +23,9 @@
 </head>
 <body>
   <h3>
+    {% if organization_legal_name %}
+      {{ organization_legal_name }}<br>
+    {% endif %}
     {% if start_date or end_date %}
       Results for {{ start_date or 'Beginning' }} to {{ end_date or 'Today' }}
     {% else %}

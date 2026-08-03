@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}Tracker Admin{% endblock %}
+{% block title %}{{ admin_title | default("Tracker Admin") }}{% endblock %}
 
 {% block extra_head %}
 <style>
@@ -159,12 +159,12 @@
 
 {% block content %}
   <div class="admin-page">
-    <h1>Administrative Flight Log Editor</h1>
-    <a href="/">← Back to Public Dashboard</a>
+    <h1>{{ admin_heading | default("Administrative Flight Log Editor") }}</h1>
+    <a href="{{ dashboard_url | default('/') }}">← Back to Public Dashboard</a>
     <hr>
 
     <div style="background: #ecf0f1; padding: 20px; border-radius: 8px; margin-bottom: 30px;">
-      <form action="/admin" method="get" style="display: flex; gap: 20px; align-items: center;">
+      <form action="{{ admin_base_url | default('/admin') }}" method="get" style="display: flex; gap: 20px; align-items: center;">
         <div>
           <label><strong>From:</strong></label>
           <input type="date" name="start_date" value="{{ start_date }}">
@@ -176,11 +176,12 @@
         <button type="submit" style="background: #27ae60; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer;">
           Update Report
         </button>
-        <a href="/admin" style="text-decoration: none; color: #7f8c8d; font-size: 0.9em;">Clear Filters</a>
+        <a href="{{ admin_base_url | default('/admin') }}" style="text-decoration: none; color: #7f8c8d; font-size: 0.9em;">Clear Filters</a>
       </form>
     </div>
 
-    <form id="admin-batch-form" action="/admin/batch" method="post">
+    <form id="admin-batch-form" action="{{ batch_url | default('/admin/batch') }}" method="post">
+      {% if form_token %}<input type="hidden" name="form_token" value="{{ form_token }}">{% endif %}
       <input type="hidden" name="start_date" value="{{ start_date }}">
       <input type="hidden" name="end_date" value="{{ end_date }}">
       <div class="table-scroll-shell" id="table-scroll-shell">
@@ -248,8 +249,12 @@
 
     <div style="margin-top: 50px; text-align: center; border-top: 1px solid #ddd; padding-top: 20px;">
       <p><a href="{{ export_url }}" style="color: #7f8c8d; text-decoration: none; font-size: 0.9em;">Export as CSV</a></p>
+      {% if archive_export_url %}
+      <p><a href="{{ archive_export_url }}" style="color: #7f8c8d; text-decoration: none; font-size: 0.9em;">Download Flight Log Archive</a></p>
+      {% endif %}
       <p>
-        <form action="/admin/import" method="post" enctype="multipart/form-data">
+        <form action="{{ import_url | default('/admin/import') }}" method="post" enctype="multipart/form-data">
+          {% if form_token %}<input type="hidden" name="form_token" value="{{ form_token }}">{% endif %}
           <input type="hidden" name="start_date" value="{{ start_date }}">
           <input type="hidden" name="end_date" value="{{ end_date }}">
           <input type="file" name="file" accept=".csv">
@@ -257,7 +262,8 @@
         </form>
       </p>
       <p>
-        <form action="/admin/import-archive" method="post" enctype="multipart/form-data">
+        <form action="{{ archive_import_url | default('/admin/import-archive') }}" method="post" enctype="multipart/form-data">
+          {% if form_token %}<input type="hidden" name="form_token" value="{{ form_token }}">{% endif %}
           <input type="hidden" name="start_date" value="{{ start_date }}">
           <input type="hidden" name="end_date" value="{{ end_date }}">
           <input type="file" name="file" accept=".tgz,.tar.gz,.tar">
@@ -265,7 +271,8 @@
         </form>
       </p>
       <p>
-        <form action="/admin/backfill-csv" method="post" enctype="multipart/form-data">
+        <form action="{{ backfill_url | default('/admin/backfill-csv') }}" method="post" enctype="multipart/form-data">
+          {% if form_token %}<input type="hidden" name="form_token" value="{{ form_token }}">{% endif %}
           <input type="hidden" name="start_date" value="{{ start_date }}">
           <input type="hidden" name="end_date" value="{{ end_date }}">
           <input type="file" name="file" accept=".csv">
@@ -273,11 +280,12 @@
         </form>
       </p>
       <p style="margin-bottom: 50px;">
-        <form action="/admin/delete" method="post" onsubmit="return confirm('Remove All Flights?');">
+        <form action="{{ delete_all_url | default('/admin/delete') }}" method="post" onsubmit="return confirm('Remove all flights for this scope?');">
+          {% if form_token %}<input type="hidden" name="form_token" value="{{ form_token }}">{% endif %}
           <input type="hidden" name="start_date" value="{{ start_date }}">
           <input type="hidden" name="end_date" value="{{ end_date }}">
           <button type="submit" style="background:#c0392b; color:white; border: black; padding:5px; cursor:pointer; border-radius:5px;">
-            Delete Entire Database (do you have a recent export/archive to restore from?)
+            {{ delete_all_label | default("Delete Entire Database (do you have a recent export/archive to restore from?)") }}
           </button>
         </form>
       </p>

@@ -16,6 +16,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the application code
 COPY main.py .
+COPY faa_proxy.py .
+COPY control_plane.py .
+COPY enrollment.py .
+COPY platform_admin.py .
+COPY platform_admin_identity.py .
+COPY platform_admin_auth.py .
+COPY turn_credentials.py .
 COPY templates/ ./templates/
 COPY static/ ./static/
 
@@ -24,5 +31,3 @@ EXPOSE 8080
 # Run the web service on container startup
 # Cloud Run provides the PORT environment variable
 CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}
-
-

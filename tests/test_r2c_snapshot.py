@@ -218,8 +218,39 @@ class SnapshotTemplateTest(unittest.TestCase):
         self.assertIn("app-version", template)
         self.assertIn("unknown version", template)
         self.assertIn("status === 'IDLE'", template)
-        self.assertIn("document.visibilityState === 'hidden'", template)
-        self.assertIn("document.addEventListener('visibilitychange', syncAutoReloadWithVisibility);", template)
+        self.assertIn("document.visibilityState === 'visible'", template)
+        self.assertIn("document.hasFocus()", template)
+        self.assertIn("window.addEventListener('blur', handleBlur);", template)
+        self.assertIn("window.addEventListener('focus', handleFocus);", template)
+        self.assertIn("windowFocused = true", template)
+        self.assertIn("document.addEventListener('visibilitychange', syncPageActivity);", template)
+        self.assertIn("stopAgeRefresh", template)
+        self.assertIn("hasActiveInstances", template)
+        self.assertIn("if (!hasActiveInstances)", template)
+
+    def test_snapshot_counts_only_online_zones_as_active(self):
+        now_ms = 1_710_000_000_000
+        zones = [
+            types.SimpleNamespace(
+                map_id="map-a", reported_map_id="map-a",
+                coordination_mode="map", zone_id="online", guid="guid-online",
+                name="Online", lat=40.0, lng=-122.0, caltopo_rtt_ms=10,
+                last_seen_ms=now_ms, online=True, connection_state="online",
+                app_version="", app_version_code=0,
+            ),
+            types.SimpleNamespace(
+                map_id="map-a", reported_map_id="map-a",
+                coordination_mode="map", zone_id="idle", guid="guid-idle",
+                name="Idle", lat=40.0, lng=-122.0, caltopo_rtt_ms=10,
+                last_seen_ms=now_ms, online=False, connection_state="idle",
+                app_version="", app_version_code=0,
+            ),
+        ]
+
+        snapshot = build_r2c_snapshot(zones, [], now_ms)
+
+        self.assertEqual(1, snapshot["active_zone_count"])
+        self.assertEqual(1, snapshot["maps"][0]["active_zone_count"])
 
     def test_dashboard_and_r2c_routes_disable_shared_live_refresh_websocket(self):
         main_path = pathlib.Path(__file__).resolve().parents[1] / "main.py"

@@ -29,42 +29,94 @@ R2C_RECOMMENDED_APP_VERSION_CODE="$1"
 R2C_UPDATE_URL="${2:-}"
 export R2C_RECOMMENDED_APP_VERSION_CODE
 export R2C_UPDATE_URL
+R2C_RECOMMENDED_IOS_APP_BUILD_NUMBER="${R2C_RECOMMENDED_IOS_APP_BUILD_NUMBER:-0}"
+R2C_IOS_UPDATE_URL="${R2C_IOS_UPDATE_URL:-}"
+export R2C_RECOMMENDED_IOS_APP_BUILD_NUMBER
+export R2C_IOS_UPDATE_URL
 
-: "${DATABASE_URL:?DATABASE_URL must be set in the environment}"
-: "${TRACKER_ADMIN_PASS:?TRACKER_ADMIN_PASS must be set in the environment}"
-: "${TRACKER_API_KEY:?TRACKER_API_KEY must be set in the environment}"
+DATABASE_URL_SECRET_NAME="${DATABASE_URL_SECRET_NAME:-}"
+TRACKER_ADMIN_PASS_SECRET_NAME="${TRACKER_ADMIN_PASS_SECRET_NAME:-}"
+TRACKER_API_KEY_SECRET_NAME="${TRACKER_API_KEY_SECRET_NAME:-}"
+CONTROL_PLANE_DATABASE_URL_SECRET_NAME="${CONTROL_PLANE_DATABASE_URL_SECRET_NAME:-}"
+CONTROL_PLANE_SIGNING_KEY_SECRET_NAME="${CONTROL_PLANE_SIGNING_KEY_SECRET_NAME:-}"
+GOOGLE_OAUTH_CLIENT_ID_SECRET_NAME="${GOOGLE_OAUTH_CLIENT_ID_SECRET_NAME:-}"
+GOOGLE_OAUTH_CLIENT_SECRET_SECRET_NAME="${GOOGLE_OAUTH_CLIENT_SECRET_SECRET_NAME:-}"
+PLATFORM_EMAIL_SMTP_PASSWORD_SECRET_NAME="${PLATFORM_EMAIL_SMTP_PASSWORD_SECRET_NAME:-}"
+CLOUDFLARE_TURN_KEY_ID_SECRET_NAME="${CLOUDFLARE_TURN_KEY_ID_SECRET_NAME:-}"
+CLOUDFLARE_TURN_API_TOKEN_SECRET_NAME="${CLOUDFLARE_TURN_API_TOKEN_SECRET_NAME:-}"
+export DATABASE_URL_SECRET_NAME
+export TRACKER_ADMIN_PASS_SECRET_NAME
+export TRACKER_API_KEY_SECRET_NAME
+export CONTROL_PLANE_DATABASE_URL_SECRET_NAME
+export CONTROL_PLANE_SIGNING_KEY_SECRET_NAME
+export GOOGLE_OAUTH_CLIENT_ID_SECRET_NAME
+export GOOGLE_OAUTH_CLIENT_SECRET_SECRET_NAME
+export PLATFORM_EMAIL_SMTP_PASSWORD_SECRET_NAME
+export CLOUDFLARE_TURN_KEY_ID_SECRET_NAME
+export CLOUDFLARE_TURN_API_TOKEN_SECRET_NAME
+
+if [ -z "${DATABASE_URL:-}" ] && [ -z "${DATABASE_URL_SECRET_NAME}" ]; then
+  echo "DATABASE_URL or DATABASE_URL_SECRET_NAME must be set." >&2
+  exit 1
+fi
+if [ -z "${TRACKER_ADMIN_PASS:-}" ] && [ -z "${TRACKER_ADMIN_PASS_SECRET_NAME}" ]; then
+  echo "TRACKER_ADMIN_PASS or TRACKER_ADMIN_PASS_SECRET_NAME must be set." >&2
+  exit 1
+fi
+if [ -z "${TRACKER_API_KEY:-}" ] && [ -z "${TRACKER_API_KEY_SECRET_NAME}" ]; then
+  echo "TRACKER_API_KEY or TRACKER_API_KEY_SECRET_NAME must be set." >&2
+  exit 1
+fi
+if [ -n "${GOOGLE_OAUTH_CLIENT_ID_SECRET_NAME}" ] \
+  || [ -n "${GOOGLE_OAUTH_CLIENT_SECRET_SECRET_NAME}" ]; then
+  if [ -z "${GOOGLE_OAUTH_CLIENT_ID_SECRET_NAME}" ] \
+    || [ -z "${GOOGLE_OAUTH_CLIENT_SECRET_SECRET_NAME}" ]; then
+    echo "Both Google OAuth Secret Manager names must be configured together." >&2
+    exit 1
+  fi
+fi
+if [ -n "${CLOUDFLARE_TURN_KEY_ID_SECRET_NAME}" ] \
+  || [ -n "${CLOUDFLARE_TURN_API_TOKEN_SECRET_NAME}" ]; then
+  if [ -z "${CLOUDFLARE_TURN_KEY_ID_SECRET_NAME}" ] \
+    || [ -z "${CLOUDFLARE_TURN_API_TOKEN_SECRET_NAME}" ]; then
+    echo "Both Cloudflare TURN Secret Manager names must be configured together." >&2
+    exit 1
+  fi
+fi
 
 validate_database_url() {
   python3 - <<'PY'
 import os
 import sys
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 url = os.environ["DATABASE_URL"]
 try:
     parts = urlsplit(url)
 except ValueError as exc:
     sys.stderr.write(f"DATABASE_URL is not parseable: {exc}\n")
-    sys.stderr.write("Current value starts with: " + url[:80] + "\n")
     sys.stderr.write(
         "This usually means the password contains reserved URL characters like @, :, /, ?, #, [, ], or % "
         "and needs to be percent-encoded.\n"
     )
     sys.exit(1)
 
+query = parse_qs(parts.query)
+socket_hosts = query.get("host", [])
+has_cloud_sql_socket = any(host.startswith("/cloudsql/") for host in socket_hosts)
+
 errors = []
 if not parts.scheme:
     errors.append("missing URL scheme")
-if not parts.hostname:
+if not parts.hostname and not has_cloud_sql_socket:
     errors.append("missing hostname")
-if parts.port is None:
+if parts.hostname and parts.port is None:
     errors.append("missing numeric port")
 if not parts.path or parts.path == "/":
     errors.append("missing database name in path")
 
 if errors:
     sys.stderr.write("DATABASE_URL does not look valid: " + ", ".join(errors) + ".\n")
-    sys.stderr.write("Current value starts with: " + url[:80] + "\n")
     sys.stderr.write(
         "If your DB password contains reserved URL characters like @, :, /, ?, #, [, ], or %, "
         "it must be percent-encoded inside DATABASE_URL.\n"
@@ -73,11 +125,21 @@ if errors:
 PY
 }
 
-validate_database_url
+if [ -n "${DATABASE_URL:-}" ]; then
+  validate_database_url
+fi
 
 REGION="${REGION:-us-west1}"
 SERVICE_NAME="${SERVICE_NAME:-r2c-tracker}"
 SECRET_KEY_SECRET_NAME="${SECRET_KEY_SECRET_NAME:-r2c-tracker-secret-key}"
+FAA_CLIENT_ID_SECRET_NAME="${FAA_CLIENT_ID_SECRET_NAME:-r2c-faa-notam-client-id}"
+FAA_CLIENT_SECRET_SECRET_NAME="${FAA_CLIENT_SECRET_SECRET_NAME:-r2c-faa-notam-client-secret}"
+PLATFORM_ADMIN_IDENTITY_SECRET_NAME="r2c-super-admin-identity"
+CLOUD_SQL_INSTANCE="${CLOUD_SQL_INSTANCE:-}"
+FLIGHTLOGS_BUCKET="${FLIGHTLOGS_BUCKET:-}"
+FLIGHTLOGS_VOLUME_NAME="${FLIGHTLOGS_VOLUME_NAME:-flightlogs}"
+CLOUD_RUN_MEMORY="${CLOUD_RUN_MEMORY:-}"
+ALLOW_UNAUTHENTICATED="${ALLOW_UNAUTHENTICATED:-0}"
 TRACKER_VERSION="${TRACKER_VERSION:-$(git describe --tags --always 2>/dev/null || echo unknown)}"
 TRACKER_RECENT_VERSIONS="${TRACKER_RECENT_VERSIONS:-$(python3 - <<'PY'
 import json
@@ -113,6 +175,7 @@ echo "Using gcloud account: ${GCLOUD_ACCOUNT}"
 echo "Using gcloud project: ${GCLOUD_PROJECT}"
 echo "Resolved tracker version: ${TRACKER_VERSION}"
 echo "Recommended RID2Caltopo versionCode: ${R2C_RECOMMENDED_APP_VERSION_CODE}"
+echo "Recommended RID2Caltopo iOS build: ${R2C_RECOMMENDED_IOS_APP_BUILD_NUMBER}"
 if [ -n "${R2C_UPDATE_URL}" ]; then
   echo "RID2Caltopo update URL configured."
 else
@@ -123,6 +186,33 @@ run_gcloud() {
   CLOUDSDK_CORE_DISABLE_PROMPTS=1 gcloud --quiet "$@"
 }
 
+secret_has_enabled_version() {
+  secret_name="$1"
+  [ -n "$(run_gcloud secrets versions list "${secret_name}" \
+    --project "${GCLOUD_PROJECT}" \
+    --filter='state=ENABLED' \
+    --format='value(name)' \
+    --limit=1)" ]
+}
+
+require_existing_secret() {
+  secret_name="$1"
+  env_name="$2"
+  echo "Checking Secret Manager secret ${secret_name} for ${env_name}..."
+  if ! run_gcloud secrets describe "${secret_name}" --project "${GCLOUD_PROJECT}" >/dev/null 2>&1; then
+    echo "Required Secret Manager secret ${secret_name} does not exist." >&2
+    exit 1
+  fi
+  if ! secret_has_enabled_version "${secret_name}"; then
+    echo "Required Secret Manager secret ${secret_name} has no enabled version." >&2
+    exit 1
+  fi
+  run_gcloud secrets add-iam-policy-binding "${secret_name}" \
+    --project "${GCLOUD_PROJECT}" \
+    --member "serviceAccount:${RUNTIME_SERVICE_ACCOUNT}" \
+    --role "roles/secretmanager.secretAccessor"
+}
+
 PROJECT_NUMBER="$(run_gcloud projects describe "${GCLOUD_PROJECT}" --format='value(projectNumber)')"
 RUNTIME_SERVICE_ACCOUNT="${RUNTIME_SERVICE_ACCOUNT:-${PROJECT_NUMBER}-compute@developer.gserviceaccount.com}"
 ENV_VARS_FILE="$(mktemp)"
@@ -130,9 +220,50 @@ trap 'rm -f "${ENV_VARS_FILE}"' EXIT
 
 echo "Using Cloud Run runtime service account: ${RUNTIME_SERVICE_ACCOUNT}"
 
+if [ -n "${DATABASE_URL_SECRET_NAME}" ]; then
+  require_existing_secret "${DATABASE_URL_SECRET_NAME}" "DATABASE_URL"
+fi
+if [ -n "${TRACKER_ADMIN_PASS_SECRET_NAME}" ]; then
+  require_existing_secret "${TRACKER_ADMIN_PASS_SECRET_NAME}" "TRACKER_ADMIN_PASS"
+fi
+if [ -n "${TRACKER_API_KEY_SECRET_NAME}" ]; then
+  require_existing_secret "${TRACKER_API_KEY_SECRET_NAME}" "TRACKER_API_KEY"
+fi
+if [ -n "${CONTROL_PLANE_DATABASE_URL_SECRET_NAME}" ]; then
+  require_existing_secret "${CONTROL_PLANE_DATABASE_URL_SECRET_NAME}" "CONTROL_PLANE_DATABASE_URL"
+fi
+if [ -n "${GOOGLE_OAUTH_CLIENT_ID_SECRET_NAME}" ]; then
+  require_existing_secret "${GOOGLE_OAUTH_CLIENT_ID_SECRET_NAME}" \
+    "GOOGLE_OAUTH_CLIENT_ID"
+  require_existing_secret "${GOOGLE_OAUTH_CLIENT_SECRET_SECRET_NAME}" \
+    "GOOGLE_OAUTH_CLIENT_SECRET"
+fi
+if [ -n "${PLATFORM_EMAIL_SMTP_PASSWORD_SECRET_NAME}" ]; then
+  require_existing_secret "${PLATFORM_EMAIL_SMTP_PASSWORD_SECRET_NAME}" \
+    "PLATFORM_EMAIL_SMTP_PASSWORD"
+fi
+if [ -n "${CLOUDFLARE_TURN_KEY_ID_SECRET_NAME}" ]; then
+  require_existing_secret "${CLOUDFLARE_TURN_KEY_ID_SECRET_NAME}" \
+    "CLOUDFLARE_TURN_KEY_ID"
+  require_existing_secret "${CLOUDFLARE_TURN_API_TOKEN_SECRET_NAME}" \
+    "CLOUDFLARE_TURN_API_TOKEN"
+fi
+if [ -n "${CONTROL_PLANE_SIGNING_KEY_SECRET_NAME}" ]; then
+  require_existing_secret "${CONTROL_PLANE_SIGNING_KEY_SECRET_NAME}" "CONTROL_PLANE_SIGNING_KEY"
+fi
+if [ -n "${CONTROL_PLANE_DATABASE_URL_SECRET_NAME}" ]; then
+  require_existing_secret "${PLATFORM_ADMIN_IDENTITY_SECRET_NAME}" \
+    "the dynamic platform administrator identity"
+fi
+
 echo "Checking Secret Manager secret ${SECRET_KEY_SECRET_NAME}..."
 if run_gcloud secrets describe "${SECRET_KEY_SECRET_NAME}" --project "${GCLOUD_PROJECT}" >/dev/null 2>&1; then
   echo "Reusing existing Secret Manager secret ${SECRET_KEY_SECRET_NAME}."
+  if ! secret_has_enabled_version "${SECRET_KEY_SECRET_NAME}"; then
+    BOOTSTRAP_SECRET_KEY="${SECRET_KEY:-$(python3 -c 'import os; print(os.urandom(32).hex())')}"
+    echo "Adding initial secret version to ${SECRET_KEY_SECRET_NAME}."
+    printf %s "${BOOTSTRAP_SECRET_KEY}" | run_gcloud secrets versions add "${SECRET_KEY_SECRET_NAME}" --project "${GCLOUD_PROJECT}" --data-file=-
+  fi
 else
   BOOTSTRAP_SECRET_KEY="${SECRET_KEY:-$(python3 -c 'import os; print(os.urandom(32).hex())')}"
   echo "Creating Secret Manager secret ${SECRET_KEY_SECRET_NAME}."
@@ -148,18 +279,105 @@ run_gcloud secrets add-iam-policy-binding "${SECRET_KEY_SECRET_NAME}" \
   --member "serviceAccount:${RUNTIME_SERVICE_ACCOUNT}" \
   --role "roles/secretmanager.secretAccessor"
 
+echo "Checking Secret Manager secret ${FAA_CLIENT_ID_SECRET_NAME}..."
+if run_gcloud secrets describe "${FAA_CLIENT_ID_SECRET_NAME}" --project "${GCLOUD_PROJECT}" >/dev/null 2>&1; then
+  echo "Reusing existing Secret Manager secret ${FAA_CLIENT_ID_SECRET_NAME}."
+  if ! secret_has_enabled_version "${FAA_CLIENT_ID_SECRET_NAME}"; then
+    if [ -z "${FAA_NOTAM_CLIENT_ID:-}" ]; then
+      echo "${FAA_CLIENT_ID_SECRET_NAME} has no enabled version. Add one in Secret Manager or set FAA_NOTAM_CLIENT_ID." >&2
+      exit 1
+    fi
+    printf %s "${FAA_NOTAM_CLIENT_ID}" | run_gcloud secrets versions add "${FAA_CLIENT_ID_SECRET_NAME}" --project "${GCLOUD_PROJECT}" --data-file=-
+  fi
+else
+  if [ -z "${FAA_NOTAM_CLIENT_ID:-}" ]; then
+    echo "FAA_NOTAM_CLIENT_ID must be set when creating ${FAA_CLIENT_ID_SECRET_NAME}." >&2
+    exit 1
+  fi
+  run_gcloud services enable secretmanager.googleapis.com --project "${GCLOUD_PROJECT}"
+  run_gcloud secrets create "${FAA_CLIENT_ID_SECRET_NAME}" --project "${GCLOUD_PROJECT}" --replication-policy="automatic"
+  printf %s "${FAA_NOTAM_CLIENT_ID}" | run_gcloud secrets versions add "${FAA_CLIENT_ID_SECRET_NAME}" --project "${GCLOUD_PROJECT}" --data-file=-
+fi
+run_gcloud secrets add-iam-policy-binding "${FAA_CLIENT_ID_SECRET_NAME}" \
+  --project "${GCLOUD_PROJECT}" \
+  --member "serviceAccount:${RUNTIME_SERVICE_ACCOUNT}" \
+  --role "roles/secretmanager.secretAccessor"
+
+echo "Checking Secret Manager secret ${FAA_CLIENT_SECRET_SECRET_NAME}..."
+if run_gcloud secrets describe "${FAA_CLIENT_SECRET_SECRET_NAME}" --project "${GCLOUD_PROJECT}" >/dev/null 2>&1; then
+  echo "Reusing existing Secret Manager secret ${FAA_CLIENT_SECRET_SECRET_NAME}."
+  if ! secret_has_enabled_version "${FAA_CLIENT_SECRET_SECRET_NAME}"; then
+    if [ -z "${FAA_NOTAM_CLIENT_SECRET:-}" ]; then
+      echo "${FAA_CLIENT_SECRET_SECRET_NAME} has no enabled version. Add one in Secret Manager or set FAA_NOTAM_CLIENT_SECRET." >&2
+      exit 1
+    fi
+    printf %s "${FAA_NOTAM_CLIENT_SECRET}" | run_gcloud secrets versions add "${FAA_CLIENT_SECRET_SECRET_NAME}" --project "${GCLOUD_PROJECT}" --data-file=-
+  fi
+else
+  if [ -z "${FAA_NOTAM_CLIENT_SECRET:-}" ]; then
+    echo "FAA_NOTAM_CLIENT_SECRET must be set when creating ${FAA_CLIENT_SECRET_SECRET_NAME}." >&2
+    exit 1
+  fi
+  run_gcloud services enable secretmanager.googleapis.com --project "${GCLOUD_PROJECT}"
+  run_gcloud secrets create "${FAA_CLIENT_SECRET_SECRET_NAME}" --project "${GCLOUD_PROJECT}" --replication-policy="automatic"
+  printf %s "${FAA_NOTAM_CLIENT_SECRET}" | run_gcloud secrets versions add "${FAA_CLIENT_SECRET_SECRET_NAME}" --project "${GCLOUD_PROJECT}" --data-file=-
+fi
+run_gcloud secrets add-iam-policy-binding "${FAA_CLIENT_SECRET_SECRET_NAME}" \
+  --project "${GCLOUD_PROJECT}" \
+  --member "serviceAccount:${RUNTIME_SERVICE_ACCOUNT}" \
+  --role "roles/secretmanager.secretAccessor"
+
 python3 - <<'PY' > "${ENV_VARS_FILE}"
 import json
 import os
 
 print(json.dumps({
-    "DATABASE_URL": os.environ["DATABASE_URL"],
-    "TRACKER_ADMIN_PASS": os.environ["TRACKER_ADMIN_PASS"],
-    "TRACKER_API_KEY": os.environ["TRACKER_API_KEY"],
     "TRACKER_VERSION": os.environ["TRACKER_VERSION"],
     "TRACKER_RECENT_VERSIONS": os.environ["TRACKER_RECENT_VERSIONS"],
     "R2C_RECOMMENDED_APP_VERSION_CODE": os.environ["R2C_RECOMMENDED_APP_VERSION_CODE"],
     "R2C_UPDATE_URL": os.environ["R2C_UPDATE_URL"],
+    "R2C_RECOMMENDED_IOS_APP_BUILD_NUMBER": os.environ["R2C_RECOMMENDED_IOS_APP_BUILD_NUMBER"],
+    "R2C_IOS_UPDATE_URL": os.environ["R2C_IOS_UPDATE_URL"],
+    "FAA_NOTAM_API_BASE_URL": os.environ.get("FAA_NOTAM_API_BASE_URL", "https://api-nms.aim.faa.gov/nmsapi"),
+    "FAA_NOTAM_TOKEN_URL": os.environ.get("FAA_NOTAM_TOKEN_URL", "https://api-nms.aim.faa.gov/v1/auth/token"),
+    "FAA_PROXY_CACHE_TTL_SEC": os.environ.get("FAA_PROXY_CACHE_TTL_SEC", "90"),
+    "FAA_PROXY_CACHE_MAX_ENTRIES": os.environ.get("FAA_PROXY_CACHE_MAX_ENTRIES", "512"),
+    "FAA_PROXY_CACHE_MAX_BYTES": os.environ.get("FAA_PROXY_CACHE_MAX_BYTES", "67108864"),
+    "FAA_PROXY_CACHE_MAX_ITEM_BYTES": os.environ.get("FAA_PROXY_CACHE_MAX_ITEM_BYTES", "8388608"),
+    "FAA_PROXY_CACHE_GRID_DEGREES": os.environ.get("FAA_PROXY_CACHE_GRID_DEGREES", "0.002"),
+    "FAA_PROXY_MAX_CONCURRENT_UPSTREAM": os.environ.get("FAA_PROXY_MAX_CONCURRENT_UPSTREAM", "8"),
+    "PLATFORM_BILLING_SOURCE": os.environ.get("PLATFORM_BILLING_SOURCE", "illustrative"),
+    "PLATFORM_BILLING_PROJECT": os.environ.get("PLATFORM_BILLING_PROJECT", ""),
+    "PLATFORM_BILLING_DATASET": os.environ.get("PLATFORM_BILLING_DATASET", ""),
+    "PLATFORM_BILLING_INCLUDED_PROJECTS": os.environ.get("PLATFORM_BILLING_INCLUDED_PROJECTS", ""),
+    "CONTROL_PLANE_MODE": os.environ.get("CONTROL_PLANE_MODE", "simulation"),
+    "CONTROL_PLANE_PUBLIC_URL": os.environ.get("CONTROL_PLANE_PUBLIC_URL", ""),
+    "CONTROL_PLANE_TRACKER_BASE_URL": os.environ.get("CONTROL_PLANE_TRACKER_BASE_URL", ""),
+    "DEVICE_CREDENTIAL_ISSUANCE_ENABLED": os.environ.get("DEVICE_CREDENTIAL_ISSUANCE_ENABLED", "false"),
+    "SESSION_COOKIE_HTTPS_ONLY": os.environ.get("SESSION_COOKIE_HTTPS_ONLY", "false"),
+    "VIDEO_ICE_SERVERS_JSON": os.environ.get("VIDEO_ICE_SERVERS_JSON", "[]"),
+    "CLOUDFLARE_TURN_CREDENTIAL_TTL_SECONDS": os.environ.get(
+        "CLOUDFLARE_TURN_CREDENTIAL_TTL_SECONDS", "3600"
+    ),
+    "PLATFORM_EMAIL_SMTP_HOST": os.environ.get("PLATFORM_EMAIL_SMTP_HOST", ""),
+    "PLATFORM_EMAIL_SMTP_PORT": os.environ.get("PLATFORM_EMAIL_SMTP_PORT", "587"),
+    "PLATFORM_EMAIL_SMTP_USER": os.environ.get("PLATFORM_EMAIL_SMTP_USER", ""),
+    "PLATFORM_EMAIL_FROM": os.environ.get("PLATFORM_EMAIL_FROM", ""),
+    **({
+        "DATABASE_URL": os.environ["DATABASE_URL"]
+    } if os.environ.get("DATABASE_URL") and not os.environ.get("DATABASE_URL_SECRET_NAME") else {}),
+    **({
+        "TRACKER_ADMIN_PASS": os.environ["TRACKER_ADMIN_PASS"]
+    } if os.environ.get("TRACKER_ADMIN_PASS") and not os.environ.get("TRACKER_ADMIN_PASS_SECRET_NAME") else {}),
+    **({
+        "TRACKER_API_KEY": os.environ["TRACKER_API_KEY"]
+    } if os.environ.get("TRACKER_API_KEY") and not os.environ.get("TRACKER_API_KEY_SECRET_NAME") else {}),
+    **({
+        "CONTROL_PLANE_DATABASE_URL": os.environ["CONTROL_PLANE_DATABASE_URL"]
+    } if os.environ.get("CONTROL_PLANE_DATABASE_URL") and not os.environ.get("CONTROL_PLANE_DATABASE_URL_SECRET_NAME") else {}),
+    **({
+        "CONTROL_PLANE_SIGNING_KEY": os.environ["CONTROL_PLANE_SIGNING_KEY"]
+    } if os.environ.get("CONTROL_PLANE_SIGNING_KEY") and not os.environ.get("CONTROL_PLANE_SIGNING_KEY_SECRET_NAME") else {}),
 }))
 PY
 
@@ -169,7 +387,34 @@ echo "Deploying ${SERVICE_NAME} version ${TRACKER_VERSION} to Cloud Run in ${REG
 WEB_REQUEST_TIMEOUT="${WEB_REQUEST_TIMEOUT:-3600s}"
 ACTIVATE_LATEST_REVISION="${ACTIVATE_LATEST_REVISION:-1}"
 
-run_gcloud run deploy "${SERVICE_NAME}" \
+SECRET_MAPPINGS="SECRET_KEY=${SECRET_KEY_SECRET_NAME}:latest,FAA_NOTAM_CLIENT_ID=${FAA_CLIENT_ID_SECRET_NAME}:latest,FAA_NOTAM_CLIENT_SECRET=${FAA_CLIENT_SECRET_SECRET_NAME}:latest"
+if [ -n "${DATABASE_URL_SECRET_NAME}" ]; then
+  SECRET_MAPPINGS="${SECRET_MAPPINGS},DATABASE_URL=${DATABASE_URL_SECRET_NAME}:latest"
+fi
+if [ -n "${TRACKER_ADMIN_PASS_SECRET_NAME}" ]; then
+  SECRET_MAPPINGS="${SECRET_MAPPINGS},TRACKER_ADMIN_PASS=${TRACKER_ADMIN_PASS_SECRET_NAME}:latest"
+fi
+if [ -n "${TRACKER_API_KEY_SECRET_NAME}" ]; then
+  SECRET_MAPPINGS="${SECRET_MAPPINGS},TRACKER_API_KEY=${TRACKER_API_KEY_SECRET_NAME}:latest"
+fi
+if [ -n "${CONTROL_PLANE_DATABASE_URL_SECRET_NAME}" ]; then
+  SECRET_MAPPINGS="${SECRET_MAPPINGS},CONTROL_PLANE_DATABASE_URL=${CONTROL_PLANE_DATABASE_URL_SECRET_NAME}:latest"
+fi
+if [ -n "${CONTROL_PLANE_SIGNING_KEY_SECRET_NAME}" ]; then
+  SECRET_MAPPINGS="${SECRET_MAPPINGS},CONTROL_PLANE_SIGNING_KEY=${CONTROL_PLANE_SIGNING_KEY_SECRET_NAME}:latest"
+fi
+if [ -n "${GOOGLE_OAUTH_CLIENT_ID_SECRET_NAME}" ]; then
+  SECRET_MAPPINGS="${SECRET_MAPPINGS},GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID_SECRET_NAME}:latest"
+  SECRET_MAPPINGS="${SECRET_MAPPINGS},GOOGLE_OAUTH_CLIENT_SECRET=${GOOGLE_OAUTH_CLIENT_SECRET_SECRET_NAME}:latest"
+fi
+if [ -n "${PLATFORM_EMAIL_SMTP_PASSWORD_SECRET_NAME}" ]; then
+  SECRET_MAPPINGS="${SECRET_MAPPINGS},PLATFORM_EMAIL_SMTP_PASSWORD=${PLATFORM_EMAIL_SMTP_PASSWORD_SECRET_NAME}:latest"
+fi
+if [ -n "${CLOUDFLARE_TURN_KEY_ID_SECRET_NAME}" ]; then
+  SECRET_MAPPINGS="${SECRET_MAPPINGS},CLOUDFLARE_TURN_KEY_ID=${CLOUDFLARE_TURN_KEY_ID_SECRET_NAME}:latest"
+  SECRET_MAPPINGS="${SECRET_MAPPINGS},CLOUDFLARE_TURN_API_TOKEN=${CLOUDFLARE_TURN_API_TOKEN_SECRET_NAME}:latest"
+fi
+set -- run deploy "${SERVICE_NAME}" \
   --source . \
   --region "${REGION}" \
   --project "${GCLOUD_PROJECT}" \
@@ -177,7 +422,31 @@ run_gcloud run deploy "${SERVICE_NAME}" \
   --timeout "${WEB_REQUEST_TIMEOUT}" \
   --max-instances 1 \
   --env-vars-file "${ENV_VARS_FILE}" \
-  --set-secrets "SECRET_KEY=${SECRET_KEY_SECRET_NAME}:latest"
+  --set-secrets "${SECRET_MAPPINGS}"
+
+if [ -n "${CLOUD_RUN_MEMORY}" ]; then
+  set -- "$@" --memory "${CLOUD_RUN_MEMORY}"
+fi
+if [ "${ALLOW_UNAUTHENTICATED}" = "1" ]; then
+  set -- "$@" --allow-unauthenticated
+fi
+if [ -n "${CLOUD_SQL_INSTANCE}" ]; then
+  set -- "$@" --set-cloudsql-instances "${CLOUD_SQL_INSTANCE}"
+fi
+if [ -n "${FLIGHTLOGS_BUCKET}" ]; then
+  set -- "$@" \
+    --execution-environment gen2 \
+    --add-volume "name=${FLIGHTLOGS_VOLUME_NAME},type=cloud-storage,bucket=${FLIGHTLOGS_BUCKET}" \
+    --add-volume-mount "volume=${FLIGHTLOGS_VOLUME_NAME},mount-path=/flightlogs-vol"
+fi
+if [ "${ACTIVATE_LATEST_REVISION}" != "1" ]; then
+  set -- "$@" --no-traffic
+fi
+if [ -n "${REVISION_TAG:-}" ]; then
+  set -- "$@" --tag "${REVISION_TAG}"
+fi
+
+run_gcloud "$@"
 
 if [ "${ACTIVATE_LATEST_REVISION}" = "1" ]; then
   echo "Routing 100% of ${SERVICE_NAME} traffic to the latest ready revision..."

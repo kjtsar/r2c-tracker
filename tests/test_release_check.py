@@ -10,6 +10,8 @@ class ReleaseCheckScriptTest(unittest.TestCase):
         self.assertIn("uvicorn main:app", script)
         self.assertIn("http://${HOST}:${PORT}/r2c", script)
         self.assertIn("http://${HOST}:${PORT}/versions", script)
+        self.assertIn("/faa/notams?latitude=39.1&longitude=-121.1&radius=2", script)
+        self.assertIn('FAA_UNAUTH_STATUS}" != "403"', script)
         self.assertIn("ws://{host}:{port}/ws/r2c", script)
         self.assertIn("hello_ack", script)
 

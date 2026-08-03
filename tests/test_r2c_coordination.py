@@ -29,6 +29,15 @@ def load_coordination_classes():
         manager_broadcasts.append((args, kwargs))
 
     manager = types.SimpleNamespace(broadcast=_broadcast)
+
+    class FakeVideoIceServerProvider:
+        async def get_ice_servers(self):
+            return [{
+                "urls": ["turns:turn.example.test:443?transport=tcp"],
+                "username": "short-lived-user",
+                "credential": "short-lived-password",
+            }]
+
     namespace = {
         "asyncio": asyncio,
         "json": json,
@@ -40,12 +49,15 @@ def load_coordination_classes():
         "WebSocket": type("WebSocket", (), {}),
         "logger": logger,
         "manager": manager,
+        "video_ice_server_provider": FakeVideoIceServerProvider(),
         "R2C_HEARTBEAT_SEC": 15,
         "R2C_LEASE_SEC": 45,
         "R2C_HEARTBEAT_ZONE_UPDATE_SEC": 60,
         "R2C_IDLE_PARK_SEC": 120,
         "R2C_RECOMMENDED_APP_VERSION_CODE": 77,
         "R2C_UPDATE_URL": "https://example.org/r2c",
+        "R2C_RECOMMENDED_IOS_APP_BUILD_NUMBER": 12,
+        "R2C_IOS_UPDATE_URL": "https://example.org/r2c-ios",
         "R2C_SWEEP_SEC": 15,
     }
     exec(snippet, namespace)
@@ -217,6 +229,69 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
             "lat": 39.2,
             "lng": -121.2
         })
+
+    async def test_media_offer_includes_short_lived_ice_servers(self):
+        self.hub._connections_by_device_credential_id["device-1"] = (
+            types.SimpleNamespace(websocket=self.ws_alpha)
+        )
+        exchange = types.SimpleNamespace(
+            request_id="request-1",
+            device_credential_id="device-1",
+            stream_session_id="stream-1",
+            browser_offer_sdp="v=0\r\n",
+            expires_at=datetime(2026, 7, 31, 22, 0, tzinfo=UTC),
+        )
+
+        delivered = await self.hub.send_video_media_offer(exchange)
+
+        self.assertTrue(delivered)
+        payload = json.loads(self.ws_alpha.sent_texts[-1])
+        self.assertEqual("video_media_offer", payload["type"])
+        self.assertEqual("request-1", payload["requestId"])
+        self.assertEqual(
+            "turns:turn.example.test:443?transport=tcp",
+            payload["iceServers"][0]["urls"][0],
+        )
+        self.assertEqual(
+            "short-lived-password",
+            payload["iceServers"][0]["credential"],
+        )
+
+    async def test_device_reconnect_close_restores_still_live_connection(self):
+        credential = types.SimpleNamespace(id="device-1")
+        original = FakeWebSocket()
+        replacement = FakeWebSocket()
+        await self.hub.connect(original, credential)
+        await self.hub.connect(replacement, credential)
+
+        await self.hub.disconnect(replacement)
+
+        self.assertIs(
+            original,
+            self.hub._connections_by_device_credential_id[
+                "device-1"
+            ].websocket,
+        )
+
+    async def test_video_delivery_finds_orphaned_live_device_connection(self):
+        credential = types.SimpleNamespace(id="device-1")
+        websocket = FakeWebSocket()
+        await self.hub.connect(websocket, credential)
+        self.hub._connections_by_device_credential_id.pop("device-1")
+        exchange = types.SimpleNamespace(
+            request_id="request-1",
+            device_credential_id="device-1",
+            browser_offer_sdp="v=0\r\n",
+            expires_at=datetime(2026, 7, 31, 22, 0, tzinfo=UTC),
+        )
+
+        delivered = await self.hub.send_video_preflight_offer(exchange)
+
+        self.assertTrue(delivered)
+        self.assertEqual(
+            "video_preflight_offer",
+            json.loads(websocket.sent_texts[-1])["type"],
+        )
 
     async def test_first_sighting_prefers_earlier_detection_then_distance(self):
         await self.hub.handle_message(self.ws_bravo, {
@@ -1145,6 +1220,26 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(120, ack["idleParkSec"])
         self.assertEqual(77, ack["recommendedAppVersionCode"])
         self.assertEqual("https://example.org/r2c", ack["updateUrl"])
+
+    async def test_ios_hello_uses_ios_specific_update_recommendation(self):
+        ws_ios = FakeWebSocket()
+        await self.hub.connect(ws_ios)
+        await self.hub.handle_message(ws_ios, {
+            "type": "hello",
+            "mapId": "MAP1",
+            "zoneId": "zone-ios",
+            "guid": "zone-ios",
+            "name": "iPad",
+            "appPlatform": "ios",
+            "appVersion": "1.2(11)",
+            "appVersionCode": 11,
+            "lat": 39.3,
+            "lng": -121.3,
+        })
+
+        ack = json.loads(ws_ios.sent_texts[0])
+        self.assertEqual(12, ack["recommendedAppVersionCode"])
+        self.assertEqual("https://example.org/r2c-ios", ack["updateUrl"])
 
     async def test_hello_persists_and_broadcasts_app_version(self):
         state = self.hub.zone_store[("MAP1", "zone-alpha")]

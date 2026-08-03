@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}Activate Organization Administrator{% endblock %}
+{% block extra_head %}
+<style>
+  .activation-shell {
+      max-width: 520px;
+      margin: 48px auto;
+      padding: 28px;
+      border: 1px solid #ccd8df;
+      border-radius: 14px;
+      background: white;
+      box-shadow: 0 10px 30px rgba(22, 47, 65, 0.08);
+  }
+  .activation-shell h1 { margin-top: 0; color: #12344d; }
+  .activation-shell p { color: #60717d; line-height: 1.5; }
+  .activation-error {
+      padding: 12px;
+      border-radius: 8px;
+      background: #fff0f0;
+      color: #8b1f1f;
+  }
+  .activation-form { display: grid; gap: 16px; }
+  .activation-form label { display: grid; gap: 6px; font-weight: 700; color: #425764; }
+  .activation-form input {
+      padding: 11px;
+      border: 1px solid #aebdc7;
+      border-radius: 7px;
+      font: inherit;
+  }
+  .activation-form button {
+      padding: 11px 16px;
+      border: 0;
+      border-radius: 7px;
+      background: #0b6680;
+      color: white;
+      font: inherit;
+      font-weight: 800;
+      cursor: pointer;
+  }
+</style>
+{% endblock %}
+{% block content %}
+<section class="activation-shell">
+  <h1>Activate organization administrator</h1>
+  {% if activation_error %}
+  <div class="activation-error" role="alert">{{ activation_error }}</div>
+  {% else %}
+  <p>
+    Create the administrator password for <strong>{{ designator }}</strong>
+    ({{ email }}). The invitation becomes unusable after activation.
+  </p>
+  <form class="activation-form" method="post"
+        action="/{{ designator|lower }}/activate">
+    <input type="hidden" name="form_token" value="{{ csrf_token }}">
+    <input type="hidden" name="token" value="{{ token }}">
+    <label>
+      Password
+      <input type="password" name="password" minlength="12" required
+             autocomplete="new-password">
+    </label>
+    <label>
+      Confirm password
+      <input type="password" name="password_confirm" minlength="12" required
+             autocomplete="new-password">
+    </label>
+    <button type="submit">Activate account</button>
+  </form>
+  {% endif %}
+</section>
+{% endblock %}
