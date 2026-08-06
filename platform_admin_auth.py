@@ -364,6 +364,44 @@ def _organization_funding_exhausted_message(
     return message
 
 
+def _organization_lifecycle_deadline_message(
+    from_address: str,
+    recipient: str,
+    administrator_name: str,
+    organization_name: str,
+    designator: str,
+    lifecycle_label: str,
+    timing: str,
+    deadline: str,
+    administration_url: str,
+    records_url: str,
+) -> EmailMessage:
+    message = EmailMessage()
+    message["Subject"] = (
+        f"{designator} R2C Tracker {lifecycle_label} {timing}"
+    )
+    message["From"] = from_address
+    message["To"] = recipient
+    message.set_content(
+        f"Hello {administrator_name},\n\n"
+        f"The {organization_name} ({designator}) R2C Tracker "
+        f"{lifecycle_label} {timing}. The recorded deadline is {deadline}.\n\n"
+        "R2C Tracker does not automatically archive or shut down an "
+        "organization when this deadline passes. The platform administrator "
+        "will contact your organization administrator before any archival or "
+        "service shutdown.\n\n"
+        "To preserve organization-owned flight records:\n"
+        f"1. Sign in and review service status: {administration_url}\n"
+        f"2. Open flight administration: {records_url}\n"
+        "3. Select Export as CSV for the flight-record summary.\n"
+        "4. Select Download Flight Log Archive for the available raw logs, "
+        "then store both downloads securely.\n\n"
+        "Reply to this message or contact the R2C Tracker platform "
+        f"administrator at {from_address} to discuss continued access."
+    )
+    return message
+
+
 class GmailApiPlatformAdminEmailSender:
     def __init__(
         self,
@@ -486,6 +524,21 @@ class GmailApiPlatformAdminEmailSender:
             kwargs["administration_url"],
         )
         self._send(message, "Funding notification email could not be sent.")
+
+    def send_organization_lifecycle_deadline(self, **kwargs) -> None:
+        message = _organization_lifecycle_deadline_message(
+            self.from_address,
+            kwargs["recipient"],
+            kwargs["administrator_name"],
+            kwargs["organization_name"],
+            kwargs["designator"],
+            kwargs["lifecycle_label"],
+            kwargs["timing"],
+            kwargs["deadline"],
+            kwargs["administration_url"],
+            kwargs["records_url"],
+        )
+        self._send(message, "Lifecycle notification email could not be sent.")
 
 
 class SmtpPlatformAdminEmailSender:
@@ -692,4 +745,30 @@ class SmtpPlatformAdminEmailSender:
         except Exception as exc:
             raise PlatformAdminAuthError(
                 "Funding notification email could not be sent."
+            ) from exc
+
+    def send_organization_lifecycle_deadline(self, **kwargs) -> None:
+        if not self.is_configured:
+            raise PlatformAdminAuthError("Administrator email is not configured.")
+        message = _organization_lifecycle_deadline_message(
+            self.from_address,
+            kwargs["recipient"],
+            kwargs["administrator_name"],
+            kwargs["organization_name"],
+            kwargs["designator"],
+            kwargs["lifecycle_label"],
+            kwargs["timing"],
+            kwargs["deadline"],
+            kwargs["administration_url"],
+            kwargs["records_url"],
+        )
+        try:
+            with smtplib.SMTP(self.host, self.port, timeout=15) as smtp:
+                smtp.starttls(context=ssl.create_default_context())
+                if self.username:
+                    smtp.login(self.username, self.password)
+                smtp.send_message(message)
+        except Exception as exc:
+            raise PlatformAdminAuthError(
+                "Lifecycle notification email could not be sent."
             ) from exc

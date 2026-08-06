@@ -22,7 +22,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from starlette.websockets import WebSocketDisconnect
 
 import main
-from control_plane import ControlPlaneStore, DeviceCredentialRecord, VideoPreflightExchange
+from control_plane import (
+    ControlPlaneStore,
+    DeviceCredentialRecord,
+    MANAGED_ACCESS_TERMS_VERSION,
+    VideoPreflightExchange,
+)
 from enrollment import ControlPlaneTokenService
 from platform_admin_identity import PlatformAdminIdentity
 from platform_admin_auth import GoogleIdentity
@@ -383,13 +388,10 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertNotIn('href="/docs"', guest_page.text)
 
         directory_page = self.client.get("/")
-        self.assertIn("Community-supported.", directory_page.text)
-        self.assertGreaterEqual(
-            directory_page.text.count('href="https://rid2caltopo.com/donations"'),
-            2,
-        )
+        self.assertNotIn("Community-supported.", directory_page.text)
+        self.assertNotIn('href="https://rid2caltopo.com/donations"', directory_page.text)
+        self.assertNotIn("Support the project", directory_page.text)
         self.assertNotIn('href="https://paypal.me/kjtgv"', directory_page.text)
-        self.assertIn("Contributions do not purchase access or priority.", directory_page.text)
         self.assertNotIn("tax-deductible", directory_page.text.lower())
         self.assertGreaterEqual(
             directory_page.text.count(
@@ -1096,11 +1098,25 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             asyncio.run(self.store.get_organization(organization.designator))
         )
 
-        archived = self.client.post(
+        contact_rejected = self.client.post(
             "/platform-admin/organizations/ncssar/archive",
             data={
                 "form_token": self.platform_form_token(rejected),
                 "confirmation": "NCSSAR",
+            },
+            follow_redirects=True,
+        )
+        self.assertIn("Confirm direct contact", contact_rejected.text)
+
+        archived = self.client.post(
+            "/platform-admin/organizations/ncssar/archive",
+            data={
+                "form_token": self.platform_form_token(contact_rejected),
+                "confirmation": "NCSSAR",
+                "contact_confirmed": "yes",
+                "administrator_contact": (
+                    "Called Primary Administrator on 06 Aug 2026; confirmed export."
+                ),
             },
             follow_redirects=True,
         )
@@ -1128,11 +1144,22 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             "organization_name": "Foothill Search and Rescue",
             "designator": "FHSAR",
             "source_host": "rid2caltopo.org",
+            "terms_acknowledged": "yes",
+            "terms_version": MANAGED_ACCESS_TERMS_VERSION,
         }
         with patch.object(main, "MANAGED_REQUEST_INGEST_KEY", "intake-secret"):
             denied = self.client.post(
                 "/managed-access-requests",
                 data=request_data,
+            )
+            missing_acknowledgement = self.client.post(
+                "/managed-access-requests",
+                data={
+                    key: value
+                    for key, value in request_data.items()
+                    if key not in {"terms_acknowledged", "terms_version"}
+                },
+                headers={"Authorization": "Bearer intake-secret"},
             )
             accepted = self.client.post(
                 "/managed-access-requests",
@@ -1140,12 +1167,15 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 headers={"Authorization": "Bearer intake-secret"},
             )
         self.assertEqual(403, denied.status_code)
+        self.assertEqual(422, missing_acknowledgement.status_code)
         self.assertEqual(200, accepted.status_code)
         page = self.client.get("/platform-admin/organizations")
         self.assertIn("Managed pilot requests", page.text)
         self.assertIn("Jamie Responder", page.text)
         self.assertIn("+1 530 555 0100", page.text)
         self.assertIn("jamie@example.org", page.text)
+        self.assertIn("Acknowledged", page.text)
+        self.assertIn(MANAGED_ACCESS_TERMS_VERSION, page.text)
 
     def test_platform_admin_can_replace_organization_administrator_with_accountability_email(self):
         organization = asyncio.run(

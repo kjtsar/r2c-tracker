@@ -11,6 +11,7 @@ from control_plane import (
     ControlPlaneStore,
     DuplicateOrganizationError,
     InvalidOrganizationError,
+    MANAGED_ACCESS_TERMS_VERSION,
     UsageDaily,
     hash_password,
     is_emergency_video_fallback,
@@ -355,6 +356,7 @@ class ControlPlaneStoreTest(unittest.TestCase):
             self.store.archive_organization(
                 designator=organization.designator,
                 actor_id="platform-admin",
+                administrator_contact="Called Primary Administrator on 30 Jul 2026.",
                 now=self.now + timedelta(hours=1),
             )
         )
@@ -384,6 +386,7 @@ class ControlPlaneStoreTest(unittest.TestCase):
             self.store.archive_organization(
                 designator=organization.designator,
                 actor_id="platform-admin",
+                administrator_contact="Called Primary Administrator on 30 Jul 2026.",
                 now=self.now + timedelta(hours=1),
             )
         )
@@ -416,6 +419,8 @@ class ControlPlaneStoreTest(unittest.TestCase):
             "organization_name": "Foothill Search and Rescue",
             "designator": "FHSAR",
             "source_host": "rid2caltopo.org",
+            "terms_acknowledged": True,
+            "terms_version": MANAGED_ACCESS_TERMS_VERSION,
             "now": self.now,
         }
         first = asyncio.run(self.store.create_managed_access_request(**values))
@@ -424,6 +429,8 @@ class ControlPlaneStoreTest(unittest.TestCase):
         self.assertEqual(first.id, second.id)
         self.assertEqual(1, len(requests))
         self.assertEqual("+1 530 555 0100", requests[0].requester_phone)
+        self.assertEqual(MANAGED_ACCESS_TERMS_VERSION, requests[0].terms_version)
+        self.assertEqual(self.now, requests[0].terms_acknowledged_at)
 
     def test_replacement_administrator_activation_does_not_restart_trial(self):
         organization = self.create_organization(simulation=False)
@@ -1375,6 +1382,66 @@ class ControlPlaneStoreTest(unittest.TestCase):
         self.assertEqual("funded", refunded.lifecycle_state)
         self.assertEqual(Decimal("5.0000"), refunded.credit_balance)
         self.assertIsNone(refunded.trial_ends_at)
+
+    def test_trial_deadline_notifications_never_archive_organization(self):
+        organization = self.create_organization()
+
+        asyncio.run(
+            self.store.queue_lifecycle_deadline_notifications(
+                now=self.now + timedelta(days=24),
+            )
+        )
+        notifications = asyncio.run(self.store.list_pending_billing_notifications())
+        self.assertEqual(["trial_ending_7d"], [item.notification_type for item in notifications])
+        asyncio.run(self.store.mark_billing_notification_sent(notifications[0].id))
+
+        asyncio.run(
+            self.store.queue_lifecycle_deadline_notifications(
+                now=self.now + timedelta(days=29, hours=12),
+            )
+        )
+        notifications = asyncio.run(self.store.list_pending_billing_notifications())
+        self.assertEqual(["trial_ending_1d"], [item.notification_type for item in notifications])
+        asyncio.run(self.store.mark_billing_notification_sent(notifications[0].id))
+
+        asyncio.run(
+            self.store.queue_lifecycle_deadline_notifications(
+                now=self.now + timedelta(days=31),
+            )
+        )
+        notifications = asyncio.run(self.store.list_pending_billing_notifications())
+        self.assertEqual(["trial_ended"], [item.notification_type for item in notifications])
+        current = asyncio.run(self.store.get_organization(organization.designator))
+        self.assertEqual("trial", current.lifecycle_state)
+        self.assertEqual("simulation ready", current.provisioning_state)
+
+    def test_archive_requires_and_audits_administrator_contact(self):
+        organization = self.create_organization()
+        with self.assertRaisesRegex(ControlPlaneError, "Record how and when"):
+            asyncio.run(
+                self.store.archive_organization(
+                    designator=organization.designator,
+                    actor_id="platform-admin",
+                    administrator_contact="",
+                    now=self.now + timedelta(hours=1),
+                )
+            )
+
+        asyncio.run(
+            self.store.archive_organization(
+                designator=organization.designator,
+                actor_id="platform-admin",
+                administrator_contact=(
+                    "Called Primary Administrator on 30 Jul 2026; export confirmed."
+                ),
+                now=self.now + timedelta(hours=1),
+            )
+        )
+        audit_events = asyncio.run(self.store.list_audit_events())
+        self.assertIn(
+            "Called Primary Administrator",
+            audit_events[0].details["administrator_contact"],
+        )
 
     def test_prefunded_live_account_does_not_start_trial_on_activation(self):
         organization = self.create_organization(

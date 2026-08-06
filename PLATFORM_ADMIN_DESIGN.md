@@ -129,6 +129,18 @@ enough funds during the grace period returns the account to funded status.
 Payment collection remains disabled; platform administrators can record manual
 deposits while future payment-provider reconciliation remains pending.
 
+Trial and grace deadlines are notification deadlines, not automated shutdown
+triggers. The notification worker sends the organization administrator an
+advance message within seven days, another within one day, and an expiration
+message if the account remains in that lifecycle state. Each message links to
+the organization-scoped CSV export and Flight Log Archive. Passing a deadline
+does not change lifecycle or provisioning state.
+
+Archiving is a platform-administrator action only. Before the archive route can
+disable a tenant, the platform administrator must affirm direct contact with
+the organization administrator and record when and how contact occurred. That
+contact record is retained in the control-plane audit event.
+
 ### provisioning_jobs
 
 Each organization onboarding request records independently retryable steps:
@@ -141,6 +153,15 @@ Each organization onboarding request records independently retryable steps:
 6. run health checks;
 7. issue a short-lived activation link;
 8. start the trial when the administrator activates the account.
+
+### managed_access_requests
+
+The public managed-access form requires an affirmative acknowledgement that
+RID2Caltopo and R2C Tracker provide supplemental situational awareness, may be
+unavailable or incomplete, and are not the sole source for navigation, flight
+safety, communications, or incident-command decisions. The website worker and
+control-plane intake endpoint both enforce the current acknowledgement version;
+the request stores its version and acknowledgement timestamp for review.
 
 ### control_plane_audit_events
 
@@ -168,6 +189,8 @@ the pilot's approval.
 - Raw flight logs: thirty days.
 - Pinned or archived logs: retained longer and billed as storage.
 - Organization-controlled export before scheduled deletion.
+- Trial or grace reminders link to both the flight-record CSV export and raw
+  Flight Log Archive before any administrator considers archival.
 - Optional record-specific incident/legal hold.
 - Backups are disaster recovery, not permanent customer archives.
 

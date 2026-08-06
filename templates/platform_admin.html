@@ -595,6 +595,7 @@
             <th>Requester</th>
             <th>Phone</th>
             <th>Submitted</th>
+            <th>Safety terms</th>
             <th>Status</th>
           </tr>
         </thead>
@@ -617,10 +618,21 @@
               {% endif %}
             </td>
             <td>{{ access_request.submitted_at.strftime("%d %b %Y %H:%M UTC") }}</td>
+            <td>
+              {% if access_request.terms_acknowledged_at %}
+              <span class="status-badge funded">Acknowledged</span>
+              <div class="secondary-text">
+                Version {{ access_request.terms_version }} ·
+                {{ access_request.terms_acknowledged_at.strftime("%d %b %Y %H:%M UTC") }}
+              </div>
+              {% else %}
+              <span class="secondary-text">Legacy request; not recorded</span>
+              {% endif %}
+            </td>
             <td><span class="status-badge">{{ access_request.state }}</span></td>
           </tr>
           {% else %}
-          <tr><td colspan="5" class="secondary-text">No managed pilot requests have been received.</td></tr>
+          <tr><td colspan="6" class="secondary-text">No managed pilot requests have been received.</td></tr>
           {% endfor %}
         </tbody>
       </table>
@@ -631,7 +643,10 @@
     <div class="panel-heading">
       <div>
         <h2>Organizations</h2>
-        <p>Commercial metadata and monthly aggregate resource usage only.</p>
+        <p>
+          Commercial metadata and monthly aggregate resource usage only.
+          Trial and grace deadlines never trigger automatic archival or shutdown.
+        </p>
       </div>
       <button class="primary-action" type="button" disabled title="Available after provisioning workflow is implemented">
         {{ "Simulation mode" if control_plane_simulation else "Live provisioning" }}
@@ -826,6 +841,16 @@
               <form class="archive-form" method="post"
                     action="/platform-admin/organizations/{{ organization.designator|lower }}/archive">
                 <input type="hidden" name="form_token" value="{{ csrf_token }}">
+                <label>
+                  Administrator contact record
+                  <textarea name="administrator_contact" required minlength="10"
+                            maxlength="500"
+                            placeholder="Date, method, person contacted, and outcome"></textarea>
+                </label>
+                <label>
+                  <input type="checkbox" name="contact_confirmed" value="yes" required>
+                  I directly contacted the organization administrator before this archival.
+                </label>
                 <label>
                   Type {{ organization.designator }}
                   <input name="confirmation" required

@@ -246,6 +246,16 @@
       <p><strong>Credit balance:</strong> ${{ "%.2f"|format(organization.credit_balance) }}</p>
       {% if organization.trial_ends_at %}
       <p><strong>{{ "Grace ends" if organization.lifecycle_state == "grace" else "Trial ends" }}:</strong> {{ organization.trial_ends_at.strftime("%d %b %Y") }}</p>
+      <p>
+        This deadline does not automatically archive or shut down the site.
+        The platform administrator will contact your organization administrator
+        before any archival or service shutdown.
+      </p>
+      <p>
+        To preserve organization-owned data, open
+        <a href="/{{ organization.designator|lower }}/admin/flights">Manage flight records</a>,
+        then download both the CSV export and Flight Log Archive.
+      </p>
       {% endif %}
       <p>
         Command staff with the <code>video_requester</code> role may request a

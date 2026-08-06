@@ -63,6 +63,7 @@ ONBOARDING_STEPS = (
     "run tenant health checks",
     "prepare administrator activation",
 )
+MANAGED_ACCESS_TERMS_VERSION = "2026-08-06"
 
 # A preflight can under-report when the synthetic TURN probe itself stalls.
 # Keep the exception deliberately narrow: only the smallest field-usable
@@ -193,6 +194,10 @@ class ManagedAccessRequest(Base):
     designator: Mapped[str] = mapped_column(String(16), index=True)
     state: Mapped[str] = mapped_column(String(24), default="pending", index=True)
     source_host: Mapped[str] = mapped_column(String(255), default="")
+    terms_version: Mapped[str] = mapped_column(String(32), default="")
+    terms_acknowledged_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True)
+    )
     submitted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
     )
@@ -498,6 +503,7 @@ class BillingNotification(Base):
     state: Mapped[str] = mapped_column(String(24), default="pending", index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     last_error: Mapped[str] = mapped_column(String(240), default="")
+    deadline_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
     )
@@ -726,6 +732,8 @@ class ManagedAccessRequestRecord:
     designator: str
     state: str
     source_host: str
+    terms_version: str
+    terms_acknowledged_at: Optional[datetime]
     submitted_at: datetime
 
 
@@ -807,7 +815,7 @@ class BillingNotificationRecord:
     administrator_name: str
     administrator_email: str
     notification_type: str
-    grace_ends_at: Optional[datetime]
+    deadline_at: Optional[datetime]
 
 
 @dataclass(frozen=True)
@@ -1145,6 +1153,47 @@ class ControlPlaneStore:
                 await connection.execute(text(
                     "ALTER TABLE organization_contacts "
                     "ADD COLUMN phone VARCHAR(64) DEFAULT '' NOT NULL"
+                ))
+            managed_request_columns = await connection.run_sync(
+                lambda sync_connection: {
+                    item["name"]
+                    for item in inspect(sync_connection).get_columns(
+                        "managed_access_requests"
+                    )
+                }
+            )
+            if "terms_version" not in managed_request_columns:
+                await connection.execute(text(
+                    "ALTER TABLE managed_access_requests "
+                    "ADD COLUMN terms_version VARCHAR(32) DEFAULT '' NOT NULL"
+                ))
+            if "terms_acknowledged_at" not in managed_request_columns:
+                timestamp_type = (
+                    "TIMESTAMP WITH TIME ZONE"
+                    if self.engine.dialect.name == "postgresql"
+                    else "DATETIME"
+                )
+                await connection.execute(text(
+                    "ALTER TABLE managed_access_requests "
+                    f"ADD COLUMN terms_acknowledged_at {timestamp_type}"
+                ))
+            billing_notification_columns = await connection.run_sync(
+                lambda sync_connection: {
+                    item["name"]
+                    for item in inspect(sync_connection).get_columns(
+                        "billing_notifications"
+                    )
+                }
+            )
+            if "deadline_at" not in billing_notification_columns:
+                timestamp_type = (
+                    "TIMESTAMP WITH TIME ZONE"
+                    if self.engine.dialect.name == "postgresql"
+                    else "DATETIME"
+                )
+                await connection.execute(text(
+                    "ALTER TABLE billing_notifications "
+                    f"ADD COLUMN deadline_at {timestamp_type}"
                 ))
             columns = await connection.run_sync(
                 lambda sync_connection: {
@@ -1919,6 +1968,8 @@ class ControlPlaneStore:
         organization_name: str,
         designator: str,
         source_host: str,
+        terms_acknowledged: bool,
+        terms_version: str,
         now: Optional[datetime] = None,
     ) -> ManagedAccessRequestRecord:
         submitted_at = now or utc_now()
@@ -1928,12 +1979,21 @@ class ControlPlaneStore:
         clean_organization = organization_name.strip()
         clean_designator = normalize_designator(designator)
         clean_source_host = source_host.strip().lower()[:255]
+        clean_terms_version = terms_version.strip()
         if not clean_name or len(clean_name) > 160:
             raise InvalidOrganizationError("Enter a requester name.")
         if len(clean_phone) > 64:
             raise InvalidOrganizationError("Enter a phone number no longer than 64 characters.")
         if not clean_organization or len(clean_organization) > 200:
             raise InvalidOrganizationError("Enter the organization's official name.")
+        if not terms_acknowledged:
+            raise InvalidOrganizationError(
+                "Acknowledge the managed-service safety terms before requesting access."
+            )
+        if clean_terms_version != MANAGED_ACCESS_TERMS_VERSION:
+            raise InvalidOrganizationError(
+                "Review and acknowledge the current managed-service safety terms."
+            )
         async with self.sessions() as session:
             existing = await session.scalar(
                 select(ManagedAccessRequest)
@@ -1954,6 +2014,8 @@ class ControlPlaneStore:
                     organization_name=clean_organization,
                     designator=clean_designator,
                     source_host=clean_source_host,
+                    terms_version=clean_terms_version,
+                    terms_acknowledged_at=submitted_at,
                     submitted_at=submitted_at,
                     updated_at=submitted_at,
                 )
@@ -1963,6 +2025,8 @@ class ControlPlaneStore:
                 existing.requester_phone = clean_phone
                 existing.organization_name = clean_organization
                 existing.source_host = clean_source_host
+                existing.terms_version = clean_terms_version
+                existing.terms_acknowledged_at = submitted_at
                 existing.updated_at = submitted_at
             await session.commit()
             return ManagedAccessRequestRecord(
@@ -1974,6 +2038,8 @@ class ControlPlaneStore:
                 designator=existing.designator,
                 state=existing.state,
                 source_host=existing.source_host,
+                terms_version=existing.terms_version,
+                terms_acknowledged_at=as_utc(existing.terms_acknowledged_at),
                 submitted_at=as_utc(existing.submitted_at),
             )
 
@@ -1998,6 +2064,8 @@ class ControlPlaneStore:
                 designator=row.designator,
                 state=row.state,
                 source_host=row.source_host,
+                terms_version=row.terms_version,
+                terms_acknowledged_at=as_utc(row.terms_acknowledged_at),
                 submitted_at=as_utc(row.submitted_at),
             )
             for row in rows
@@ -2151,9 +2219,15 @@ class ControlPlaneStore:
         *,
         designator: str,
         actor_id: str,
+        administrator_contact: str,
         now: Optional[datetime] = None,
     ) -> OrganizationRecord:
         clean_designator = normalize_designator(designator)
+        clean_contact = " ".join(administrator_contact.split())
+        if len(clean_contact) < 10 or len(clean_contact) > 500:
+            raise ControlPlaneError(
+                "Record how and when the organization administrator was contacted."
+            )
         archived_at = now or utc_now()
         async with self.sessions() as session:
             organization = await session.scalar(
@@ -2251,6 +2325,7 @@ class ControlPlaneStore:
                             "previous_lifecycle_state": organization.archived_from_lifecycle_state,
                             "previous_provisioning_state": organization.archived_from_provisioning_state,
                             "previous_subscription_state": organization.archived_from_subscription_state,
+                            "administrator_contact": clean_contact,
                         }
                     ),
                     created_at=archived_at,
@@ -3137,6 +3212,7 @@ class ControlPlaneStore:
                         f"funding-exhausted:{organization.id}:"
                         f"{changed_at.isoformat()}"
                     ),
+                    deadline_at=organization.trial_ends_at,
                     created_at=changed_at,
                 )
             )
@@ -3163,6 +3239,95 @@ class ControlPlaneStore:
             )
         organization.updated_at = changed_at
 
+    async def queue_lifecycle_deadline_notifications(
+        self,
+        *,
+        now: Optional[datetime] = None,
+    ) -> None:
+        checked_at = now or utc_now()
+        lifecycle_types = (
+            "trial_ending_7d",
+            "trial_ending_1d",
+            "trial_ended",
+            "grace_ending_7d",
+            "grace_ending_1d",
+            "grace_ended",
+        )
+        async with self.sessions() as session:
+            pending_rows = (
+                await session.execute(
+                    select(BillingNotification, Organization)
+                    .join(
+                        Organization,
+                        Organization.id == BillingNotification.organization_id,
+                    )
+                    .where(
+                        BillingNotification.state == "pending",
+                        BillingNotification.notification_type.in_(lifecycle_types),
+                    )
+                )
+            ).all()
+            for notification, organization in pending_rows:
+                expected_prefix = f"{organization.lifecycle_state}_"
+                if (
+                    not notification.notification_type.startswith(expected_prefix)
+                    or organization.trial_ends_at is None
+                    or as_utc(notification.deadline_at)
+                    != as_utc(organization.trial_ends_at)
+                ):
+                    notification.state = "canceled"
+
+            organizations = (
+                await session.scalars(
+                    select(Organization).where(
+                        Organization.lifecycle_state.in_(("trial", "grace")),
+                        Organization.trial_ends_at.is_not(None),
+                    )
+                )
+            ).all()
+            for organization in organizations:
+                deadline = as_utc(organization.trial_ends_at)
+                remaining = deadline - checked_at
+                if remaining > timedelta(days=7):
+                    continue
+                if remaining > timedelta(days=1):
+                    phase = "ending_7d"
+                elif remaining > timedelta(0):
+                    phase = "ending_1d"
+                else:
+                    phase = "ended"
+                notification_type = f"{organization.lifecycle_state}_{phase}"
+                for pending_notification, pending_organization in pending_rows:
+                    if (
+                        pending_organization.id == organization.id
+                        and as_utc(pending_notification.deadline_at) == deadline
+                        and pending_notification.notification_type
+                        != notification_type
+                    ):
+                        pending_notification.state = "canceled"
+                event_key = (
+                    f"lifecycle:{organization.id}:{organization.lifecycle_state}:"
+                    f"{deadline.isoformat()}:{phase}"
+                )
+                values = {
+                    "id": new_id(),
+                    "organization_id": organization.id,
+                    "notification_type": notification_type,
+                    "event_key": event_key,
+                    "state": "pending",
+                    "deadline_at": deadline,
+                    "created_at": checked_at,
+                }
+                insert = (
+                    postgresql_insert(BillingNotification)
+                    if self.engine.dialect.name == "postgresql"
+                    else sqlite_insert(BillingNotification)
+                ).values(**values)
+                await session.execute(
+                    insert.on_conflict_do_nothing(index_elements=["event_key"])
+                )
+            await session.commit()
+
     async def list_pending_billing_notifications(
         self,
         limit: int = 20,
@@ -3187,6 +3352,8 @@ class ControlPlaneStore:
                     .where(
                         BillingNotification.state == "pending",
                         OrganizationContact.contact_role == "primary_admin",
+                        OrganizationContact.notifications_enabled.is_(True),
+                        Organization.lifecycle_state != "archived",
                     )
                     .order_by(BillingNotification.created_at)
                     .limit(safe_limit)
@@ -3199,9 +3366,9 @@ class ControlPlaneStore:
                 designator=organization.designator,
                 organization_name=organization.legal_name,
                 administrator_name=contact.name,
-                administrator_email=contact.email,
+                administrator_email=(organization.notification_email or contact.email),
                 notification_type=notification.notification_type,
-                grace_ends_at=as_utc(organization.trial_ends_at),
+                deadline_at=as_utc(notification.deadline_at),
             )
             for notification, organization, contact in rows
         )

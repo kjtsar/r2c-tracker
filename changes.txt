@@ -1,3 +1,9 @@
+v1.4.21:
+* Required managed-access applicants to acknowledge versioned safety terms explaining that RID2Caltopo and R2C Tracker are supplemental tools, may be unavailable or incomplete, and are not the sole source for safety-critical or incident-command decisions.
+* Added automated seven-day, one-day, and expiration notices for trial and grace deadlines with organization-scoped CSV and flight-log archive instructions; deadline passage does not automatically archive or shut down a site.
+* Required the platform administrator to confirm and audit direct contact with an organization administrator before manually archiving and disabling an organization site.
+* Paused public contribution solicitations and removed personal donation links while a fiscal sponsorship and long-term operating structure are evaluated.
+
 v1.4.20: deployed
 * Promoted the hosted evaluation to guarded live organization onboarding with permanent tenant paths, managed-access request intake, activation and access email, and tenant-scoped enrollment credentials.
 * Added platform-administrator controls to edit organization and administrator contact details, replace an administrator with an accountable reactivation flow, add prepaid credit, and archive or restore an organization while keeping its designator reserved.

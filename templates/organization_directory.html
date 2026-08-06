@@ -4,35 +4,6 @@
 
 {% block extra_head %}
 <style>
-  .support-banner {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 20px;
-    max-width: 900px;
-    margin: 0 auto;
-    padding: 11px 18px;
-    border-radius: 8px;
-    background: #102b20;
-    color: #f8f4e9;
-    font-size: 0.88rem;
-    line-height: 1.4;
-    text-align: center;
-  }
-  .support-banner p {
-    margin: 0;
-  }
-  .support-banner a {
-    flex: 0 0 auto;
-    color: #ff9a6f;
-    font-weight: 700;
-    text-decoration: underline;
-    text-underline-offset: 3px;
-  }
-  .organization-picker .support-banner {
-    border-radius: 0;
-    flex: 0 0 auto;
-  }
   .directory-shell {
     max-width: 760px;
     margin: 8vh auto 0;
@@ -175,12 +146,6 @@
     overflow-y: auto;
   }
   @media (max-width: 560px) {
-    .support-banner {
-      align-items: flex-start;
-      flex-direction: column;
-      gap: 4px;
-      text-align: left;
-    }
     .directory-shell {
       margin-top: 3vh;
       padding: 30px 20px;
@@ -198,10 +163,6 @@
 {% endblock %}
 
 {% block content %}
-<aside class="support-banner" aria-label="Community support">
-  <p><strong>Community-supported.</strong> Voluntary contributions help fund development, hosting, and administration. Contributions do not purchase access or priority.</p>
-  <a href="https://rid2caltopo.com/donations" aria-label="Learn how contributions support RID2Caltopo">Support the project →</a>
-</aside>
 <section class="directory-shell">
   <h1>Find your organization.</h1>
   <p>
@@ -222,10 +183,6 @@
 </section>
 
 <dialog class="organization-picker" id="organization-picker" aria-labelledby="organization-picker-title">
-  <aside class="support-banner" aria-label="Community support">
-    <p><strong>Community-supported.</strong> Voluntary contributions help fund development, hosting, and administration.</p>
-    <a href="https://rid2caltopo.com/donations" aria-label="Learn how contributions support RID2Caltopo">Support the project →</a>
-  </aside>
   <div class="picker-heading">
     <div>
       <h2 id="organization-picker-title">Organizations</h2>

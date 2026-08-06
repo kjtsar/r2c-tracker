@@ -248,31 +248,58 @@ def organization_site_ready() -> bool:
 async def deliver_pending_billing_notifications() -> None:
     if control_plane_store is None or not platform_admin_email_sender.is_configured:
         return
+    await control_plane_store.queue_lifecycle_deadline_notifications()
     notifications = await control_plane_store.list_pending_billing_notifications()
     for notification in notifications:
-        if notification.notification_type != "funding_exhausted":
-            continue
-        grace_ends = (
-            notification.grace_ends_at.strftime("%d %b %Y")
-            if notification.grace_ends_at
+        deadline = (
+            notification.deadline_at.strftime("%d %b %Y")
+            if notification.deadline_at
             else "the date shown in R2C Tracker"
         )
         try:
-            await asyncio.to_thread(
-                platform_admin_email_sender.send_organization_funding_exhausted,
-                recipient=notification.administrator_email,
-                administrator_name=notification.administrator_name,
-                organization_name=notification.organization_name,
-                designator=notification.designator,
-                grace_ends=grace_ends,
-                administration_url=(
-                    f"{CONTROL_PLANE_PUBLIC_URL.rstrip('/')}/"
-                    f"{notification.designator.lower()}/admin#service-status"
-                ),
+            administration_url = (
+                f"{CONTROL_PLANE_PUBLIC_URL.rstrip('/')}/"
+                f"{notification.designator.lower()}/admin#service-status"
             )
+            if notification.notification_type == "funding_exhausted":
+                await asyncio.to_thread(
+                    platform_admin_email_sender.send_organization_funding_exhausted,
+                    recipient=notification.administrator_email,
+                    administrator_name=notification.administrator_name,
+                    organization_name=notification.organization_name,
+                    designator=notification.designator,
+                    grace_ends=deadline,
+                    administration_url=administration_url,
+                )
+            else:
+                lifecycle, _, phase = notification.notification_type.partition("_")
+                timing = {
+                    "ending_7d": "ends within seven days",
+                    "ending_1d": "ends within one day",
+                    "ended": "has ended",
+                }.get(phase)
+                if lifecycle not in {"trial", "grace"} or timing is None:
+                    continue
+                await asyncio.to_thread(
+                    platform_admin_email_sender.send_organization_lifecycle_deadline,
+                    recipient=notification.administrator_email,
+                    administrator_name=notification.administrator_name,
+                    organization_name=notification.organization_name,
+                    designator=notification.designator,
+                    lifecycle_label=(
+                        "trial" if lifecycle == "trial" else "grace period"
+                    ),
+                    timing=timing,
+                    deadline=deadline,
+                    administration_url=administration_url,
+                    records_url=(
+                        f"{CONTROL_PLANE_PUBLIC_URL.rstrip('/')}/"
+                        f"{notification.designator.lower()}/admin/flights"
+                    ),
+                )
             await control_plane_store.mark_billing_notification_sent(notification.id)
         except Exception as exc:
-            logging.exception("Funding notification delivery failed")
+            logging.exception("Organization notification delivery failed")
             await control_plane_store.mark_billing_notification_failed(
                 notification.id,
                 str(exc),
@@ -4354,6 +4381,8 @@ async def managed_access_request_ingest(
         organization_name: Annotated[str, Form()],
         designator: Annotated[str, Form()],
         source_host: Annotated[str, Form()],
+        terms_version: Annotated[str, Form()],
+        terms_acknowledged: Annotated[str, Form()],
         requester_phone: Annotated[str, Form()] = ""):
     if not MANAGED_REQUEST_INGEST_KEY:
         raise HTTPException(status_code=503, detail="Request intake is not configured.")
@@ -4371,6 +4400,9 @@ async def managed_access_request_ingest(
             organization_name=organization_name,
             designator=designator,
             source_host=source_host,
+            terms_acknowledged=terms_acknowledged.strip().lower()
+            in {"1", "true", "yes", "on"},
+            terms_version=terms_version,
         )
     except (ControlPlaneError, InvalidOrganizationError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -5245,6 +5277,8 @@ async def platform_admin_archive_organization(
         designator: str,
         confirmation: Annotated[str, Form()],
         form_token: Annotated[str, Form()],
+        administrator_contact: Annotated[str, Form()] = "",
+        contact_confirmed: Annotated[str, Form()] = "",
         user=Depends(check_platform_admin)):
     verify_csrf(request, "platform_organizations", form_token)
     try:
@@ -5256,9 +5290,14 @@ async def platform_admin_archive_organization(
             raise ControlPlaneError(
                 f"Type {clean_designator} to confirm organization archival."
             )
+        if contact_confirmed.strip().lower() not in {"1", "true", "yes", "on"}:
+            raise ControlPlaneError(
+                "Confirm direct contact with the organization administrator before archival."
+            )
         organization = await control_plane_store.archive_organization(
             designator=clean_designator,
             actor_id=user.id,
+            administrator_contact=administrator_contact,
         )
         clear_organization_session(request)
         flash(

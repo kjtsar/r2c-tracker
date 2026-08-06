@@ -237,6 +237,37 @@ class PlatformAdminAuthHelpersTest(unittest.TestCase):
         )
         self.assertIn("gross amount, Stripe processing fee, and net", content)
 
+    @patch("platform_admin_auth.smtplib.SMTP")
+    def test_lifecycle_deadline_email_explains_export_and_human_contact(self, smtp):
+        sender = SmtpPlatformAdminEmailSender(
+            host="smtp.example.org",
+            port=587,
+            username="tracker@example.org",
+            password="secret manager value",
+            from_address="tracker@example.org",
+        )
+
+        sender.send_organization_lifecycle_deadline(
+            recipient="admin@ncssar.example",
+            administrator_name="Site Administrator",
+            organization_name="North County SAR",
+            designator="NCSSAR",
+            lifecycle_label="grace period",
+            timing="ends within seven days",
+            deadline="03 Sep 2026",
+            administration_url="https://r2c-tracker.com/ncssar/admin#service-status",
+            records_url="https://r2c-tracker.com/ncssar/admin/flights",
+        )
+
+        message = smtp.return_value.__enter__.return_value.send_message.call_args.args[0]
+        content = message.get_content()
+        self.assertIn("grace period ends within seven days", message["Subject"])
+        self.assertIn("does not automatically archive or shut down", content)
+        self.assertIn("will contact your organization administrator", content)
+        self.assertIn("Export as CSV", content)
+        self.assertIn("Download Flight Log Archive", content)
+        self.assertIn("https://r2c-tracker.com/ncssar/admin/flights", content)
+
     @patch("google.oauth2.id_token.verify_oauth2_token")
     @patch("platform_admin_auth.requests.post")
     def test_google_exchange_requires_verified_email_and_matching_nonce(
