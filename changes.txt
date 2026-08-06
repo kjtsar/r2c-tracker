@@ -1,4 +1,4 @@
-v1.4.20:
+v1.4.20: deployed
 * Promoted the hosted evaluation to guarded live organization onboarding with permanent tenant paths, managed-access request intake, activation and access email, and tenant-scoped enrollment credentials.
 * Added platform-administrator controls to edit organization and administrator contact details, replace an administrator with an accountable reactivation flow, add prepaid credit, and archive or restore an organization while keeping its designator reserved.
 * Added send-only Gmail authorization for invitations and notifications plus non-enumerating, rate-limited, single-use organization password reset links; OAuth-only members continue to sign in without an R2C password.
