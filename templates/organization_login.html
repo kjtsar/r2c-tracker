@@ -56,8 +56,9 @@
      href="{{ google_start_url }}">
     Continue with Google
   </a>
-  <div class="auth-divider">or use your website password</div>
+  <div class="auth-divider">or use your R2C password</div>
   {% endif %}
+  {% if password_login_enabled %}
   <form class="auth-form" method="post"
         action="/{{ organization.designator|lower }}/login">
     <input type="hidden" name="form_token" value="{{ csrf_token }}">
@@ -72,5 +73,7 @@
     </label>
     <button type="submit">Sign in</button>
   </form>
+  <p><a href="/{{ organization.designator|lower }}/forgot-password">Forgot password?</a></p>
+  {% endif %}
 </section>
 {% endblock %}

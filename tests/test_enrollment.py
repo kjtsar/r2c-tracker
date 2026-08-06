@@ -24,7 +24,7 @@ class ControlPlaneTokenServiceTest(unittest.TestCase):
             id="48e48566-9802-4ed3-b090-36d074a658b3",
             legal_name="North County Search and Rescue",
             designator="NCSSAR",
-            hostname="ncssar.r2c-tracker.com",
+            hostname="r2c-tracker.com/ncssar",
             lifecycle_state="trial",
             provisioning_state="simulation ready",
             billing_mode="shadow billing",

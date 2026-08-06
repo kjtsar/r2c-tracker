@@ -20,7 +20,7 @@
       color: #8b1f1f;
   }
   .activation-form { display: grid; gap: 16px; }
-  .activation-form label { display: grid; gap: 6px; font-weight: 700; color: #425764; }
+  .activation-form label { display: grid; gap: 6px; font-weight: 700; }
   .activation-form input {
       padding: 11px;
       border: 1px solid #aebdc7;
@@ -37,6 +37,7 @@
       font-weight: 800;
       cursor: pointer;
   }
+  .auth-divider { text-align: center; color: #60717d; margin: 18px 0; }
 </style>
 {% endblock %}
 {% block content %}
@@ -46,9 +47,26 @@
   <div class="activation-error" role="alert">{{ activation_error }}</div>
   {% else %}
   <p>
-    Create the administrator password for <strong>{{ designator }}</strong>
-    ({{ email }}). The invitation becomes unusable after activation.
+    Verify <strong>{{ email }}</strong> with one of the available sign-in
+    providers to activate the administrator account for
+    <strong>{{ designator }}</strong>, or create an R2C Tracker password.
   </p>
+  <p>
+    <strong>Account notice:</strong> By activating, you confirm that you are
+    authorized to enable this organization's R2C Tracker account. If prepaid
+    credit is not available, the 30-day trial begins immediately. Otherwise,
+    the account remains funded until cumulative attributed GCP usage consumes
+    the credit, followed by a 30-day grace period.
+  </p>
+  {% if google_login_enabled %}
+  <form class="activation-form" method="post"
+        action="/{{ designator|lower }}/activate/google">
+    <input type="hidden" name="form_token" value="{{ csrf_token }}">
+    <input type="hidden" name="token" value="{{ token }}">
+    <button type="submit">Continue with Google</button>
+  </form>
+  <div class="auth-divider">or create an R2C password</div>
+  {% endif %}
   <form class="activation-form" method="post"
         action="/{{ designator|lower }}/activate">
     <input type="hidden" name="form_token" value="{{ csrf_token }}">
@@ -63,7 +81,7 @@
       <input type="password" name="password_confirm" minlength="12" required
              autocomplete="new-password">
     </label>
-    <button type="submit">Activate account</button>
+    <button type="submit">Create password and activate</button>
   </form>
   {% endif %}
 </section>

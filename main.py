@@ -66,6 +66,7 @@ from platform_admin import (
     BigQueryBillingSnapshotProvider,
     CostBreakdown,
     OrganizationBillingSummary,
+    allocate_platform_costs,
     build_illustrative_platform_snapshot,
     build_pending_platform_snapshot,
     public_snapshot_dict,
@@ -75,6 +76,7 @@ from platform_admin_identity import (
     SecretManagerPlatformAdminIdentityProvider,
 )
 from platform_admin_auth import (
+    GmailApiPlatformAdminEmailSender,
     GoogleOidcClient,
     PlatformAdminAuthError,
     SmtpPlatformAdminEmailSender,
@@ -83,6 +85,7 @@ from turn_credentials import (
     CloudflareTurnCredentialProvider,
     sanitize_ice_servers,
 )
+from stripe_checkout import StripeCheckoutError, StripeCheckoutProvider
 
 # --- CONFIGURATION & DATABASE SETUP ---
 DB_URL = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./test.db") # Defaults to local file if no Cloud SQL
@@ -119,6 +122,9 @@ CONTROL_PLANE_SIMULATION = (
 )
 CONTROL_PLANE_SIGNING_KEY = os.environ.get(
     "CONTROL_PLANE_SIGNING_KEY", ""
+).strip()
+MANAGED_REQUEST_INGEST_KEY = os.environ.get(
+    "MANAGED_REQUEST_INGEST_KEY", ""
 ).strip()
 CONTROL_PLANE_PUBLIC_URL = os.environ.get(
     "CONTROL_PLANE_PUBLIC_URL", "https://r2c-tracker.com"
@@ -163,11 +169,13 @@ class DeviceEnrollmentRedeemRequest(BaseModel):
 class BrowserVideoPreflightOffer(BaseModel):
     sdp: str = Field(min_length=3, max_length=262_144)
     form_token: str = Field(min_length=16, max_length=512)
+    relay_candidate_ms: int = Field(default=0, ge=0, le=60_000)
 
 
 class BrowserVideoMediaOffer(BaseModel):
     sdp: str = Field(min_length=3, max_length=262_144)
     form_token: str = Field(min_length=16, max_length=512)
+    relay_candidate_ms: int = Field(default=0, ge=0, le=60_000)
 
 
 class BrowserVideoMediaState(BaseModel):
@@ -208,7 +216,15 @@ platform_admin_identity_provider = (
     else None
 )
 google_oidc_client = GoogleOidcClient.from_environment()
-platform_admin_email_sender = SmtpPlatformAdminEmailSender.from_environment()
+gmail_email_sender = GmailApiPlatformAdminEmailSender.from_environment()
+smtp_email_sender = SmtpPlatformAdminEmailSender.from_environment()
+platform_admin_email_sender = (
+    gmail_email_sender if gmail_email_sender.is_configured else smtp_email_sender
+)
+stripe_checkout_provider = StripeCheckoutProvider.from_environment()
+PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_TARGET = os.environ.get(
+    "PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_TARGET", ""
+).strip()
 control_plane_tokens = (
     ControlPlaneTokenService(
         CONTROL_PLANE_SIGNING_KEY,
@@ -227,6 +243,49 @@ def organization_site_ready() -> bool:
         and SECRET_KEY
         and (CONTROL_PLANE_SIMULATION or SESSION_COOKIE_HTTPS_ONLY)
     )
+
+
+async def deliver_pending_billing_notifications() -> None:
+    if control_plane_store is None or not platform_admin_email_sender.is_configured:
+        return
+    notifications = await control_plane_store.list_pending_billing_notifications()
+    for notification in notifications:
+        if notification.notification_type != "funding_exhausted":
+            continue
+        grace_ends = (
+            notification.grace_ends_at.strftime("%d %b %Y")
+            if notification.grace_ends_at
+            else "the date shown in R2C Tracker"
+        )
+        try:
+            await asyncio.to_thread(
+                platform_admin_email_sender.send_organization_funding_exhausted,
+                recipient=notification.administrator_email,
+                administrator_name=notification.administrator_name,
+                organization_name=notification.organization_name,
+                designator=notification.designator,
+                grace_ends=grace_ends,
+                administration_url=(
+                    f"{CONTROL_PLANE_PUBLIC_URL.rstrip('/')}/"
+                    f"{notification.designator.lower()}/admin#service-status"
+                ),
+            )
+            await control_plane_store.mark_billing_notification_sent(notification.id)
+        except Exception as exc:
+            logging.exception("Funding notification delivery failed")
+            await control_plane_store.mark_billing_notification_failed(
+                notification.id,
+                str(exc),
+            )
+
+
+async def billing_notification_worker(stop: asyncio.Event) -> None:
+    while not stop.is_set():
+        await deliver_pending_billing_notifications()
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=60)
+        except TimeoutError:
+            pass
 
 
 def load_platform_billing_snapshot():
@@ -646,10 +705,19 @@ async def lifespan(app: FastAPI):
     await init_db()
     if control_plane_store is not None:
         await control_plane_store.init()
+    billing_notification_stop = asyncio.Event()
+    billing_notification_task = None
+    if control_plane_store is not None and platform_admin_email_sender.is_configured:
+        billing_notification_task = asyncio.create_task(
+            billing_notification_worker(billing_notification_stop)
+        )
     await r2c_hub.start()
     yield
     # Shutdown Clean up resources (if needed)
     await r2c_hub.stop()
+    billing_notification_stop.set()
+    if billing_notification_task is not None:
+        await billing_notification_task
     if control_plane_store is not None:
         await control_plane_store.dispose()
     await engine.dispose()
@@ -674,7 +742,9 @@ async def protect_control_plane_pages(request: Request, call_next):
         response.headers["Cache-Control"] = "no-cache, max-age=0"
     organization_page = re.fullmatch(
         r"/[a-z0-9]{2,16}/(?:"
-        r"activate|login|google/start|logout|admin|settings|members|"
+        r"activate(?:/google)?|login|forgot-password|reset-password|"
+        r"google/start|logout|admin(?:/.*)?|settings|members|"
+        r"billing/checkout|"
         r"streams(?:/status|/[^/]+/request|/requests/[^/]+/"
         r"(?:cancel|preflight/(?:offer|status)))?|"
         r"enroll(?:/credential)?|"
@@ -4253,7 +4323,11 @@ async def organization_directory(
     if control_plane_store is not None:
         organizations = tuple(
             sorted(
-                await control_plane_store.list_organizations(),
+                (
+                    organization
+                    for organization in await control_plane_store.list_organizations()
+                    if organization.lifecycle_state != "archived"
+                ),
                 key=lambda organization: (
                     organization.legal_name.casefold(),
                     organization.designator,
@@ -4270,6 +4344,37 @@ async def organization_directory(
             "organizations": organizations,
         },
     )
+
+
+@app.post("/managed-access-requests", include_in_schema=False)
+async def managed_access_request_ingest(
+        request: Request,
+        requester_name: Annotated[str, Form()],
+        requester_email: Annotated[str, Form()],
+        organization_name: Annotated[str, Form()],
+        designator: Annotated[str, Form()],
+        source_host: Annotated[str, Form()],
+        requester_phone: Annotated[str, Form()] = ""):
+    if not MANAGED_REQUEST_INGEST_KEY:
+        raise HTTPException(status_code=503, detail="Request intake is not configured.")
+    authorization = request.headers.get("authorization", "")
+    expected = f"Bearer {MANAGED_REQUEST_INGEST_KEY}"
+    if not secrets.compare_digest(authorization, expected):
+        raise HTTPException(status_code=403, detail="Request intake authorization failed.")
+    if control_plane_store is None:
+        raise HTTPException(status_code=503, detail="Request storage is not configured.")
+    try:
+        record = await control_plane_store.create_managed_access_request(
+            requester_name=requester_name,
+            requester_email=requester_email,
+            requester_phone=requester_phone,
+            organization_name=organization_name,
+            designator=designator,
+            source_host=source_host,
+        )
+    except (ControlPlaneError, InvalidOrganizationError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"status": "received", "request_id": record.id}
 
 
 async def render_public_dashboard(
@@ -4461,7 +4566,6 @@ async def platform_admin_login_page(
                 "platform_admin_setup_request",
             ),
             "next": safe_next,
-            "platform_admin_email": identity.email,
             "has_password": has_password,
             "google_login_enabled": google_oidc_client.is_configured,
             "email_setup_enabled": platform_admin_email_sender.is_configured,
@@ -4552,12 +4656,118 @@ async def platform_admin_google_start(
     )
 
 
+@app.get("/platform-admin/gmail/start")
+async def platform_admin_gmail_start(
+        request: Request,
+        _user=Depends(check_platform_admin)):
+    identity, _authoritative_user = await current_platform_admin_identity()
+    if not PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_TARGET:
+        flash(request, "Gmail sender setup is not enabled.", "warning")
+        return RedirectResponse(
+            url="/platform-admin/account",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    try:
+        authorization_url, flow = google_oidc_client.gmail_authorization_request(
+            platform_admin_google_redirect_uri()
+        )
+    except PlatformAdminAuthError as exc:
+        flash(request, str(exc), "warning")
+        return RedirectResponse(
+            url="/platform-admin/account",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    request.session["platform_admin_gmail_flow"] = {
+        **flow,
+        "identity_generation": identity.generation,
+    }
+    return RedirectResponse(
+        url=authorization_url,
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+def store_gmail_refresh_token(refresh_token: str) -> None:
+    if not PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_TARGET:
+        raise PlatformAdminAuthError("Gmail sender setup is not enabled.")
+    try:
+        from google.cloud import secretmanager
+
+        client = secretmanager.SecretManagerServiceClient()
+        client.add_secret_version(
+            request={
+                "parent": PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_TARGET,
+                "payload": {"data": refresh_token.encode("utf-8")},
+            }
+        )
+    except Exception as exc:
+        raise PlatformAdminAuthError(
+            "The Gmail credential could not be saved."
+        ) from exc
+
+
 @app.get("/platform-admin/google/callback")
 async def platform_admin_google_callback(
         request: Request,
         code: str = "",
         state: str = "",
         error: str = ""):
+    gmail_flow = request.session.pop("platform_admin_gmail_flow", None)
+    if isinstance(gmail_flow, dict):
+        try:
+            user = await check_platform_admin(request)
+            identity, authoritative_user = await current_platform_admin_identity()
+            if user.id != authoritative_user.id or not secrets.compare_digest(
+                identity.generation,
+                str(gmail_flow.get("identity_generation", "")),
+            ):
+                raise PlatformAdminAuthError(
+                    "The authorized administrator changed. Sign in again."
+                )
+            if (
+                error
+                or not code
+                or not state
+                or not secrets.compare_digest(
+                    state, str(gmail_flow.get("state", ""))
+                )
+            ):
+                raise PlatformAdminAuthError(
+                    "Google Gmail authorization was canceled or could not be verified."
+                )
+            authorization = await asyncio.to_thread(
+                google_oidc_client.exchange_gmail_code,
+                code=code,
+                redirect_uri=platform_admin_google_redirect_uri(),
+                verifier=str(gmail_flow.get("verifier", "")),
+                expected_nonce=str(gmail_flow.get("nonce", "")),
+            )
+            if not secrets.compare_digest(
+                authorization.identity.email, identity.email
+            ):
+                raise PlatformAdminAuthError(
+                    "Gmail must be authorized by the platform administrator account."
+                )
+            await asyncio.to_thread(
+                store_gmail_refresh_token,
+                authorization.refresh_token,
+            )
+        except (HTTPException, PlatformAdminAuthError) as exc:
+            logging.warning("Gmail sender authorization failed: %s", exc)
+            flash(request, str(exc), "warning")
+            return RedirectResponse(
+                url="/platform-admin/account",
+                status_code=status.HTTP_303_SEE_OTHER,
+            )
+        flash(
+            request,
+            "Gmail sender authorized. R2C Tracker is ready for its final mail deployment.",
+            "success",
+        )
+        return RedirectResponse(
+            url="/platform-admin/account",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
     flow = request.session.pop("platform_admin_google_flow", None)
     if (
         error
@@ -4753,6 +4963,11 @@ async def platform_admin_account(
             "include_datetime_script": False,
             "platform_admin": user,
             "csrf_token": csrf_token(request, "platform_admin_password"),
+            "gmail_setup_enabled": bool(
+                PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_TARGET
+                and google_oidc_client.is_configured
+            ),
+            "email_sender_configured": platform_admin_email_sender.is_configured,
         },
     )
 
@@ -4791,22 +5006,60 @@ async def platform_admin_organizations(
     activation_url = request.session.pop("_platform_activation_url", None)
     provisioning_jobs = ()
     audit_events = ()
+    managed_access_requests = ()
     ledger_nonces = {}
     if control_plane_store is not None:
         (
             records,
-            usage_costs,
             usage_aggregates,
             provisioning_jobs,
             audit_events,
+            managed_access_requests,
             collected_mtd,
         ) = await asyncio.gather(
             control_plane_store.list_organizations(),
-            control_plane_store.month_to_date_usage_costs(),
             control_plane_store.month_to_date_usage_aggregates(),
             control_plane_store.list_provisioning_jobs(),
             control_plane_store.list_audit_events(),
+            control_plane_store.list_managed_access_requests(),
             control_plane_store.collected_month_to_date(),
+        )
+        allocation_inputs = {
+            record.id: AggregateUsage(
+                requests=(
+                    usage_aggregates[record.id].faa_proxy_requests
+                    if record.id in usage_aggregates else 0
+                ),
+                network_bytes=(
+                    usage_aggregates[record.id].network_bytes
+                    if record.id in usage_aggregates else 0
+                ),
+                storage_byte_days=(
+                    usage_aggregates[record.id].storage_byte_days
+                    if record.id in usage_aggregates else 0
+                ),
+                compute_units=(
+                    usage_aggregates[record.id].compute_units
+                    if record.id in usage_aggregates else Decimal("0")
+                ),
+                database_units=(
+                    usage_aggregates[record.id].database_units
+                    if record.id in usage_aggregates else Decimal("0")
+                ),
+                turn_relay_bytes=(
+                    usage_aggregates[record.id].turn_relay_bytes
+                    if record.id in usage_aggregates else 0
+                ),
+            )
+            for record in records
+            if (
+                record.lifecycle_state != "archived"
+                and record.provisioning_state == "ready"
+            )
+        }
+        allocated_costs, allocation_unallocated = allocate_platform_costs(
+            snapshot.actual_cost_breakdown_mtd,
+            allocation_inputs if snapshot.source_status == "ready" else {},
         )
         organizations = tuple(
             OrganizationBillingSummary(
@@ -4820,23 +5073,14 @@ async def platform_admin_organizations(
                 billing_mode=record.billing_mode,
                 trial_ends_at=record.trial_ends_at,
                 credit_balance=record.credit_balance,
-                month_to_date_cost=(
-                    CostBreakdown(
-                        compute=usage_costs[record.id].compute,
-                        network=usage_costs[record.id].network,
-                        storage=usage_costs[record.id].storage,
-                        database=usage_costs[record.id].database,
-                        other=usage_costs[record.id].other,
-                    )
-                    if (
-                        snapshot.source_status == "ready"
-                        and record.id in usage_costs
-                    )
-                    else CostBreakdown()
+                month_to_date_cost=allocated_costs.get(
+                    record.id,
+                    CostBreakdown(),
                 ),
                 primary_admin_postal_address=(
                     record.primary_admin_postal_address
                 ),
+                primary_admin_phone=record.primary_admin_phone,
                 aggregate_usage=(
                     AggregateUsage(
                         requests=usage_aggregates[record.id].faa_proxy_requests,
@@ -4865,15 +5109,15 @@ async def platform_admin_organizations(
             snapshot,
             organizations=organizations,
             attributed_cost_mtd=attributed,
-            unallocated_cost_mtd=snapshot.actual_cost_mtd - attributed,
+            unallocated_cost_mtd=allocation_unallocated,
             collected_mtd=collected_mtd,
             organizations_are_illustrative=False,
         )
-        if CONTROL_PLANE_SIMULATION:
-            ledger_nonces = {
-                record.designator: secrets.token_urlsafe(24)
-                for record in records
-            }
+        ledger_nonces = {
+            record.designator: secrets.token_urlsafe(24)
+            for record in records
+            if record.lifecycle_state != "archived"
+        }
     return templates.TemplateResponse(
         request=request,
         name="platform_admin.html",
@@ -4900,6 +5144,7 @@ async def platform_admin_organizations(
             "activation_url": activation_url,
             "provisioning_jobs": provisioning_jobs,
             "audit_events": audit_events,
+            "managed_access_requests": managed_access_requests,
             "ledger_nonces": ledger_nonces,
             "platform_admin": user,
             "account_csrf_token": csrf_token(
@@ -4919,17 +5164,9 @@ async def platform_admin_create_organization(
         admin_email: Annotated[str, Form()],
         postal_address: Annotated[str, Form()],
         form_token: Annotated[str, Form()],
-        pilot_acknowledged: Annotated[Optional[str], Form()] = None,
+        admin_phone: Annotated[str, Form()] = "",
         user=Depends(check_platform_admin)):
     verify_csrf(request, "platform_organizations", form_token)
-    if pilot_acknowledged != "yes":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                "Confirm that the organization understands this is an "
-                "unpriced pilot before creating the account."
-            ),
-        )
     if control_plane_store is None or control_plane_tokens is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -4940,7 +5177,7 @@ async def platform_admin_create_organization(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
                 "Live organization provisioning requires the configured "
-                "STARTTLS email sender."
+                "outbound email sender."
             ),
         )
     try:
@@ -4949,10 +5186,10 @@ async def platform_admin_create_organization(
             designator=designator,
             admin_name=admin_name,
             admin_email=admin_email,
+            admin_phone=admin_phone,
             postal_address=postal_address,
             actor_id=user.id,
             simulation=CONTROL_PLANE_SIMULATION,
-            pilot_acknowledged=True,
         )
         invitation = await control_plane_store.get_invitation(
             organization.designator,
@@ -5002,8 +5239,163 @@ async def platform_admin_create_organization(
     )
 
 
+@app.post("/platform-admin/organizations/{designator}/archive")
+async def platform_admin_archive_organization(
+        request: Request,
+        designator: str,
+        confirmation: Annotated[str, Form()],
+        form_token: Annotated[str, Form()],
+        user=Depends(check_platform_admin)):
+    verify_csrf(request, "platform_organizations", form_token)
+    try:
+        clean_designator = designator.strip().upper()
+        if not secrets.compare_digest(
+            confirmation.strip().upper(),
+            clean_designator,
+        ):
+            raise ControlPlaneError(
+                f"Type {clean_designator} to confirm organization archival."
+            )
+        organization = await control_plane_store.archive_organization(
+            designator=clean_designator,
+            actor_id=user.id,
+        )
+        clear_organization_session(request)
+        flash(
+            request,
+            (
+                f"{organization.designator} archived. Its site access, users, "
+                "enrollment campaigns, device credentials, and active streams "
+                "have been disabled; its designator remains reserved."
+            ),
+            "success",
+        )
+    except (ControlPlaneError, InvalidOrganizationError, ValueError) as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(
+        url="/platform-admin/organizations",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post("/platform-admin/organizations/{designator}/contact")
+async def platform_admin_update_organization_contact(
+        request: Request,
+        designator: str,
+        legal_name: Annotated[str, Form()],
+        admin_name: Annotated[str, Form()],
+        admin_email: Annotated[str, Form()],
+        admin_phone: Annotated[str, Form()],
+        postal_address: Annotated[str, Form()],
+        form_token: Annotated[str, Form()],
+        user=Depends(check_platform_admin)):
+    verify_csrf(request, "platform_organizations", form_token)
+    if control_plane_store is None or control_plane_tokens is None:
+        raise HTTPException(status_code=503, detail="Organization administration is not configured.")
+    if not platform_admin_email_sender.is_configured:
+        raise HTTPException(status_code=503, detail="Administrator email is not configured.")
+    try:
+        update_record = await control_plane_store.update_organization_administrator(
+            designator=designator,
+            legal_name=legal_name,
+            admin_name=admin_name,
+            admin_email=admin_email,
+            admin_phone=admin_phone,
+            postal_address=postal_address,
+            actor_id=user.id,
+        )
+        organization = update_record.organization
+        if update_record.administrator_changed:
+            invitation = await control_plane_store.get_invitation(
+                organization.designator,
+                organization.primary_admin_email,
+            )
+            if invitation is None:
+                raise ControlPlaneError("New administrator invitation is unavailable.")
+            await asyncio.to_thread(
+                platform_admin_email_sender.send_organization_activation,
+                recipient=organization.primary_admin_email,
+                administrator_name=organization.primary_admin_name,
+                organization_name=organization.legal_name,
+                designator=organization.designator,
+                activation_url=control_plane_tokens.activation_url(invitation),
+            )
+            await asyncio.to_thread(
+                platform_admin_email_sender.send_organization_administrator_changed,
+                recipient=update_record.old_email,
+                former_administrator_name=update_record.old_name,
+                organization_name=organization.legal_name,
+                designator=organization.designator,
+                new_administrator_name=organization.primary_admin_name,
+                new_administrator_email=organization.primary_admin_email,
+            )
+            flash(
+                request,
+                (
+                    f"{organization.designator} administrator replaced. An activation "
+                    f"invitation was sent to {organization.primary_admin_email}, and "
+                    f"an accountability notice was sent to {update_record.old_email}."
+                ),
+                "success",
+            )
+        else:
+            flash(request, f"{organization.designator} contact information updated.", "success")
+    except (ControlPlaneError, InvalidOrganizationError, PlatformAdminAuthError, ValueError) as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(
+        url="/platform-admin/organizations",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post("/platform-admin/organizations/{designator}/unarchive")
+async def platform_admin_unarchive_organization(
+        request: Request,
+        designator: str,
+        form_token: Annotated[str, Form()],
+        user=Depends(check_platform_admin)):
+    verify_csrf(request, "platform_organizations", form_token)
+    if control_plane_store is None or control_plane_tokens is None:
+        raise HTTPException(status_code=503, detail="Organization administration is not configured.")
+    if not platform_admin_email_sender.is_configured:
+        raise HTTPException(status_code=503, detail="Administrator email is not configured.")
+    try:
+        organization = await control_plane_store.unarchive_organization(
+            designator=designator,
+            actor_id=user.id,
+        )
+        invitation = await control_plane_store.get_invitation(
+            organization.designator,
+            organization.primary_admin_email,
+        )
+        if invitation is None:
+            raise ControlPlaneError("Restored administrator invitation is unavailable.")
+        await asyncio.to_thread(
+            platform_admin_email_sender.send_organization_activation,
+            recipient=organization.primary_admin_email,
+            administrator_name=organization.primary_admin_name,
+            organization_name=organization.legal_name,
+            designator=organization.designator,
+            activation_url=control_plane_tokens.activation_url(invitation),
+        )
+        flash(
+            request,
+            (
+                f"{organization.designator} unarchived. A fresh administrator invitation "
+                "was sent; prior device credentials and enrollment campaigns remain revoked."
+            ),
+            "success",
+        )
+    except (ControlPlaneError, InvalidOrganizationError, PlatformAdminAuthError, ValueError) as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(
+        url="/platform-admin/organizations",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
 @app.post("/platform-admin/organizations/{designator}/credit")
-async def platform_admin_add_simulation_credit(
+async def platform_admin_add_organization_credit(
         request: Request,
         designator: str,
         amount: Annotated[Decimal, Form()],
@@ -5011,11 +5403,6 @@ async def platform_admin_add_simulation_credit(
         form_token: Annotated[str, Form()],
         user=Depends(check_platform_admin)):
     verify_csrf(request, "platform_organizations", form_token)
-    if not CONTROL_PLANE_SIMULATION:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Manual credit entry is available only in simulation mode.",
-        )
     if control_plane_store is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -5027,22 +5414,26 @@ async def platform_admin_add_simulation_credit(
     try:
         if amount <= 0 or amount > Decimal("100000"):
             raise ControlPlaneError(
-                "Simulation credit must be greater than zero and no more than $100,000."
+                "Credit must be greater than zero and no more than $100,000."
             )
         if not re.fullmatch(r"[A-Za-z0-9_-]{16,160}", idempotency_key):
-            raise ControlPlaneError("Invalid simulation credit request.")
+            raise ControlPlaneError("Invalid credit request.")
         await control_plane_store.append_ledger_entry(
             organization_id=organization.id,
             entry_type="credit",
             amount=amount,
-            description="Simulation prepaid account credit",
+            description=(
+                "Simulation prepaid account credit"
+                if CONTROL_PLANE_SIMULATION
+                else "Prepaid account credit"
+            ),
             idempotency_key=f"ui-{organization.id}-{idempotency_key}",
             created_by_type="platform_admin",
             created_by_id=user.id,
         )
         flash(
             request,
-            f"Recorded ${amount:.2f} simulation credit for {organization.designator}.",
+            f"Added ${amount:.2f} credit for {organization.designator}.",
             "success",
         )
     except ControlPlaneError as exc:
@@ -5078,27 +5469,49 @@ async def platform_admin_send_organization_invitation(
         organization = await control_plane_store.get_organization(designator)
         if organization is None:
             raise ControlPlaneError("Organization not found.")
-        invitation = await control_plane_store.renew_invitation(
-            organization.designator,
-            organization.primary_admin_email,
-        )
-        await asyncio.to_thread(
-            platform_admin_email_sender.send_organization_activation,
-            recipient=organization.primary_admin_email,
-            administrator_name=organization.primary_admin_name,
-            organization_name=organization.legal_name,
-            designator=organization.designator,
-            activation_url=control_plane_tokens.activation_url(invitation),
-        )
-        await control_plane_store.mark_organization_invitation_sent(
-            organization_id=organization.id,
-            actor_id=user.id,
-        )
-        flash(
-            request,
-            f"Activation invitation sent to {organization.primary_admin_email}.",
-            "success",
-        )
+        if organization.provisioning_state == "ready":
+            await asyncio.to_thread(
+                platform_admin_email_sender.send_organization_access,
+                recipient=organization.primary_admin_email,
+                administrator_name=organization.primary_admin_name,
+                organization_name=organization.legal_name,
+                designator=organization.designator,
+                login_url=(
+                    CONTROL_PLANE_PUBLIC_URL.rstrip("/")
+                    + f"/{organization.designator.lower()}/login"
+                ),
+            )
+            await control_plane_store.mark_organization_access_email_sent(
+                organization_id=organization.id,
+                actor_id=user.id,
+            )
+            flash(
+                request,
+                f"Administrator access email sent to {organization.primary_admin_email}.",
+                "success",
+            )
+        else:
+            invitation = await control_plane_store.renew_invitation(
+                organization.designator,
+                organization.primary_admin_email,
+            )
+            await asyncio.to_thread(
+                platform_admin_email_sender.send_organization_activation,
+                recipient=organization.primary_admin_email,
+                administrator_name=organization.primary_admin_name,
+                organization_name=organization.legal_name,
+                designator=organization.designator,
+                activation_url=control_plane_tokens.activation_url(invitation),
+            )
+            await control_plane_store.mark_organization_invitation_sent(
+                organization_id=organization.id,
+                actor_id=user.id,
+            )
+            flash(
+                request,
+                f"Activation invitation sent to {organization.primary_admin_email}.",
+                "success",
+            )
     except (ControlPlaneError, InvalidOrganizationError, PlatformAdminAuthError) as exc:
         flash(request, str(exc), "warning")
     return RedirectResponse(
@@ -5166,6 +5579,7 @@ async def organization_activate_page(
             "email": claims.email,
             "token": token,
             "csrf_token": csrf_token(request, "organization_activation"),
+            "google_login_enabled": google_oidc_client.is_configured,
             "organization_page_designator": claims.designator,
             "organization_identity_name": identity_name,
         },
@@ -5173,7 +5587,7 @@ async def organization_activate_page(
 
 
 @app.post("/{designator}/activate")
-async def organization_activate(
+async def organization_activate_with_password(
         request: Request,
         designator: str,
         token: Annotated[str, Form()],
@@ -5181,32 +5595,16 @@ async def organization_activate(
         password_confirm: Annotated[str, Form()],
         form_token: Annotated[str, Form()]):
     verify_csrf(request, "organization_activation", form_token)
-    if not organization_site_ready():
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Organization administration is not configured.",
+    if password != password_confirm:
+        flash(request, "Passwords do not match.", "warning")
+        return RedirectResponse(
+            url=f"/{designator.lower()}/activate?{urlencode({'token': token})}",
+            status_code=status.HTTP_303_SEE_OTHER,
         )
     try:
         claims = control_plane_tokens.decode_activation(token)
-        if (
-            claims.designator.lower() != designator.lower()
-            or password != password_confirm
-        ):
-            raise ControlPlaneError(
-                "The activation link is invalid or the passwords do not match."
-            )
-        invitation = await control_plane_store.get_invitation(
-            claims.designator,
-            claims.email,
-        )
-        if (
-            invitation is None
-            or invitation.user_id != claims.user_id
-            or invitation.organization_id != claims.organization_id
-        ):
-            raise ControlPlaneError(
-                "The administrator invitation is invalid or already used."
-            )
+        if claims.designator.lower() != designator.lower():
+            raise ControlPlaneError("The activation link is invalid.")
         user = await control_plane_store.activate_owner(
             claims.designator,
             claims.email,
@@ -5221,10 +5619,7 @@ async def organization_activate(
     ) as exc:
         flash(request, str(exc), "warning")
         return RedirectResponse(
-            url=(
-                f"/{designator.lower()}/activate?"
-                f"{urlencode({'token': token})}"
-            ),
+            url=f"/{designator.lower()}/activate?{urlencode({'token': token})}",
             status_code=status.HTTP_303_SEE_OTHER,
         )
     clear_organization_session(request)
@@ -5233,6 +5628,67 @@ async def organization_activate(
     flash(request, "Administrator account activated.", "success")
     return RedirectResponse(
         url=f"/{claims.designator.lower()}/admin",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post("/{designator}/activate/google")
+async def organization_activate_with_google(
+        request: Request,
+        designator: str,
+        token: Annotated[str, Form()],
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_activation", form_token)
+    if not organization_site_ready():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Organization administration is not configured.",
+        )
+    try:
+        claims = control_plane_tokens.decode_activation(token)
+        if claims.designator.lower() != designator.lower():
+            raise ControlPlaneError("The activation link is invalid.")
+        invitation = await control_plane_store.get_invitation(
+            claims.designator,
+            claims.email,
+        )
+        if (
+            invitation is None
+            or invitation.user_id != claims.user_id
+            or invitation.organization_id != claims.organization_id
+            or not secrets.compare_digest(invitation.activation_nonce, claims.nonce)
+        ):
+            raise ControlPlaneError(
+                "The administrator invitation is invalid or already used."
+            )
+        authorization_url, flow = google_oidc_client.authorization_request(
+            organization_google_redirect_uri()
+        )
+    except (
+        ControlPlaneError,
+        EnrollmentTokenError,
+        InvalidOrganizationError,
+        PlatformAdminAuthError,
+        ValueError,
+    ) as exc:
+        flash(request, str(exc), "warning")
+        return RedirectResponse(
+            url=(
+                f"/{designator.lower()}/activate?"
+                f"{urlencode({'token': token})}"
+            ),
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    request.session["organization_google_flow"] = {
+        **flow,
+        "organization_id": claims.organization_id,
+        "designator": claims.designator,
+        "next": "",
+        "activation_email": claims.email,
+        "activation_nonce": claims.nonce,
+    }
+    return RedirectResponse(
+        url=authorization_url,
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -5267,6 +5723,7 @@ async def organization_login_page(
             "organization": organization,
             "csrf_token": csrf_token(request, "organization_login"),
             "google_login_enabled": google_oidc_client.is_configured,
+            "password_login_enabled": True,
             "google_start_url": (
                 f"/{organization.designator.lower()}/google/start"
                 + ("?" + urlencode({"next": next_path}) if next_path else "")
@@ -5286,6 +5743,7 @@ async def organization_login(
         password: Annotated[str, Form()],
         form_token: Annotated[str, Form()],
         next: Annotated[str, Form()] = ""):
+    """Authenticate an organization user with an R2C password."""
     verify_csrf(request, "organization_login", form_token)
     if not organization_site_ready():
         raise HTTPException(
@@ -5318,6 +5776,148 @@ async def organization_login(
     dashboard_path = f"/{organization.designator.lower()}"
     return RedirectResponse(
         url=dashboard_path if next == dashboard_path else f"{dashboard_path}/admin",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.get("/{designator}/forgot-password", response_class=HTMLResponse)
+async def organization_forgot_password_page(
+        request: Request,
+        designator: str):
+    organization = await control_plane_store.get_organization(designator)
+    if organization is None:
+        raise HTTPException(status_code=404, detail="Organization not found.")
+    return templates.TemplateResponse(
+        request=request,
+        name="organization_forgot_password.html",
+        context={
+            "request": request,
+            "enable_live_refresh": False,
+            "include_leaflet": False,
+            "include_datetime_script": False,
+            "organization": organization,
+            "csrf_token": csrf_token(request, "organization_password_reset_request"),
+            "organization_page_designator": organization.designator,
+            "organization_identity_name": await organization_page_identity(
+                request, organization.designator
+            ),
+        },
+    )
+
+
+@app.post("/{designator}/forgot-password")
+async def organization_forgot_password_request(
+        request: Request,
+        designator: str,
+        email: Annotated[str, Form()],
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_password_reset_request", form_token)
+    organization = await control_plane_store.get_organization(designator)
+    if organization is None:
+        raise HTTPException(status_code=404, detail="Organization not found.")
+    if platform_admin_email_sender.is_configured:
+        try:
+            token = await control_plane_store.issue_organization_password_reset(
+                designator=organization.designator,
+                email=email,
+            )
+        except InvalidOrganizationError:
+            token = None
+        if token:
+            reset_url = (
+                CONTROL_PLANE_PUBLIC_URL.rstrip("/")
+                + f"/{organization.designator.lower()}/reset-password#"
+                + urlencode({"token": token})
+            )
+            try:
+                await asyncio.to_thread(
+                    platform_admin_email_sender.send_organization_password_reset,
+                    recipient=email.strip().lower(),
+                    organization_name=organization.legal_name,
+                    designator=organization.designator,
+                    reset_url=reset_url,
+                )
+            except PlatformAdminAuthError:
+                logging.exception("Unable to send organization password reset email")
+    flash(
+        request,
+        "If that address is registered, a password-reset link has been sent.",
+        "info",
+    )
+    return RedirectResponse(
+        url=f"/{organization.designator.lower()}/login",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+def organization_reset_password_response(
+        request: Request,
+        designator: str,
+        reset_token: str = "",
+        status_code: int = status.HTTP_200_OK):
+    return templates.TemplateResponse(
+        request=request,
+        name="organization_reset_password.html",
+        context={
+            "request": request,
+            "enable_live_refresh": False,
+            "include_leaflet": False,
+            "include_datetime_script": False,
+            "designator": designator.upper(),
+            "reset_token": reset_token,
+            "csrf_token": csrf_token(request, "organization_password_reset"),
+            "organization_page_designator": designator.upper(),
+            "organization_identity_name": "Guest",
+        },
+        status_code=status_code,
+    )
+
+
+@app.get("/{designator}/reset-password", response_class=HTMLResponse)
+async def organization_reset_password_page(request: Request, designator: str):
+    organization = await control_plane_store.get_organization(designator)
+    if organization is None:
+        raise HTTPException(status_code=404, detail="Organization not found.")
+    return organization_reset_password_response(request, organization.designator)
+
+
+@app.post("/{designator}/reset-password")
+async def organization_reset_password(
+        request: Request,
+        designator: str,
+        reset_token: Annotated[str, Form()],
+        new_password: Annotated[str, Form()],
+        new_password_confirm: Annotated[str, Form()],
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_password_reset", form_token)
+    if new_password != new_password_confirm:
+        flash(request, "Passwords do not match.", "warning")
+        return organization_reset_password_response(
+            request, designator, reset_token, status.HTTP_400_BAD_REQUEST
+        )
+    try:
+        user = await control_plane_store.set_organization_password_from_reset(
+            designator=designator,
+            token=reset_token,
+            new_password=new_password,
+        )
+    except ValueError as exc:
+        flash(request, str(exc), "warning")
+        return organization_reset_password_response(
+            request, designator, reset_token, status.HTTP_400_BAD_REQUEST
+        )
+    if user is None:
+        flash(request, "That reset link is invalid, expired, or already used.", "warning")
+        return RedirectResponse(
+            url=f"/{designator.lower()}/login",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    clear_organization_session(request)
+    request.session["organization_user_id"] = user.id
+    request.session["organization_designator"] = designator.upper()
+    flash(request, "Password reset complete.", "success")
+    return RedirectResponse(
+        url=f"/{designator.lower()}/admin",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -5429,6 +6029,14 @@ async def organization_google_callback(
         user = await control_plane_store.authorize_google_user(
             organization.designator,
             google_identity.email,
+            activation_nonce=(
+                str(flow.get("activation_nonce", ""))
+                if secrets.compare_digest(
+                    google_identity.email,
+                    str(flow.get("activation_email", "")),
+                )
+                else None
+            ),
         )
     except (PlatformAdminAuthError, InvalidOrganizationError) as exc:
         logging.warning("Google organization login failed: %s", exc)
@@ -5450,6 +6058,8 @@ async def organization_google_callback(
     request.session["organization_user_id"] = user.id
     request.session["organization_designator"] = organization.designator
     request.session["organization_google_subject"] = google_identity.subject
+    if flow.get("activation_nonce"):
+        flash(request, "Administrator account activated.", "success")
     dashboard_path = f"/{organization.designator.lower()}"
     return RedirectResponse(
         url=(
@@ -5506,10 +6116,105 @@ async def organization_admin(request: Request, designator: str):
             "invitation_email_enabled": (
                 platform_admin_email_sender.is_configured
             ),
+            "stripe_checkout_enabled": stripe_checkout_provider.is_configured,
             "organization_page_designator": organization.designator,
             "organization_identity_name": user.display_name,
         },
     )
+
+
+@app.post("/{designator}/billing/checkout")
+async def organization_billing_checkout(
+        request: Request,
+        designator: str,
+        amount: Annotated[Decimal, Form()],
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_admin", form_token)
+    organization, _user = await require_organization_user(
+        request,
+        designator,
+        required_roles=("organization_owner", "billing_admin"),
+        redirect_to_login=True,
+    )
+    try:
+        checkout_url = await asyncio.to_thread(
+            stripe_checkout_provider.create_checkout,
+            organization_id=organization.id,
+            designator=organization.designator,
+            administrator_email=organization.primary_admin_email,
+            amount=amount,
+            success_url=(
+                f"{CONTROL_PLANE_PUBLIC_URL.rstrip('/')}/"
+                f"{organization.designator.lower()}/admin?payment=success"
+                "#service-status"
+            ),
+            cancel_url=(
+                f"{CONTROL_PLANE_PUBLIC_URL.rstrip('/')}/"
+                f"{organization.designator.lower()}/admin?payment=cancelled"
+                "#service-status"
+            ),
+        )
+    except StripeCheckoutError as exc:
+        flash(request, str(exc), "warning")
+        return RedirectResponse(
+            url=f"/{organization.designator.lower()}/admin#service-status",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    return RedirectResponse(url=checkout_url, status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/billing/stripe/webhook")
+async def stripe_billing_webhook(request: Request):
+    payload = await request.body()
+    signature = request.headers.get("Stripe-Signature", "")
+    try:
+        payment = await asyncio.to_thread(
+            stripe_checkout_provider.completed_payment,
+            payload,
+            signature,
+        )
+        if payment is None:
+            return {"received": True}
+        organization = await control_plane_store.get_organization(
+            payment.designator,
+            include_archived=True,
+        )
+        if (
+            organization is None
+            or organization.id != payment.organization_id
+            or organization.lifecycle_state == "archived"
+        ):
+            raise StripeCheckoutError("Stripe payment organization is unavailable.")
+        await control_plane_store.append_ledger_entry(
+            organization_id=organization.id,
+            entry_type="payment",
+            amount=payment.gross_amount,
+            description=f"Stripe payment received (${payment.gross_amount:.2f} gross)",
+            idempotency_key=f"stripe-payment-{payment.session_id}",
+            external_reference=payment.session_id,
+            created_by_type="payment_provider",
+            created_by_id="stripe",
+        )
+        await control_plane_store.append_ledger_entry(
+            organization_id=organization.id,
+            entry_type="charge",
+            amount=-payment.processing_fee,
+            description=(
+                f"Stripe processing fee; net account credit "
+                f"${payment.net_credit:.2f}"
+            ),
+            idempotency_key=f"stripe-fee-{payment.session_id}",
+            external_reference=payment.session_id,
+            created_by_type="payment_provider",
+            created_by_id="stripe",
+        )
+    except StripeCheckoutError as exc:
+        logging.warning("Stripe webhook rejected: %s", exc)
+        raise HTTPException(status_code=400, detail="Invalid Stripe event.") from exc
+    except Exception as exc:
+        logging.exception("Stripe payment reconciliation failed")
+        raise HTTPException(status_code=503, detail="Payment reconciliation pending.") from exc
+    return {"received": True}
 
 
 async def require_organization_records_admin(
@@ -5607,6 +6312,7 @@ async def organization_flight_admin(
             "admin_heading": f"{organization.designator} Flight Log Editor",
             "dashboard_url": f"/{organization.designator.lower()}",
             "admin_base_url": base_url,
+            "flight_log_base_url": base_url,
             "batch_url": f"{base_url}/batch",
             "import_url": f"{base_url}/import",
             "archive_import_url": f"{base_url}/import-archive",
@@ -5620,6 +6326,53 @@ async def organization_flight_admin(
             "organization_page_designator": organization.designator,
             "organization_identity_name": user.display_name,
         },
+    )
+
+
+@app.get("/{designator}/admin/flights/{flight_id}/log", response_class=FileResponse)
+async def organization_flight_log_download(
+        request: Request,
+        designator: str,
+        flight_id: int,
+        db: AsyncSession = Depends(get_db)):
+    organization, _user = await require_organization_records_admin(
+        request,
+        designator,
+    )
+    result = await db.execute(
+        select(Flight).where(
+            Flight.id == flight_id,
+            Flight.organization_id == organization.id,
+        )
+    )
+    flight = result.scalar_one_or_none()
+    if flight is None or not flight.archive_relpath:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Flight log not found.",
+        )
+
+    normalized = os.path.normpath(flight.archive_relpath)
+    scope_prefix = os.path.join(
+        "organizations",
+        organization.designator.lower(),
+    ) + os.sep
+    if os.path.isabs(normalized) or not normalized.startswith(scope_prefix):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Flight log not found.",
+        )
+
+    filepath = os.path.join(BASE_LOG_DIRECTORY, normalized)
+    if not os.path.isfile(filepath):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Flight log not found.",
+        )
+    return FileResponse(
+        filepath,
+        media_type="application/geo+json",
+        filename=os.path.basename(normalized),
     )
 
 
@@ -6223,6 +6976,9 @@ def organization_stream_status(streams, requests) -> dict:
         # request that can outlive the tablet which advertised it.  Explicit
         # preflight/media scripts continue to own their active operations.
         "active": bool(streams),
+        "awaiting_approval": any(
+            item.state == "awaiting_approval" for item in requests
+        ),
         "next_expiry": min(expiry_boundaries) if expiry_boundaries else None,
     }
 
@@ -6350,6 +7106,7 @@ async def organization_start_video_preflight(
             organization_id=organization.id,
             requester_user_id=user.id,
             browser_offer_sdp=payload.sdp,
+            relay_candidate_ms=payload.relay_candidate_ms,
         )
         delivered = await r2c_hub.send_video_preflight_offer(exchange)
         return {
@@ -6422,6 +7179,7 @@ async def organization_start_video_media(
             organization_id=organization.id,
             requester_user_id=user.id,
             browser_offer_sdp=payload.sdp,
+            relay_candidate_ms=payload.relay_candidate_ms,
         )
         delivered = await r2c_hub.send_video_media_offer(exchange)
         return {"accepted": True, "delivered": delivered, "state": exchange.state}
@@ -6876,33 +7634,12 @@ async def redeem_device_enrollment(payload: DeviceEnrollmentRedeemRequest):
 # List the admin page
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_dashboard(
-        request: Request,
-        db: AsyncSession = Depends(get_db),
-        user: str = Depends(check_admin),
-        start_date: Optional[date] = None,
-        end_date: Optional[date] = None):
-
-    # Base query:
-    stmt = apply_date_filter(
-        select(Flight).where(Flight.organization_id.is_(None)),
-        start_date,
-        end_date,
-    )
-    stmt = stmt.order_by(Flight.start_time.desc())
-    if not start_date and not end_date:
-        stmt = stmt.limit(50)
-    result = await db.execute(stmt)
-    flights = result.scalars().all()
-    return templates.TemplateResponse(
-        request=request,
-        name="admin.html",
-        context={
-            "request": request,
-            "flights": flights,
-            "start_date": start_date.isoformat() if start_date else "",
-            "end_date": end_date.isoformat() if end_date else "",
-            "export_url": export_url(start_date, end_date),
-        },
+        request: Request):
+    """Send the retired global admin entry point to platform administration."""
+    next_url = "/platform-admin/organizations"
+    return RedirectResponse(
+        url=f"/platform-admin/login?{urlencode({'next': next_url})}",
+        status_code=status.HTTP_303_SEE_OTHER,
     )
 
 @app.post("/admin/edit/{flight_id}")
@@ -7682,7 +8419,13 @@ async def organization_stream_events(websocket: WebSocket, designator: str):
             # already-open focused-page socket as a bounded fallback so a
             # missed notification or a Cloud Run revision handoff repairs
             # itself without another connection or operator refresh.
-            timeout_seconds = 30.0
+            # Approval can race with the reconnect which follows preflight.
+            # Reconcile quickly while the requester is specifically awaiting
+            # the pilot decision so a missed cross-instance notification does
+            # not add a fixed 30-second delay before media signaling.
+            timeout_seconds = (
+                1.0 if status_snapshot["awaiting_approval"] else 30.0
+            )
             if expiry is not None:
                 expiry = expiry if expiry.tzinfo else expiry.replace(tzinfo=UTC)
                 timeout_seconds = min(

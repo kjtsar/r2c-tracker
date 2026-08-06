@@ -52,6 +52,7 @@ class OrganizationBillingSummary:
     credit_balance: Decimal
     month_to_date_cost: CostBreakdown
     primary_admin_postal_address: str = ""
+    primary_admin_phone: str = ""
     aggregate_usage: AggregateUsage = AggregateUsage()
 
 
@@ -60,6 +61,7 @@ class PlatformBillingSnapshot:
     generated_at: datetime
     billing_data_through: datetime
     actual_cost_mtd: Decimal
+    actual_cost_breakdown_mtd: CostBreakdown
     attributed_cost_mtd: Decimal
     unallocated_cost_mtd: Decimal
     forecast_cost: Decimal
@@ -93,7 +95,7 @@ def build_illustrative_platform_snapshot(
         OrganizationBillingSummary(
             legal_name="North County Search and Rescue",
             designator="NCSSAR",
-            hostname="ncssar.r2c-tracker.com",
+            hostname="r2c-tracker.com/ncssar",
             primary_admin_name="Site administrator",
             primary_admin_email="admin@example.invalid",
             account_status="trial",
@@ -112,7 +114,7 @@ def build_illustrative_platform_snapshot(
         OrganizationBillingSummary(
             legal_name="Example County SAR",
             designator="EXSAR",
-            hostname="exsar.r2c-tracker.com",
+            hostname="r2c-tracker.com/exsar",
             primary_admin_name="Pending activation",
             primary_admin_email="new-admin@example.invalid",
             account_status="pending",
@@ -125,7 +127,7 @@ def build_illustrative_platform_snapshot(
         OrganizationBillingSummary(
             legal_name="Regional Search and Rescue Demonstration",
             designator="DEMO",
-            hostname="demo.r2c-tracker.com",
+            hostname="r2c-tracker.com/demo",
             primary_admin_name="Billing administrator",
             primary_admin_email="billing@example.invalid",
             account_status="active",
@@ -152,6 +154,13 @@ def build_illustrative_platform_snapshot(
         generated_at=generated_at,
         billing_data_through=generated_at - timedelta(hours=8),
         actual_cost_mtd=actual,
+        actual_cost_breakdown_mtd=CostBreakdown(
+            compute=Decimal("1.50"),
+            network=Decimal("4.93"),
+            storage=Decimal("0.47"),
+            database=Decimal("0.80"),
+            other=actual - Decimal("7.70"),
+        ),
         attributed_cost_mtd=attributed,
         unallocated_cost_mtd=unallocated,
         forecast_cost=Decimal("18.40"),
@@ -173,6 +182,7 @@ def build_pending_platform_snapshot(
         generated_at=generated_at,
         billing_data_through=generated_at,
         actual_cost_mtd=MONEY_ZERO,
+        actual_cost_breakdown_mtd=CostBreakdown(),
         attributed_cost_mtd=MONEY_ZERO,
         unallocated_cost_mtd=MONEY_ZERO,
         forecast_cost=MONEY_ZERO,
@@ -214,6 +224,97 @@ def _forecast_cost(actual: Decimal, through: datetime) -> Decimal:
     return (actual * Decimal(days_in_month) / elapsed_days).quantize(
         Decimal("0.01")
     )
+
+
+def allocate_platform_costs(
+    actual_costs: CostBreakdown,
+    usage_by_organization: dict[str, AggregateUsage],
+) -> tuple[dict[str, CostBreakdown], Decimal]:
+    """Allocate live costs by usage, with registered organizations sharing overhead.
+
+    Metered categories are proportional to privacy-safe usage. Categories with
+    no measured usage, plus miscellaneous costs, are split equally. The result
+    is intentionally not written to the billing ledger: operators can compare
+    the shadow allocation with the Google bill before it affects credit.
+    """
+    if not usage_by_organization:
+        return {}, actual_costs.total
+
+    weights = {
+        "compute": {
+            organization_id: Decimal(usage.compute_units)
+            for organization_id, usage in usage_by_organization.items()
+        },
+        "network": {
+            organization_id: Decimal(
+                usage.network_bytes + usage.turn_relay_bytes
+            )
+            for organization_id, usage in usage_by_organization.items()
+        },
+        "storage": {
+            organization_id: Decimal(usage.storage_byte_days)
+            for organization_id, usage in usage_by_organization.items()
+        },
+        "database": {
+            organization_id: Decimal(usage.database_units)
+            for organization_id, usage in usage_by_organization.items()
+        },
+    }
+    allocated_values = {
+        organization_id: {
+            "compute": MONEY_ZERO,
+            "network": MONEY_ZERO,
+            "storage": MONEY_ZERO,
+            "database": MONEY_ZERO,
+            "other": MONEY_ZERO,
+        }
+        for organization_id in usage_by_organization
+    }
+    organization_ids = sorted(usage_by_organization)
+
+    def assign_category(category: str, category_weights: dict[str, Decimal]) -> None:
+        total_weight = sum(category_weights.values(), Decimal("0"))
+        category_cost = getattr(actual_costs, category)
+        if total_weight > 0:
+            effective_weights = category_weights
+            effective_total = total_weight
+        else:
+            effective_weights = {
+                organization_id: Decimal("1")
+                for organization_id in organization_ids
+            }
+            effective_total = Decimal(len(organization_ids))
+        for organization_id, weight in effective_weights.items():
+            allocated_values[organization_id][category] = (
+                category_cost * weight / effective_total
+            ).quantize(Decimal("0.000001"))
+
+        # Keep the category fully reconciled despite sub-cent rounding.
+        assigned = sum(
+            (
+                allocated_values[organization_id][category]
+                for organization_id in organization_ids
+            ),
+            MONEY_ZERO,
+        )
+        allocated_values[organization_ids[0]][category] += category_cost - assigned
+
+    for category, category_weights in weights.items():
+        assign_category(category, category_weights)
+    assign_category(
+        "other",
+        {organization_id: Decimal("1") for organization_id in organization_ids},
+    )
+
+    allocations = {
+        organization_id: CostBreakdown(**values)
+        for organization_id, values in allocated_values.items()
+    }
+    attributed = sum(
+        (allocation.total for allocation in allocations.values()),
+        MONEY_ZERO,
+    )
+    return allocations, actual_costs.total - attributed
 
 
 class BigQueryBillingSnapshotProvider:
@@ -356,6 +457,7 @@ FROM net_costs
             generated_at=generated_at,
             billing_data_through=through,
             actual_cost_mtd=actual,
+            actual_cost_breakdown_mtd=breakdown,
             attributed_cost_mtd=MONEY_ZERO,
             unallocated_cost_mtd=actual,
             forecast_cost=(

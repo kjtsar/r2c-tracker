@@ -87,6 +87,7 @@ class CloudflareTurnCredentialProvider:
             if self._cached and now < self._cached_until:
                 return list(self._cached)
             try:
+                request_started = time.monotonic()
                 response = await asyncio.to_thread(
                     self._post,
                     "https://rtc.live.cloudflare.com/v1/turn/keys/"
@@ -119,6 +120,10 @@ class CloudflareTurnCredentialProvider:
                         self.credential_ttl_seconds * 0.8,
                         self.credential_ttl_seconds - 60,
                     ),
+                )
+                logger.info(
+                    "Cloudflare TURN credentials generated in %d ms",
+                    round((time.monotonic() - request_started) * 1000),
                 )
                 return list(self._cached)
             except Exception:

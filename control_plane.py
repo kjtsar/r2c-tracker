@@ -55,11 +55,11 @@ DEFAULT_OWNER_ROLES = (
     "video_requester",
 )
 ONBOARDING_STEPS = (
-    "reserve organization identity and hostname",
+    "reserve organization identity and tenant path",
     "prepare tenant database boundary",
     "prepare tenant object-storage boundary",
     "prepare tenant secret references",
-    "prepare hostname routing",
+    "prepare tenant path routing",
     "run tenant health checks",
     "prepare administrator activation",
 )
@@ -153,6 +153,9 @@ class Organization(Base):
     record_retention_days: Mapped[int] = mapped_column(Integer, default=730)
     log_retention_days: Mapped[int] = mapped_column(Integer, default=30)
     notification_email: Mapped[str] = mapped_column(String(320), default="")
+    archived_from_lifecycle_state: Mapped[str] = mapped_column(String(32), default="")
+    archived_from_provisioning_state: Mapped[str] = mapped_column(String(32), default="")
+    archived_from_subscription_state: Mapped[str] = mapped_column(String(32), default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
     )
@@ -171,10 +174,30 @@ class OrganizationContact(Base):
     contact_role: Mapped[str] = mapped_column(String(32), default="primary_admin")
     name: Mapped[str] = mapped_column(String(160), nullable=False)
     email: Mapped[str] = mapped_column(String(320), nullable=False)
+    phone: Mapped[str] = mapped_column(String(64), default="")
     postal_address: Mapped[str] = mapped_column(Text, default="")
     notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
+    )
+
+
+class ManagedAccessRequest(Base):
+    __tablename__ = "managed_access_requests"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    requester_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    requester_email: Mapped[str] = mapped_column(String(320), nullable=False, index=True)
+    requester_phone: Mapped[str] = mapped_column(String(64), default="")
+    organization_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    designator: Mapped[str] = mapped_column(String(16), index=True)
+    state: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    source_host: Mapped[str] = mapped_column(String(255), default="")
+    submitted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
     )
 
 
@@ -236,6 +259,48 @@ class OrganizationLoginThrottle(Base):
         DateTime(timezone=True), default=utc_now
     )
     locked_until: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True)
+    )
+
+
+class OrganizationPasswordResetToken(Base):
+    __tablename__ = "organization_password_reset_tokens"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id"), index=True
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("organization_users.id"), index=True
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
+class OrganizationPasswordResetThrottle(Base):
+    __tablename__ = "organization_password_reset_throttles"
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id",
+            "email",
+            name="uq_org_password_reset_throttle",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id"), index=True
+    )
+    email: Mapped[str] = mapped_column(String(320), nullable=False)
+    request_count: Mapped[int] = mapped_column(Integer, default=0)
+    window_started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    last_requested_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True)
     )
 
@@ -419,6 +484,24 @@ class BillingLedgerEntry(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
     )
+
+
+class BillingNotification(Base):
+    __tablename__ = "billing_notifications"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id"), index=True
+    )
+    notification_type: Mapped[str] = mapped_column(String(48), nullable=False)
+    event_key: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+    state: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str] = mapped_column(String(240), default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
 
 class ControlPlaneAuditEvent(Base):
@@ -630,6 +713,29 @@ class OrganizationRecord:
     subscription_state: str = "trial"
     credit_balance: Decimal = Decimal("0.00")
     primary_admin_postal_address: str = ""
+    primary_admin_phone: str = ""
+
+
+@dataclass(frozen=True)
+class ManagedAccessRequestRecord:
+    id: str
+    requester_name: str
+    requester_email: str
+    requester_phone: str
+    organization_name: str
+    designator: str
+    state: str
+    source_host: str
+    submitted_at: datetime
+
+
+@dataclass(frozen=True)
+class AdministratorUpdateRecord:
+    organization: OrganizationRecord
+    old_name: str
+    old_email: str
+    old_phone: str
+    administrator_changed: bool
 
 
 @dataclass(frozen=True)
@@ -690,6 +796,18 @@ class BillingLedgerRecord:
     description: str
     external_reference: str
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class BillingNotificationRecord:
+    id: str
+    organization_id: str
+    designator: str
+    organization_name: str
+    administrator_name: str
+    administrator_email: str
+    notification_type: str
+    grace_ends_at: Optional[datetime]
 
 
 @dataclass(frozen=True)
@@ -999,6 +1117,35 @@ class ControlPlaneStore:
     async def init(self) -> None:
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+            organization_columns = await connection.run_sync(
+                lambda sync_connection: {
+                    item["name"]
+                    for item in inspect(sync_connection).get_columns("organizations")
+                }
+            )
+            for column_name in (
+                "archived_from_lifecycle_state",
+                "archived_from_provisioning_state",
+                "archived_from_subscription_state",
+            ):
+                if column_name not in organization_columns:
+                    await connection.execute(text(
+                        "ALTER TABLE organizations "
+                        f"ADD COLUMN {column_name} VARCHAR(32) DEFAULT '' NOT NULL"
+                    ))
+            contact_columns = await connection.run_sync(
+                lambda sync_connection: {
+                    item["name"]
+                    for item in inspect(sync_connection).get_columns(
+                        "organization_contacts"
+                    )
+                }
+            )
+            if "phone" not in contact_columns:
+                await connection.execute(text(
+                    "ALTER TABLE organization_contacts "
+                    "ADD COLUMN phone VARCHAR(64) DEFAULT '' NOT NULL"
+                ))
             columns = await connection.run_sync(
                 lambda sync_connection: {
                     item["name"]
@@ -1049,6 +1196,14 @@ class ControlPlaneStore:
                     ))
         async with self.sessions() as session:
             organizations = (await session.scalars(select(Organization))).all()
+            for organization in organizations:
+                legacy_hostname = (
+                    f"{organization.designator.lower()}.r2c-tracker.com"
+                )
+                if organization.hostname.lower() == legacy_hostname:
+                    organization.hostname = (
+                        f"r2c-tracker.com/{organization.designator.lower()}"
+                    )
             subscribed_ids = set(
                 await session.scalars(select(Subscription.organization_id))
             )
@@ -1393,20 +1548,23 @@ class ControlPlaneStore:
         postal_address: str,
         actor_id: str,
         simulation: bool = True,
-        pilot_acknowledged: bool = False,
         now: Optional[datetime] = None,
+        admin_phone: str = "",
     ) -> OrganizationRecord:
         created_at = now or utc_now()
         clean_name = legal_name.strip()
         clean_admin_name = admin_name.strip()
         clean_designator = normalize_designator(designator)
         clean_email = normalize_email(admin_email)
+        clean_phone = " ".join(admin_phone.split())
         if not clean_name or len(clean_name) > 200:
             raise InvalidOrganizationError("Enter the organization's official name.")
         if not clean_admin_name or len(clean_admin_name) > 160:
             raise InvalidOrganizationError("Enter the site administrator's name.")
+        if len(clean_phone) > 64:
+            raise InvalidOrganizationError("Enter a phone number no longer than 64 characters.")
 
-        hostname = f"{clean_designator.lower()}.r2c-tracker.com"
+        hostname = f"r2c-tracker.com/{clean_designator.lower()}"
         trial_start = created_at if simulation else None
         trial_end = created_at + timedelta(days=30) if simulation else None
         organization = Organization(
@@ -1429,6 +1587,7 @@ class ControlPlaneStore:
             organization_id=organization.id,
             name=clean_admin_name,
             email=clean_email,
+            phone=clean_phone,
             postal_address=postal_address.strip(),
             created_at=created_at,
         )
@@ -1475,7 +1634,6 @@ class ControlPlaneStore:
                     "designator": clean_designator,
                     "hostname": hostname,
                     "simulation": simulation,
-                    "pilot_acknowledged": pilot_acknowledged,
                 }
             ),
             created_at=created_at,
@@ -1489,17 +1647,27 @@ class ControlPlaneStore:
             )
             if existing:
                 raise DuplicateOrganizationError(
-                    "That designator or hostname is already reserved."
+                    f"Preferred designator {clean_designator} is already in use. "
+                    "Designators remain reserved after an organization is archived."
                 )
             try:
                 session.add(organization)
                 await session.flush()
                 session.add_all((contact, owner, job, subscription, audit))
+                await session.execute(
+                    update(ManagedAccessRequest)
+                    .where(
+                        ManagedAccessRequest.designator == clean_designator,
+                        ManagedAccessRequest.state == "pending",
+                    )
+                    .values(state="organization created", updated_at=created_at)
+                )
                 await session.commit()
             except IntegrityError as exc:
                 await session.rollback()
                 raise DuplicateOrganizationError(
-                    "That designator or hostname is already reserved."
+                    f"Preferred designator {clean_designator} is already in use. "
+                    "Designators remain reserved after an organization is archived."
                 ) from exc
 
         return OrganizationRecord(
@@ -1520,6 +1688,7 @@ class ControlPlaneStore:
             subscription_state=subscription.state,
             credit_balance=Decimal("0.00"),
             primary_admin_postal_address=contact.postal_address,
+            primary_admin_phone=contact.phone,
         )
 
     async def mark_organization_invitation_sent(
@@ -1546,6 +1715,10 @@ class ControlPlaneStore:
                 for step in ONBOARDING_STEPS[:-1]
             ] + [{"step": ONBOARDING_STEPS[-1], "state": "pending"}]
             job.state = "waiting for activation"
+            # Sending a real invitation is the explicit promotion seam for an
+            # organization originally created while the control plane was in
+            # simulation mode.
+            job.simulation = False
             job.current_step = ONBOARDING_STEPS[-1]
             job.steps_json = json.dumps(steps)
             session.add(
@@ -1554,6 +1727,30 @@ class ControlPlaneStore:
                     actor_type="platform_admin",
                     actor_id=actor_id,
                     event_type="administrator.invitation_sent",
+                    details_json="{}",
+                    created_at=sent_at,
+                )
+            )
+            await session.commit()
+
+    async def mark_organization_access_email_sent(
+        self,
+        *,
+        organization_id: str,
+        actor_id: str,
+        now: Optional[datetime] = None,
+    ) -> None:
+        sent_at = now or utc_now()
+        async with self.sessions() as session:
+            organization = await session.get(Organization, organization_id)
+            if organization is None or organization.lifecycle_state == "archived":
+                raise ControlPlaneError("Active organization not found.")
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=organization_id,
+                    actor_type="platform_admin",
+                    actor_id=actor_id,
+                    event_type="administrator.access_email_sent",
                     details_json="{}",
                     created_at=sent_at,
                 )
@@ -1569,20 +1766,37 @@ class ControlPlaneStore:
         organization = await session.get(Organization, organization_id)
         if organization is None:
             raise ControlPlaneError("Organization not found.")
+        first_activation = organization.provisioning_state != "ready"
         organization.provisioning_state = "ready"
-        organization.lifecycle_state = "trial"
-        organization.trial_starts_at = activated_at
-        organization.trial_ends_at = activated_at + timedelta(days=30)
+        if first_activation:
+            deposited, usage_cost = await self._organization_funding_totals(
+                session,
+                organization_id,
+            )
+            if deposited - usage_cost > 0:
+                organization.lifecycle_state = "funded"
+                organization.billing_mode = "prepaid credit"
+                organization.trial_starts_at = None
+                organization.trial_ends_at = None
+            else:
+                organization.lifecycle_state = "trial"
+                organization.trial_starts_at = activated_at
+                organization.trial_ends_at = activated_at + timedelta(days=30)
         organization.updated_at = activated_at
         subscription = await session.scalar(
             select(Subscription).where(
                 Subscription.organization_id == organization_id
             )
         )
-        if subscription is not None:
-            subscription.state = "trial"
-            subscription.trial_starts_at = activated_at
-            subscription.trial_ends_at = activated_at + timedelta(days=30)
+        if subscription is not None and first_activation:
+            if organization.lifecycle_state == "funded":
+                subscription.state = "funded"
+                subscription.trial_starts_at = None
+                subscription.trial_ends_at = None
+            else:
+                subscription.state = "trial"
+                subscription.trial_starts_at = activated_at
+                subscription.trial_ends_at = activated_at + timedelta(days=30)
             subscription.updated_at = activated_at
         job = await session.scalar(
             select(ProvisioningJob).where(
@@ -1622,10 +1836,30 @@ class ControlPlaneStore:
                     )
                 )
             ).all()
+            usage_rows = (
+                await session.execute(
+                    select(
+                        UsageDaily.organization_id,
+                        UsageDaily.compute_cost,
+                        UsageDaily.network_cost,
+                        UsageDaily.storage_cost,
+                        UsageDaily.database_cost,
+                        UsageDaily.faa_proxy_cost,
+                        UsageDaily.turn_relay_cost,
+                        UsageDaily.other_cost,
+                    )
+                )
+            ).all()
         balances: dict[str, Decimal] = {}
         for organization_id, amount in ledger_rows:
             balances[organization_id] = (
                 balances.get(organization_id, Decimal("0")) + Decimal(amount)
+            )
+        usage_costs: dict[str, Decimal] = {}
+        for organization_id, *costs in usage_rows:
+            usage_costs[organization_id] = (
+                usage_costs.get(organization_id, Decimal("0"))
+                + sum((Decimal(cost) for cost in costs), Decimal("0"))
             )
         return tuple(
             OrganizationRecord(
@@ -1644,16 +1878,23 @@ class ControlPlaneStore:
                 primary_admin_name=contact.name,
                 primary_admin_email=contact.email,
                 subscription_state=subscription.state,
-                credit_balance=balances.get(
-                    organization.id,
+                credit_balance=max(
+                    balances.get(organization.id, Decimal("0.00"))
+                    - usage_costs.get(organization.id, Decimal("0.00")),
                     Decimal("0.00"),
                 ),
                 primary_admin_postal_address=contact.postal_address,
+                primary_admin_phone=contact.phone,
             )
             for organization, contact, subscription in rows
         )
 
-    async def get_organization(self, designator: str) -> Optional[OrganizationRecord]:
+    async def get_organization(
+        self,
+        designator: str,
+        *,
+        include_archived: bool = False,
+    ) -> Optional[OrganizationRecord]:
         clean_designator = normalize_designator(designator)
         organizations = await self.list_organizations()
         return next(
@@ -1661,9 +1902,464 @@ class ControlPlaneStore:
                 organization
                 for organization in organizations
                 if organization.designator == clean_designator
+                and (
+                    include_archived
+                    or organization.lifecycle_state != "archived"
+                )
             ),
             None,
         )
+
+    async def create_managed_access_request(
+        self,
+        *,
+        requester_name: str,
+        requester_email: str,
+        requester_phone: str,
+        organization_name: str,
+        designator: str,
+        source_host: str,
+        now: Optional[datetime] = None,
+    ) -> ManagedAccessRequestRecord:
+        submitted_at = now or utc_now()
+        clean_name = requester_name.strip()
+        clean_email = normalize_email(requester_email)
+        clean_phone = " ".join(requester_phone.split())
+        clean_organization = organization_name.strip()
+        clean_designator = normalize_designator(designator)
+        clean_source_host = source_host.strip().lower()[:255]
+        if not clean_name or len(clean_name) > 160:
+            raise InvalidOrganizationError("Enter a requester name.")
+        if len(clean_phone) > 64:
+            raise InvalidOrganizationError("Enter a phone number no longer than 64 characters.")
+        if not clean_organization or len(clean_organization) > 200:
+            raise InvalidOrganizationError("Enter the organization's official name.")
+        async with self.sessions() as session:
+            existing = await session.scalar(
+                select(ManagedAccessRequest)
+                .where(
+                    ManagedAccessRequest.requester_email == clean_email,
+                    ManagedAccessRequest.designator == clean_designator,
+                    ManagedAccessRequest.state == "pending",
+                    ManagedAccessRequest.submitted_at
+                    >= submitted_at - timedelta(minutes=15),
+                )
+                .order_by(ManagedAccessRequest.submitted_at.desc())
+            )
+            if existing is None:
+                existing = ManagedAccessRequest(
+                    requester_name=clean_name,
+                    requester_email=clean_email,
+                    requester_phone=clean_phone,
+                    organization_name=clean_organization,
+                    designator=clean_designator,
+                    source_host=clean_source_host,
+                    submitted_at=submitted_at,
+                    updated_at=submitted_at,
+                )
+                session.add(existing)
+            else:
+                existing.requester_name = clean_name
+                existing.requester_phone = clean_phone
+                existing.organization_name = clean_organization
+                existing.source_host = clean_source_host
+                existing.updated_at = submitted_at
+            await session.commit()
+            return ManagedAccessRequestRecord(
+                id=existing.id,
+                requester_name=existing.requester_name,
+                requester_email=existing.requester_email,
+                requester_phone=existing.requester_phone,
+                organization_name=existing.organization_name,
+                designator=existing.designator,
+                state=existing.state,
+                source_host=existing.source_host,
+                submitted_at=as_utc(existing.submitted_at),
+            )
+
+    async def list_managed_access_requests(
+        self,
+    ) -> tuple[ManagedAccessRequestRecord, ...]:
+        async with self.sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(ManagedAccessRequest).order_by(
+                        ManagedAccessRequest.submitted_at.desc()
+                    )
+                )
+            ).all()
+        return tuple(
+            ManagedAccessRequestRecord(
+                id=row.id,
+                requester_name=row.requester_name,
+                requester_email=row.requester_email,
+                requester_phone=row.requester_phone,
+                organization_name=row.organization_name,
+                designator=row.designator,
+                state=row.state,
+                source_host=row.source_host,
+                submitted_at=as_utc(row.submitted_at),
+            )
+            for row in rows
+        )
+
+    async def update_organization_administrator(
+        self,
+        *,
+        designator: str,
+        legal_name: str,
+        admin_name: str,
+        admin_email: str,
+        admin_phone: str,
+        postal_address: str,
+        actor_id: str,
+        now: Optional[datetime] = None,
+    ) -> AdministratorUpdateRecord:
+        clean_designator = normalize_designator(designator)
+        clean_legal_name = legal_name.strip()
+        clean_name = admin_name.strip()
+        clean_email = normalize_email(admin_email)
+        clean_phone = " ".join(admin_phone.split())
+        clean_address = postal_address.strip()
+        changed_at = now or utc_now()
+        if not clean_legal_name or len(clean_legal_name) > 200:
+            raise InvalidOrganizationError("Enter the organization's official name.")
+        if not clean_name or len(clean_name) > 160:
+            raise InvalidOrganizationError("Enter the site administrator's name.")
+        if len(clean_phone) > 64:
+            raise InvalidOrganizationError("Enter a phone number no longer than 64 characters.")
+        if len(clean_address) > 2000:
+            raise InvalidOrganizationError("Enter a postal address no longer than 2,000 characters.")
+        async with self.sessions() as session:
+            row = (
+                await session.execute(
+                    select(Organization, OrganizationContact)
+                    .join(
+                        OrganizationContact,
+                        OrganizationContact.organization_id == Organization.id,
+                    )
+                    .where(
+                        Organization.designator == clean_designator,
+                        OrganizationContact.contact_role == "primary_admin",
+                    )
+                )
+            ).first()
+            if row is None:
+                raise InvalidOrganizationError("Organization not found.")
+            organization, contact = row
+            if organization.lifecycle_state == "archived":
+                raise ControlPlaneError("Unarchive the organization before editing its administrator.")
+            old_name = contact.name
+            old_email = contact.email
+            old_phone = contact.phone
+            administrator_changed = old_email != clean_email
+            organization.legal_name = clean_legal_name
+            organization.notification_email = clean_email
+            organization.updated_at = changed_at
+            contact.name = clean_name
+            contact.email = clean_email
+            contact.phone = clean_phone
+            contact.postal_address = clean_address
+            if administrator_changed:
+                old_user = await session.scalar(
+                    select(OrganizationUser).where(
+                        OrganizationUser.organization_id == organization.id,
+                        OrganizationUser.email == old_email,
+                    )
+                )
+                if old_user is not None:
+                    old_user.set_roles(())
+                    old_user.state = "archived"
+                    old_user.password_hash = ""
+                new_user = await session.scalar(
+                    select(OrganizationUser).where(
+                        OrganizationUser.organization_id == organization.id,
+                        OrganizationUser.email == clean_email,
+                    )
+                )
+                if new_user is None:
+                    new_user = OrganizationUser(
+                        id=new_id(),
+                        organization_id=organization.id,
+                        email=clean_email,
+                        display_name=clean_name,
+                        state="invited",
+                        activation_nonce=new_id(),
+                        activation_expires_at=changed_at + timedelta(days=7),
+                        created_at=changed_at,
+                    )
+                    session.add(new_user)
+                else:
+                    new_user.display_name = clean_name
+                    new_user.state = "invited"
+                    new_user.password_hash = ""
+                    new_user.activation_nonce = new_id()
+                    new_user.activation_expires_at = changed_at + timedelta(days=7)
+                new_user.set_roles(DEFAULT_OWNER_ROLES)
+            else:
+                owner = await session.scalar(
+                    select(OrganizationUser).where(
+                        OrganizationUser.organization_id == organization.id,
+                        OrganizationUser.email == clean_email,
+                    )
+                )
+                if owner is not None:
+                    owner.display_name = clean_name
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=organization.id,
+                    actor_type="platform_admin",
+                    actor_id=actor_id,
+                    event_type=(
+                        "administrator.replaced"
+                        if administrator_changed
+                        else "administrator.contact_updated"
+                    ),
+                    details_json=json.dumps({
+                        "old_name": old_name,
+                        "old_email": old_email,
+                        "old_phone": old_phone,
+                        "new_name": clean_name,
+                        "new_email": clean_email,
+                        "new_phone": clean_phone,
+                    }),
+                    created_at=changed_at,
+                )
+            )
+            await session.execute(
+                update(ManagedAccessRequest)
+                .where(
+                    ManagedAccessRequest.designator == clean_designator,
+                    ManagedAccessRequest.state == "pending",
+                )
+                .values(state="organization created", updated_at=changed_at)
+            )
+            await session.commit()
+        record = await self.get_organization(clean_designator)
+        if record is None:
+            raise ControlPlaneError("Updated organization could not be read.")
+        return AdministratorUpdateRecord(
+            organization=record,
+            old_name=old_name,
+            old_email=old_email,
+            old_phone=old_phone,
+            administrator_changed=administrator_changed,
+        )
+
+    async def archive_organization(
+        self,
+        *,
+        designator: str,
+        actor_id: str,
+        now: Optional[datetime] = None,
+    ) -> OrganizationRecord:
+        clean_designator = normalize_designator(designator)
+        archived_at = now or utc_now()
+        async with self.sessions() as session:
+            organization = await session.scalar(
+                select(Organization).where(
+                    Organization.designator == clean_designator
+                )
+            )
+            if organization is None:
+                raise InvalidOrganizationError("Organization not found.")
+            if organization.lifecycle_state == "archived":
+                raise ControlPlaneError(
+                    f"{clean_designator} is already archived."
+                )
+            subscription = await session.scalar(
+                select(Subscription).where(
+                    Subscription.organization_id == organization.id
+                )
+            )
+            organization.archived_from_lifecycle_state = organization.lifecycle_state
+            organization.archived_from_provisioning_state = organization.provisioning_state
+            organization.archived_from_subscription_state = (
+                subscription.state if subscription is not None else ""
+            )
+            organization.lifecycle_state = "archived"
+            organization.provisioning_state = "archived"
+            organization.updated_at = archived_at
+            await session.execute(
+                update(OrganizationUser)
+                .where(OrganizationUser.organization_id == organization.id)
+                .values(state="archived")
+            )
+            await session.execute(
+                update(OrganizationPasswordResetToken)
+                .where(
+                    OrganizationPasswordResetToken.organization_id
+                    == organization.id,
+                    OrganizationPasswordResetToken.consumed_at.is_(None),
+                )
+                .values(consumed_at=archived_at)
+            )
+            await session.execute(
+                update(EnrollmentCampaign)
+                .where(
+                    EnrollmentCampaign.organization_id == organization.id,
+                    EnrollmentCampaign.state == "active",
+                )
+                .values(state="revoked", revoked_at=archived_at)
+            )
+            await session.execute(
+                update(DeviceCredential)
+                .where(
+                    DeviceCredential.organization_id == organization.id,
+                    DeviceCredential.state == "active",
+                )
+                .values(state="revoked")
+            )
+            await session.execute(
+                update(ActiveVideoStream)
+                .where(
+                    ActiveVideoStream.organization_id == organization.id,
+                    ActiveVideoStream.state == "active",
+                )
+                .values(state="stopped", expires_at=archived_at)
+            )
+            await session.execute(
+                update(VideoStreamRequest)
+                .where(
+                    VideoStreamRequest.organization_id == organization.id,
+                    VideoStreamRequest.state.not_in(("stopped", "expired")),
+                )
+                .values(state="stopped", stopped_at=archived_at)
+            )
+            if subscription is not None:
+                subscription.state = "archived"
+                subscription.updated_at = archived_at
+            job = await session.scalar(
+                select(ProvisioningJob).where(
+                    ProvisioningJob.organization_id == organization.id
+                )
+            )
+            if job is not None:
+                job.state = "archived"
+                job.current_step = "organization archived"
+                job.completed_at = archived_at
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=organization.id,
+                    actor_type="platform_admin",
+                    actor_id=actor_id,
+                    event_type="organization.archived",
+                    details_json=json.dumps(
+                        {
+                            "designator": clean_designator,
+                            "hostname": organization.hostname,
+                            "previous_lifecycle_state": organization.archived_from_lifecycle_state,
+                            "previous_provisioning_state": organization.archived_from_provisioning_state,
+                            "previous_subscription_state": organization.archived_from_subscription_state,
+                        }
+                    ),
+                    created_at=archived_at,
+                )
+            )
+            await session.commit()
+        record = await self.get_organization(
+            clean_designator,
+            include_archived=True,
+        )
+        if record is None:
+            raise ControlPlaneError("Archived organization could not be read.")
+        return record
+
+    async def unarchive_organization(
+        self,
+        *,
+        designator: str,
+        actor_id: str,
+        now: Optional[datetime] = None,
+    ) -> OrganizationRecord:
+        clean_designator = normalize_designator(designator)
+        restored_at = now or utc_now()
+        async with self.sessions() as session:
+            organization = await session.scalar(
+                select(Organization).where(
+                    Organization.designator == clean_designator
+                )
+            )
+            if organization is None:
+                raise InvalidOrganizationError("Organization not found.")
+            if organization.lifecycle_state != "archived":
+                raise ControlPlaneError(f"{clean_designator} is not archived.")
+            organization.lifecycle_state = (
+                organization.archived_from_lifecycle_state or "trial"
+            )
+            organization.provisioning_state = (
+                organization.archived_from_provisioning_state or "ready"
+            )
+            organization.updated_at = restored_at
+            contact = await session.scalar(
+                select(OrganizationContact).where(
+                    OrganizationContact.organization_id == organization.id,
+                    OrganizationContact.contact_role == "primary_admin",
+                )
+            )
+            if contact is None:
+                raise ControlPlaneError("Primary administrator contact not found.")
+            owner = await session.scalar(
+                select(OrganizationUser).where(
+                    OrganizationUser.organization_id == organization.id,
+                    OrganizationUser.email == contact.email,
+                )
+            )
+            if owner is None:
+                owner = OrganizationUser(
+                    id=new_id(),
+                    organization_id=organization.id,
+                    email=contact.email,
+                    display_name=contact.name,
+                    created_at=restored_at,
+                )
+                session.add(owner)
+            owner.display_name = contact.name
+            owner.state = "invited"
+            owner.password_hash = ""
+            owner.activation_nonce = new_id()
+            owner.activation_expires_at = restored_at + timedelta(days=7)
+            owner.set_roles(DEFAULT_OWNER_ROLES)
+            subscription = await session.scalar(
+                select(Subscription).where(
+                    Subscription.organization_id == organization.id
+                )
+            )
+            if subscription is not None:
+                subscription.state = (
+                    organization.archived_from_subscription_state
+                    or organization.lifecycle_state
+                )
+                subscription.updated_at = restored_at
+            job = await session.scalar(
+                select(ProvisioningJob).where(
+                    ProvisioningJob.organization_id == organization.id
+                )
+            )
+            if job is not None:
+                job.state = "waiting for activation"
+                job.current_step = ONBOARDING_STEPS[-1]
+                job.simulation = False
+                job.completed_at = None
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=organization.id,
+                    actor_type="platform_admin",
+                    actor_id=actor_id,
+                    event_type="organization.unarchived",
+                    details_json=json.dumps({
+                        "designator": clean_designator,
+                        "credentials_restored": False,
+                        "campaigns_restored": False,
+                    }),
+                    created_at=restored_at,
+                )
+            )
+            await session.commit()
+        record = await self.get_organization(clean_designator)
+        if record is None:
+            raise ControlPlaneError("Unarchived organization could not be read.")
+        return record
 
     async def get_organization_by_id(
         self,
@@ -1866,13 +2562,159 @@ class ControlPlaneStore:
                 state=user.state,
             )
 
+    async def issue_organization_password_reset(
+        self,
+        *,
+        designator: str,
+        email: str,
+        now: Optional[datetime] = None,
+    ) -> Optional[str]:
+        clean_designator = normalize_designator(designator)
+        clean_email = normalize_email(email)
+        issued_at = now or utc_now()
+        async with self.sessions() as session:
+            organization = await session.scalar(
+                select(Organization).where(
+                    Organization.designator == clean_designator
+                )
+            )
+            if organization is None:
+                return None
+            user = await session.scalar(
+                select(OrganizationUser).where(
+                    OrganizationUser.organization_id == organization.id,
+                    OrganizationUser.email == clean_email,
+                    OrganizationUser.state == "active",
+                )
+            )
+            if user is None:
+                return None
+            throttle = await session.scalar(
+                select(OrganizationPasswordResetThrottle).where(
+                    OrganizationPasswordResetThrottle.organization_id
+                    == organization.id,
+                    OrganizationPasswordResetThrottle.email == clean_email,
+                )
+            )
+            if throttle is None:
+                throttle = OrganizationPasswordResetThrottle(
+                    id=new_id(),
+                    organization_id=organization.id,
+                    email=clean_email,
+                    request_count=0,
+                    window_started_at=issued_at,
+                )
+                session.add(throttle)
+            window_started = as_utc(throttle.window_started_at) or issued_at
+            last_requested = as_utc(throttle.last_requested_at)
+            if window_started < issued_at - timedelta(hours=1):
+                throttle.window_started_at = issued_at
+                throttle.request_count = 0
+            elif throttle.request_count >= 5:
+                return None
+            if (
+                last_requested is not None
+                and last_requested > issued_at - timedelta(minutes=1)
+            ):
+                return None
+            existing_tokens = (
+                await session.scalars(
+                    select(OrganizationPasswordResetToken).where(
+                        OrganizationPasswordResetToken.organization_id
+                        == organization.id,
+                        OrganizationPasswordResetToken.user_id == user.id,
+                        OrganizationPasswordResetToken.consumed_at.is_(None),
+                    )
+                )
+            ).all()
+            for existing in existing_tokens:
+                existing.consumed_at = issued_at
+            token = secrets.token_urlsafe(32)
+            session.add(
+                OrganizationPasswordResetToken(
+                    id=new_id(),
+                    organization_id=organization.id,
+                    user_id=user.id,
+                    token_hash=device_token_hash(token),
+                    created_at=issued_at,
+                    expires_at=issued_at + timedelta(minutes=15),
+                )
+            )
+            throttle.request_count += 1
+            throttle.last_requested_at = issued_at
+            await session.commit()
+            return token
+
+    async def set_organization_password_from_reset(
+        self,
+        *,
+        designator: str,
+        token: str,
+        new_password: str,
+        now: Optional[datetime] = None,
+    ) -> Optional[UserRecord]:
+        clean_designator = normalize_designator(designator)
+        password_hash = hash_password(new_password)
+        consumed_at = now or utc_now()
+        async with self.sessions() as session:
+            reset = await session.scalar(
+                select(OrganizationPasswordResetToken)
+                .join(
+                    Organization,
+                    Organization.id
+                    == OrganizationPasswordResetToken.organization_id,
+                )
+                .where(
+                    Organization.designator == clean_designator,
+                    OrganizationPasswordResetToken.token_hash
+                    == device_token_hash(token),
+                    OrganizationPasswordResetToken.consumed_at.is_(None),
+                )
+            )
+            if (
+                reset is None
+                or (as_utc(reset.expires_at) or consumed_at) <= consumed_at
+            ):
+                return None
+            user = await session.get(OrganizationUser, reset.user_id)
+            if (
+                user is None
+                or user.organization_id != reset.organization_id
+                or user.state != "active"
+            ):
+                return None
+            reset.consumed_at = consumed_at
+            user.password_hash = password_hash
+            user.last_login_at = consumed_at
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=user.organization_id,
+                    actor_type="organization_user",
+                    actor_id=user.id,
+                    event_type="administrator.password_reset",
+                    details_json="{}",
+                    created_at=consumed_at,
+                )
+            )
+            await session.commit()
+            return UserRecord(
+                id=user.id,
+                organization_id=user.organization_id,
+                email=user.email,
+                display_name=user.display_name,
+                roles=user.roles,
+                state=user.state,
+            )
+
     async def authorize_google_user(
         self,
         designator: str,
         email: str,
         now: Optional[datetime] = None,
+        *,
+        activation_nonce: Optional[str] = None,
     ) -> Optional[UserRecord]:
-        """Authorize an exact verified email, activating a pending member."""
+        """Authorize an exact verified email; activation requires its nonce."""
         clean_designator = normalize_designator(designator)
         clean_email = normalize_email(email)
         login_at = now or utc_now()
@@ -1892,6 +2734,11 @@ class ControlPlaneStore:
             if user is None:
                 return None
             if user.state == "invited":
+                if not activation_nonce or not secrets.compare_digest(
+                    user.activation_nonce,
+                    activation_nonce,
+                ):
+                    return None
                 activation_expires_at = as_utc(user.activation_expires_at)
                 if (
                     activation_expires_at is None
@@ -2183,6 +3030,12 @@ class ControlPlaneStore:
                     )
                 return self._ledger_record(existing)
             session.add(entry)
+            await session.flush()
+            await self._reconcile_organization_funding_state(
+                session,
+                organization,
+                created_at,
+            )
             session.add(
                 ControlPlaneAuditEvent(
                     organization_id=organization_id,
@@ -2201,6 +3054,187 @@ class ControlPlaneStore:
             )
             await session.commit()
         return self._ledger_record(entry)
+
+    async def _organization_funding_totals(
+        self,
+        session: AsyncSession,
+        organization_id: str,
+    ) -> tuple[Decimal, Decimal]:
+        ledger_amounts = await session.scalars(
+            select(BillingLedgerEntry.amount).where(
+                BillingLedgerEntry.organization_id == organization_id
+            )
+        )
+        deposited = sum(
+            (Decimal(amount) for amount in ledger_amounts),
+            Decimal("0"),
+        )
+        usage_rows = (
+            await session.execute(
+                select(
+                    UsageDaily.compute_cost,
+                    UsageDaily.network_cost,
+                    UsageDaily.storage_cost,
+                    UsageDaily.database_cost,
+                    UsageDaily.faa_proxy_cost,
+                    UsageDaily.turn_relay_cost,
+                    UsageDaily.other_cost,
+                ).where(UsageDaily.organization_id == organization_id)
+            )
+        ).all()
+        usage_cost = sum(
+            (
+                sum((Decimal(cost) for cost in row), Decimal("0"))
+                for row in usage_rows
+            ),
+            Decimal("0"),
+        )
+        return deposited, usage_cost
+
+    async def _reconcile_organization_funding_state(
+        self,
+        session: AsyncSession,
+        organization: Organization,
+        changed_at: datetime,
+    ) -> None:
+        if organization.lifecycle_state == "archived":
+            return
+        deposited, usage_cost = await self._organization_funding_totals(
+            session,
+            organization.id,
+        )
+        subscription = await session.scalar(
+            select(Subscription).where(
+                Subscription.organization_id == organization.id
+            )
+        )
+        previous_state = organization.lifecycle_state
+        if deposited - usage_cost > 0:
+            organization.lifecycle_state = "funded"
+            organization.billing_mode = "prepaid credit"
+            organization.trial_starts_at = None
+            organization.trial_ends_at = None
+            if subscription is not None:
+                subscription.state = "funded"
+                subscription.trial_starts_at = None
+                subscription.trial_ends_at = None
+                subscription.updated_at = changed_at
+        elif deposited > 0 and organization.lifecycle_state != "grace":
+            organization.lifecycle_state = "grace"
+            organization.billing_mode = "30-day grace"
+            organization.trial_starts_at = changed_at
+            organization.trial_ends_at = changed_at + timedelta(days=30)
+            if subscription is not None:
+                subscription.state = "grace"
+                subscription.trial_starts_at = changed_at
+                subscription.trial_ends_at = changed_at + timedelta(days=30)
+                subscription.updated_at = changed_at
+            session.add(
+                BillingNotification(
+                    organization_id=organization.id,
+                    notification_type="funding_exhausted",
+                    event_key=(
+                        f"funding-exhausted:{organization.id}:"
+                        f"{changed_at.isoformat()}"
+                    ),
+                    created_at=changed_at,
+                )
+            )
+        if organization.lifecycle_state != previous_state:
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=organization.id,
+                    actor_type="billing_system",
+                    actor_id="gcp-usage-reconciliation",
+                    event_type="billing.funding_state_changed",
+                    details_json=json.dumps(
+                        {
+                            "from": previous_state,
+                            "to": organization.lifecycle_state,
+                            "deposited": str(deposited),
+                            "attributed_gcp_usage_cost": str(usage_cost),
+                            "available_credit": str(
+                                max(deposited - usage_cost, Decimal("0"))
+                            ),
+                        }
+                    ),
+                    created_at=changed_at,
+                )
+            )
+        organization.updated_at = changed_at
+
+    async def list_pending_billing_notifications(
+        self,
+        limit: int = 20,
+    ) -> tuple[BillingNotificationRecord, ...]:
+        safe_limit = max(1, min(limit, 100))
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        BillingNotification,
+                        Organization,
+                        OrganizationContact,
+                    )
+                    .join(
+                        Organization,
+                        Organization.id == BillingNotification.organization_id,
+                    )
+                    .join(
+                        OrganizationContact,
+                        OrganizationContact.organization_id == Organization.id,
+                    )
+                    .where(
+                        BillingNotification.state == "pending",
+                        OrganizationContact.contact_role == "primary_admin",
+                    )
+                    .order_by(BillingNotification.created_at)
+                    .limit(safe_limit)
+                )
+            ).all()
+        return tuple(
+            BillingNotificationRecord(
+                id=notification.id,
+                organization_id=organization.id,
+                designator=organization.designator,
+                organization_name=organization.legal_name,
+                administrator_name=contact.name,
+                administrator_email=contact.email,
+                notification_type=notification.notification_type,
+                grace_ends_at=as_utc(organization.trial_ends_at),
+            )
+            for notification, organization, contact in rows
+        )
+
+    async def mark_billing_notification_sent(
+        self,
+        notification_id: str,
+        *,
+        now: Optional[datetime] = None,
+    ) -> None:
+        sent_at = now or utc_now()
+        async with self.sessions() as session:
+            notification = await session.get(BillingNotification, notification_id)
+            if notification is None or notification.state == "sent":
+                return
+            notification.state = "sent"
+            notification.sent_at = sent_at
+            notification.attempts += 1
+            notification.last_error = ""
+            await session.commit()
+
+    async def mark_billing_notification_failed(
+        self,
+        notification_id: str,
+        error: str,
+    ) -> None:
+        async with self.sessions() as session:
+            notification = await session.get(BillingNotification, notification_id)
+            if notification is None or notification.state == "sent":
+                return
+            notification.attempts += 1
+            notification.last_error = error.strip()[:240]
+            await session.commit()
 
     async def list_ledger(
         self,
@@ -2319,6 +3353,12 @@ class ControlPlaneStore:
             usage.turn_relay_cost = Decimal(turn_relay_cost)
             usage.other_cost = Decimal(other_cost)
             usage.recorded_at = now or utc_now()
+            await session.flush()
+            await self._reconcile_organization_funding_state(
+                session,
+                organization,
+                usage.recorded_at,
+            )
             await session.commit()
 
     async def increment_daily_usage(
@@ -3285,6 +4325,7 @@ class ControlPlaneStore:
         organization_id: str,
         requester_user_id: str,
         browser_offer_sdp: str,
+        relay_candidate_ms: int = 0,
         now: Optional[datetime] = None,
     ) -> VideoPreflightExchangeRecord:
         started_at = now or utc_now()
@@ -3342,7 +4383,12 @@ class ControlPlaneStore:
                     actor_type="organization_user",
                     actor_id=requester_user_id,
                     event_type="video.preflight_started",
-                    details_json=json.dumps({"request_id": request.id}),
+                    details_json=json.dumps({
+                        "request_id": request.id,
+                        "browser_relay_candidate_ms": max(
+                            0, min(int(relay_candidate_ms), 60_000)
+                        ),
+                    }),
                     created_at=started_at,
                 )
             )
@@ -3827,6 +4873,7 @@ class ControlPlaneStore:
         organization_id: str,
         requester_user_id: str,
         browser_offer_sdp: str,
+        relay_candidate_ms: int = 0,
         now: Optional[datetime] = None,
     ) -> VideoMediaExchangeRecord:
         started_at = now or utc_now()
@@ -3868,7 +4915,12 @@ class ControlPlaneStore:
                 actor_type="organization_user",
                 actor_id=requester_user_id,
                 event_type="video.media_signaling_started",
-                details_json=json.dumps({"request_id": request.id}),
+                details_json=json.dumps({
+                    "request_id": request.id,
+                    "browser_relay_candidate_ms": max(
+                        0, min(int(relay_candidate_ms), 60_000)
+                    ),
+                }),
                 created_at=started_at,
             ))
             if self.engine.dialect.name == "postgresql":

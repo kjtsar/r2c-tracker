@@ -1,3 +1,12 @@
-v1.4.19: deployed
-*
-
+v1.4.20:
+* Promoted the hosted evaluation to guarded live organization onboarding with permanent tenant paths, managed-access request intake, activation and access email, and tenant-scoped enrollment credentials.
+* Added platform-administrator controls to edit organization and administrator contact details, replace an administrator with an accountable reactivation flow, add prepaid credit, and archive or restore an organization while keeping its designator reserved.
+* Added send-only Gmail authorization for invitations and notifications plus non-enumerating, rate-limited, single-use organization password reset links; OAuth-only members continue to sign in without an R2C password.
+* Added transparent funding lifecycle behavior: trials begin on administrator activation unless credit is already available, cumulative attributed GCP usage consumes deposited credit, and exhausted funded accounts enter a 30-day grace period with notifications.
+* Added category-aware shadow allocation of compute, network and TURN, storage, database, and shared platform costs across eligible organizations without charging their ledgers.
+* Added optional Stripe Checkout and signed-webhook support for prepaid funding, including net credit after the actual processing fee; payments remain visibly unavailable unless both Stripe secrets are configured.
+* Migrated the pilot deployment path from Cloud SQL attachment to isolated PostgreSQL databases reached through guarded Direct VPC egress, and expanded Secret Manager wiring for managed requests, Gmail, and optional Stripe credentials.
+* Refreshed organization and platform navigation, status and funding displays, access-request visibility, project-support messaging, and application icon treatment.
+* Added secure, organization-scoped downloads for individual archived flight logs from the flight administration table.
+* Fixed flight administration table overflow guidance so the fade and scroll instructions appear only when additional columns are actually off-screen.
+* Reduced pilot-approved live-video startup delays with fast approval reconciliation, first-relay-candidate signaling, and privacy-safe TURN timing diagnostics.

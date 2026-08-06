@@ -195,7 +195,12 @@
     show("Gathering a routed WebRTC path to the tablet…", "starting");
     const offer = await peer.createOffer();
     await peer.setLocalDescription(offer);
+    const gatheringStartedAt = performance.now();
     await waitForRelayCandidate(4000);
+    const relayCandidateMs = Math.max(
+      0,
+      Math.round(performance.now() - gatheringStartedAt),
+    );
     if (!peer.localDescription?.sdp.includes(" typ relay ")) {
       throw new Error("A routed TURN candidate was not available.");
     }
@@ -209,6 +214,7 @@
       body: JSON.stringify({
         sdp: peer.localDescription.sdp,
         form_token: formToken,
+        relay_candidate_ms: relayCandidateMs,
       }),
     });
     if (!response.ok) {

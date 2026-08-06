@@ -15,6 +15,11 @@ A FastAPI-based flight log aggregator for SAR operations.
 - `PLATFORM_BILLING_SOURCE`: `illustrative` (default) or `bigquery`. The live
   mode reads aggregate cost only and never queries tenant operational data.
 - `PLATFORM_BILLING_PROJECT`: Project containing the billing export dataset
+- `STRIPE_SECRET_KEY`: Stripe test or live secret key used only by the server.
+- `STRIPE_WEBHOOK_SECRET`: Signing secret for the public
+  `/billing/stripe/webhook` endpoint. Both Stripe values must be configured
+  together. Until then, organization administrators see payments as pending
+  setup and no Checkout session can be created.
   (default `r2c-tracker-platform`).
 - `PLATFORM_BILLING_DATASET`: Billing export dataset ID (default
   `r2c_billing_export`).
@@ -109,17 +114,20 @@ GCI maintainers rotate the authoritative identity with:
 
 Google client ID and secret values are mapped from the
 `r2c-google-oauth-client-id` and `r2c-google-oauth-client-secret` secrets.
-Outbound password-setup mail uses mandatory STARTTLS SMTP configuration; its
-configuration is not currently reused implicitly for organization invitations.
+Hosted outbound mail uses the Gmail API with the send-only OAuth scope. The
+offline credential is mapped from Secret Manager; R2C Tracker stores no Google
+password and cannot read the mailbox. STARTTLS SMTP remains an optional fallback
+for self-hosted installations.
 Pending organization members can instead activate with a verified Google
 account whose email exactly matches the pending membership record.
-The SMTP password is mapped from Secret Manager and never placed in source or an
-ordinary environment-value file.
 
-The initial hosted evaluation uses `r2c-tracker.com` as a shared pilot in
-simulation mode. The setup guide also records the required future split into
-isolated test and production projects, databases, secrets, provider accounts,
-and QR-token trust domains.
+The hosted evaluation at `r2c-tracker.com` uses live organization onboarding:
+activation invitations are delivered by the Gmail API, and an
+organization's 30-day trial starts when its primary administrator activates the
+account through a configured OAuth identity provider or creates an optional R2C
+password. Password users can request a non-enumerating, single-use reset link;
+OAuth users never need an R2C password. Billing remains shadow accounting; live
+onboarding does not collect a payment or imply production service guarantees.
 
 ## FAA NOTAM Proxy
 

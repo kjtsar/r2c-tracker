@@ -104,14 +104,14 @@
     state.dataset.state = kind;
   }
 
-  function waitForIce(timeoutMs) {
-    if (peer.iceGatheringState === "complete") return Promise.resolve();
+  function waitForRelayCandidate(timeoutMs) {
+    if (peer.localDescription?.sdp.includes(" typ relay ")) return Promise.resolve();
     return new Promise(function (resolve) {
       const timeout = window.setTimeout(resolve, timeoutMs);
-      peer.addEventListener("icegatheringstatechange", function () {
-        if (peer.iceGatheringState === "complete") {
+      peer.addEventListener("icecandidate", function (event) {
+        if (!event.candidate || event.candidate.candidate.includes(" typ relay ")) {
           window.clearTimeout(timeout);
-          resolve();
+          window.setTimeout(resolve, 0);
         }
       });
     });
@@ -306,12 +306,24 @@
     audioTransceiver = peer.addTransceiver("audio", { direction: "sendrecv" });
     const offer = await peer.createOffer();
     await peer.setLocalDescription(offer);
-    await waitForIce(5000);
+    const gatheringStartedAt = performance.now();
+    await waitForRelayCandidate(4000);
+    const relayCandidateMs = Math.max(
+      0,
+      Math.round(performance.now() - gatheringStartedAt),
+    );
+    if (!peer.localDescription?.sdp.includes(" typ relay ")) {
+      throw new Error("A routed TURN candidate was not available for video.");
+    }
     const response = await fetch(`${base}/offer`, {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({ sdp: peer.localDescription.sdp, form_token: formToken }),
+      body: JSON.stringify({
+        sdp: peer.localDescription.sdp,
+        form_token: formToken,
+        relay_candidate_ms: relayCandidateMs,
+      }),
     });
     if (!response.ok) throw new Error("The tracker rejected the media offer.");
     const result = await response.json();

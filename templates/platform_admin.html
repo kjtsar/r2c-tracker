@@ -247,6 +247,51 @@
   .postal-address {
       white-space: pre-line;
   }
+  .contact-editor {
+      margin-top: 9px;
+  }
+  .contact-editor summary {
+      color: var(--platform-blue);
+      cursor: pointer;
+      font-size: 0.82rem;
+      font-weight: 700;
+  }
+  .contact-edit-form {
+      display: grid;
+      gap: 8px;
+      min-width: 260px;
+      margin-top: 10px;
+      padding: 12px;
+      border: 1px solid var(--platform-line);
+      border-radius: 8px;
+      background: #f8fbfd;
+  }
+  .contact-edit-form label {
+      display: grid;
+      gap: 3px;
+      color: var(--platform-muted);
+      font-size: 0.75rem;
+      font-weight: 700;
+  }
+  .contact-edit-form input,
+  .contact-edit-form textarea {
+      box-sizing: border-box;
+      width: 100%;
+      padding: 7px 8px;
+      border: 1px solid #b8c7d1;
+      border-radius: 6px;
+      font: inherit;
+  }
+  .contact-edit-form button,
+  .unarchive-form button {
+      padding: 8px 10px;
+      border: 0;
+      border-radius: 6px;
+      background: var(--platform-blue);
+      color: white;
+      font-weight: 700;
+      cursor: pointer;
+  }
   .status-badge {
       display: inline-flex;
       padding: 5px 9px;
@@ -259,6 +304,7 @@
       white-space: nowrap;
   }
   .status-badge.active,
+  .status-badge.funded,
   .status-badge.ready {
       background: #e5f4ec;
       color: var(--platform-success);
@@ -266,6 +312,10 @@
   .status-badge.trial {
       background: #e8f2fa;
       color: #215f8b;
+  }
+  .status-badge.grace {
+      background: #fff2dc;
+      color: var(--platform-warning);
   }
   .status-badge.pending,
   .status-badge.activation-pending {
@@ -295,6 +345,26 @@
       color: #3d310d;
       font-weight: 750;
       cursor: pointer;
+  }
+  .archive-form {
+      display: grid;
+      gap: 6px;
+      min-width: 150px;
+  }
+  .archive-form input {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 6px;
+      border: 1px solid var(--platform-line);
+      border-radius: 5px;
+  }
+  .archive-form button {
+      padding: 7px 9px;
+      border: 1px solid var(--platform-danger);
+      border-radius: 6px;
+      background: white;
+      color: var(--platform-danger);
+      font-weight: 700;
   }
   .cost-breakdown {
       display: grid;
@@ -473,12 +543,12 @@
     <article class="metric-card">
       <div class="metric-label">Attributed to organizations</div>
       <div class="metric-value">${{ "%.2f"|format(snapshot.attributed_cost_mtd) }}</div>
-      <div class="metric-note">Direct plus allocated usage</div>
+      <div class="metric-note">Shadow allocation; credit is not consumed</div>
     </article>
     <article class="metric-card">
       <div class="metric-label">Unallocated platform cost</div>
       <div class="metric-value">${{ "%.2f"|format(snapshot.unallocated_cost_mtd) }}</div>
-      <div class="metric-note">Shared services and overhead</div>
+      <div class="metric-note">Remains only when no registered organization can share it</div>
     </article>
     <article class="metric-card">
       <div class="metric-label">
@@ -499,6 +569,62 @@
       <div class="metric-value">{{ snapshot.organizations|length }}</div>
       <div class="metric-note">All account states</div>
     </article>
+  </section>
+
+  <div class="prototype-banner" role="note">
+    <strong>Shadow allocation policy:</strong>
+    compute, network/TURN, storage, and database costs follow their aggregate
+    usage meters. If a billed category has no measured usage, it is divided
+    equally among fully provisioned organizations. Miscellaneous platform cost
+    is also shared equally. Pending and archived organizations are excluded,
+    and these shadow amounts do not yet consume credit.
+  </div>
+
+  <section class="platform-panel">
+    <div class="panel-heading">
+      <div>
+        <h2>Managed pilot requests</h2>
+        <p>Contact information submitted through rid2caltopo.org.</p>
+      </div>
+    </div>
+    <div class="organization-table-scroll" tabindex="0">
+      <table class="organization-table">
+        <thead>
+          <tr>
+            <th>Organization</th>
+            <th>Requester</th>
+            <th>Phone</th>
+            <th>Submitted</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for access_request in managed_access_requests %}
+          <tr>
+            <td>
+              <div class="org-name">{{ access_request.designator }} · {{ access_request.organization_name }}</div>
+              <div class="secondary-text">{{ access_request.source_host }}</div>
+            </td>
+            <td>
+              <div>{{ access_request.requester_name }}</div>
+              <div class="secondary-text"><a href="mailto:{{ access_request.requester_email }}">{{ access_request.requester_email }}</a></div>
+            </td>
+            <td>
+              {% if access_request.requester_phone %}
+              <a href="tel:{{ access_request.requester_phone }}">{{ access_request.requester_phone }}</a>
+              {% else %}
+              <span class="secondary-text">Not provided</span>
+              {% endif %}
+            </td>
+            <td>{{ access_request.submitted_at.strftime("%d %b %Y %H:%M UTC") }}</td>
+            <td><span class="status-badge">{{ access_request.state }}</span></td>
+          </tr>
+          {% else %}
+          <tr><td colspan="5" class="secondary-text">No managed pilot requests have been received.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
   </section>
 
   <section class="platform-panel">
@@ -523,6 +649,10 @@
         Preferred designator
         <input name="designator" maxlength="16" required placeholder="NCSSAR"
                pattern="[A-Za-z][A-Za-z0-9]{1,15}">
+        <span class="secondary-text">
+          Creates the permanent path <code>r2c-tracker.com/&lt;designator&gt;</code>.
+          Designators must be unique and remain reserved after archival.
+        </span>
       </label>
       <label>
         Primary site administrator
@@ -532,18 +662,20 @@
         Administrator email
         <input name="admin_email" type="email" maxlength="320" required autocomplete="email">
       </label>
+      <label>
+        Administrator phone
+        <input name="admin_phone" type="tel" maxlength="64" autocomplete="tel">
+      </label>
       <label class="form-span">
         Postal address
         <textarea name="postal_address" maxlength="2000" autocomplete="street-address"></textarea>
       </label>
-      <label class="form-span">
-        <input name="pilot_acknowledged" type="checkbox" value="yes" required>
-        The organization understands this is an unpriced pilot with evolving
-        features, retention, metering, and availability.
-      </label>
       <div class="form-actions form-span">
         <span>
-          A 30-day trial and restricted flight-record visibility are applied by default.
+          Activating starts the 30-day trial unless prepaid credit is available.
+          Funded organizations enter a 30-day grace period only after cumulative
+          attributed GCP usage consumes their credit. Restricted flight-record
+          visibility is applied by default.
         </span>
         <button class="primary-action" type="submit">Create organization</button>
       </div>
@@ -566,9 +698,10 @@
             <th>Account</th>
             <th>Provisioning</th>
             <th>Billing</th>
-            <th>Credit</th>
+            <th>Available credit</th>
             <th>Usage cost MTD</th>
             <th>Aggregate usage MTD</th>
+            <th>Actions</th>
           </tr>
         </thead>
         <tbody>
@@ -576,13 +709,45 @@
           <tr>
             <td>
               <div class="org-name">{{ organization.designator }} · {{ organization.legal_name }}</div>
-              <div class="org-hostname">{{ organization.hostname }}</div>
+              <div class="org-hostname">
+                <a href="/{{ organization.designator|lower }}">
+                  {{ organization.hostname }}
+                </a>
+              </div>
             </td>
             <td>
               <div>{{ organization.primary_admin_name }}</div>
               <div class="secondary-text">{{ organization.primary_admin_email }}</div>
+              {% if organization.primary_admin_phone %}
+              <div class="secondary-text">{{ organization.primary_admin_phone }}</div>
+              {% endif %}
               {% if organization.primary_admin_postal_address %}
               <div class="secondary-text postal-address">{{ organization.primary_admin_postal_address }}</div>
+              {% endif %}
+              {% if organization.account_status != "archived" %}
+              <details class="contact-editor">
+                <summary>Edit organization or administrator</summary>
+                <form class="contact-edit-form" method="post"
+                      action="/platform-admin/organizations/{{ organization.designator|lower }}/contact">
+                  <input type="hidden" name="form_token" value="{{ csrf_token }}">
+                  <label>Official organization name
+                    <input name="legal_name" maxlength="200" required value="{{ organization.legal_name }}" autocomplete="organization">
+                  </label>
+                  <label>Administrator name
+                    <input name="admin_name" maxlength="160" required value="{{ organization.primary_admin_name }}" autocomplete="name">
+                  </label>
+                  <label>Administrator email
+                    <input name="admin_email" type="email" maxlength="320" required value="{{ organization.primary_admin_email }}" autocomplete="email">
+                  </label>
+                  <label>Administrator phone
+                    <input name="admin_phone" type="tel" maxlength="64" value="{{ organization.primary_admin_phone }}" autocomplete="tel">
+                  </label>
+                  <label>Postal address
+                    <textarea name="postal_address" maxlength="2000" autocomplete="street-address">{{ organization.primary_admin_postal_address }}</textarea>
+                  </label>
+                  <button type="submit">Save contact changes</button>
+                </form>
+              </details>
               {% endif %}
             </td>
             <td>
@@ -591,7 +756,8 @@
               </span>
               {% if organization.trial_ends_at %}
               <div class="secondary-text">
-                Trial ends {{ organization.trial_ends_at.strftime("%d %b %Y") }}
+                {{ "Grace ends" if organization.account_status == "grace" else "Trial ends" }}
+                {{ organization.trial_ends_at.strftime("%d %b %Y") }}
               </div>
               {% endif %}
             </td>
@@ -599,11 +765,13 @@
               <span class="status-badge {{ organization.provisioning_status|replace(' ', '-') }}">
                 {{ organization.provisioning_status }}
               </span>
-              {% if not control_plane_simulation and organization.provisioning_status != "ready" %}
+              {% if not control_plane_simulation and organization.account_status != "archived" %}
               <form method="post"
                     action="/platform-admin/organizations/{{ organization.designator|lower }}/send-invitation">
                 <input type="hidden" name="form_token" value="{{ csrf_token }}">
-                <button type="submit">Send activation</button>
+                <button type="submit">
+                  {{ "Send access email" if organization.provisioning_status == "ready" else "Send activation" }}
+                </button>
               </form>
               {% endif %}
             </td>
@@ -612,15 +780,15 @@
             </td>
             <td>
               <div class="cost-total">${{ "%.2f"|format(organization.credit_balance) }}</div>
-              {% if control_plane_simulation %}
+              {% if organization.account_status != "archived" and ledger_nonces is defined and organization.designator in ledger_nonces %}
               <form class="credit-form" method="post"
                     action="/platform-admin/organizations/{{ organization.designator|lower }}/credit">
                 <input type="hidden" name="form_token" value="{{ csrf_token }}">
                 <input type="hidden" name="idempotency_key"
                        value="{{ ledger_nonces[organization.designator] }}">
                 <input type="number" name="amount" min="0.01" max="100000"
-                       step="0.01" value="10.00" aria-label="Simulation credit amount for {{ organization.designator }}">
-                <button type="submit">Add test credit</button>
+                       step="0.01" value="10.00" aria-label="Credit amount for {{ organization.designator }}">
+                <button type="submit">Add credit</button>
               </form>
               {% endif %}
             </td>
@@ -631,7 +799,7 @@
                 <span>Network</span><span>${{ "%.2f"|format(organization.month_to_date_cost.network) }}</span>
                 <span>Storage</span><span>${{ "%.2f"|format(organization.month_to_date_cost.storage) }}</span>
                 <span>Database</span><span>${{ "%.2f"|format(organization.month_to_date_cost.database) }}</span>
-                <span>Other</span><span>${{ "%.2f"|format(organization.month_to_date_cost.other) }}</span>
+                <span>Shared / unmetered</span><span>${{ "%.2f"|format(organization.month_to_date_cost.other) }}</span>
               </div>
             </td>
             <td>
@@ -644,13 +812,37 @@
                 <span>Database</span><span>{{ organization.aggregate_usage.database_units }}</span>
               </div>
             </td>
+            <td>
+              {% if organization.account_status == "archived" %}
+              <div class="secondary-text">
+                Archived; site access disabled and designator reserved.
+              </div>
+              <form class="unarchive-form" method="post"
+                    action="/platform-admin/organizations/{{ organization.designator|lower }}/unarchive">
+                <input type="hidden" name="form_token" value="{{ csrf_token }}">
+                <button type="submit">Unarchive organization</button>
+              </form>
+              {% else %}
+              <form class="archive-form" method="post"
+                    action="/platform-admin/organizations/{{ organization.designator|lower }}/archive">
+                <input type="hidden" name="form_token" value="{{ csrf_token }}">
+                <label>
+                  Type {{ organization.designator }}
+                  <input name="confirmation" required
+                         autocomplete="off"
+                         aria-label="Type {{ organization.designator }} to archive">
+                </label>
+                <button type="submit">Archive organization</button>
+              </form>
+              {% endif %}
+            </td>
           </tr>
           {% else %}
           <tr>
-            <td colspan="8">
+            <td colspan="9">
               {% if control_plane_enabled %}
               No organization accounts exist yet. Use the onboarding form above
-              to create the first simulated account.
+              to create the first account.
               {% else %}
               Organization commercial records are not connected yet. Google
               Cloud costs remain unallocated until aggregate application usage

@@ -48,11 +48,8 @@
 <section class="auth-shell">
   <h1>R2C platform administration</h1>
   <p>
-    Sign in as the administrator selected by the GCI maintainer. Passwords are
-    hashed in the control-plane database and may be generated and saved by your
-    browser.
+    Sign in with an authorized platform-administrator account.
   </p>
-  <p><strong>Administrator:</strong> {{ platform_admin_email }}</p>
   {% if google_login_enabled %}
   <a class="auth-choice" href="/platform-admin/google/start?next={{ next | urlencode }}">
     Continue with Google
@@ -65,9 +62,8 @@
     <input type="hidden" name="next" value="{{ next }}">
     <label>
       Email
-      <input type="email" name="email" required readonly
-             autocomplete="username" inputmode="email"
-             value="{{ platform_admin_email }}">
+      <input type="email" name="email" required
+             autocomplete="username" inputmode="email">
     </label>
     <label>
       Password

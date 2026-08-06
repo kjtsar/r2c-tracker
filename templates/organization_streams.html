@@ -420,7 +420,7 @@
      data-revision="{{ stream_status_revision }}"></div>
 <script src="/static/organization_streams_live.js?v=20260802-2" defer></script>
 {% if active_preflight_request_id %}
-<script src="/static/video_preflight.js?v=20260801-1" defer></script>
+<script src="/static/video_preflight.js?v=20260805-1" defer></script>
 {% endif %}
 {% if active_media_request_id %}
 <div id="video-media"
@@ -429,6 +429,6 @@
      data-designator="{{ organization.designator|lower }}"
      data-form-token="{{ csrf_token }}"
      data-ice-servers='{{ video_ice_servers|tojson }}'></div>
-<script src="/static/video_media.js?v=20260802-5" defer></script>
+<script src="/static/video_media.js?v=20260805-1" defer></script>
 {% endif %}
 {% endblock %}

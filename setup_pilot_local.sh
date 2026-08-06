@@ -7,8 +7,9 @@ ACCOUNT="${R2C_GCLOUD_ACCOUNT:-kjtsar@kjt.us}"
 PROJECT="${R2C_GCLOUD_PROJECT:-r2c-tracker-pilot}"
 REGION="${R2C_GCLOUD_REGION:-us-west1}"
 ENV_FILE="${R2C_PILOT_ENV_FILE:-${SCRIPT_DIR}/.env.pilot.local}"
-PROXY_PORT="${R2C_CLOUD_SQL_PROXY_PORT:-5433}"
-CONNECTION_NAME="r2c-tracker-pilot:us-west1:r2c-pilot-pg"
+DATABASE_VM_PROJECT="${R2C_DATABASE_VM_PROJECT:-shaped-splicer-482602-v1}"
+DATABASE_VM_ZONE="${R2C_DATABASE_VM_ZONE:-us-west1-b}"
+DATABASE_VM_NAME="${R2C_DATABASE_VM_NAME:-instance-20260104-171736}"
 
 if ! command -v gcloud >/dev/null 2>&1; then
   echo "gcloud is required." >&2
@@ -46,7 +47,9 @@ if [ "${actual_project}" != "${PROJECT}" ] || [ "${actual_region}" != "${REGION}
 fi
 
 pilot_gcloud projects describe "${PROJECT}" >/dev/null
-pilot_gcloud sql instances describe r2c-pilot-pg --project="${PROJECT}" >/dev/null
+pilot_gcloud compute instances describe "${DATABASE_VM_NAME}" \
+  --project="${DATABASE_VM_PROJECT}" \
+  --zone="${DATABASE_VM_ZONE}" >/dev/null
 pilot_gcloud storage buckets describe gs://r2c-tracker-pilot-flightlogs --project="${PROJECT}" >/dev/null
 
 secret_has_enabled_version() {
@@ -57,15 +60,10 @@ secret_has_enabled_version() {
     --limit=1)" ]
 }
 
-cloud_database_url="$(pilot_gcloud secrets versions access latest --secret=r2c-tracker-database-url --project="${PROJECT}")"
 tracker_admin_pass="$(pilot_gcloud secrets versions access latest --secret=r2c-tracker-admin-password --project="${PROJECT}")"
 tracker_api_key="$(pilot_gcloud secrets versions access latest --secret=r2c-tracker-api-key --project="${PROJECT}")"
 secret_key="$(pilot_gcloud secrets versions access latest --secret=r2c-tracker-secret-key --project="${PROJECT}")"
-control_plane_database_url=""
 control_plane_signing_key=""
-if secret_has_enabled_version r2c-control-plane-database-url; then
-  control_plane_database_url="$(pilot_gcloud secrets versions access latest --secret=r2c-control-plane-database-url --project="${PROJECT}")"
-fi
 if secret_has_enabled_version r2c-control-plane-signing-key; then
   control_plane_signing_key="$(pilot_gcloud secrets versions access latest --secret=r2c-control-plane-signing-key --project="${PROJECT}")"
 fi
@@ -78,39 +76,8 @@ if secret_has_enabled_version r2c-faa-notam-client-secret; then
   faa_notam_client_secret="$(pilot_gcloud secrets versions access latest --secret=r2c-faa-notam-client-secret --project="${PROJECT}")"
 fi
 
-export CLOUD_DATABASE_URL="${cloud_database_url}"
-export PROXY_PORT
-local_database_url="$(python3 - <<'PY'
-import os
-from urllib.parse import quote, unquote, urlsplit
-
-parts = urlsplit(os.environ["CLOUD_DATABASE_URL"])
-username = quote(unquote(parts.username or ""), safe="")
-password = quote(unquote(parts.password or ""), safe="")
-database = parts.path.lstrip("/")
-port = os.environ["PROXY_PORT"]
-print(f"postgresql+asyncpg://{username}:{password}@127.0.0.1:{port}/{database}")
-PY
-)"
-unset CLOUD_DATABASE_URL
-
-local_control_plane_database_url=""
-if [ -n "${control_plane_database_url}" ]; then
-  export CLOUD_CONTROL_PLANE_DATABASE_URL="${control_plane_database_url}"
-  local_control_plane_database_url="$(python3 - <<'PY'
-import os
-from urllib.parse import quote, unquote, urlsplit
-
-parts = urlsplit(os.environ["CLOUD_CONTROL_PLANE_DATABASE_URL"])
-username = quote(unquote(parts.username or ""), safe="")
-password = quote(unquote(parts.password or ""), safe="")
-database = parts.path.lstrip("/")
-port = os.environ["PROXY_PORT"]
-print(f"postgresql+asyncpg://{username}:{password}@127.0.0.1:{port}/{database}")
-PY
-)"
-  unset CLOUD_CONTROL_PLANE_DATABASE_URL
-fi
+local_database_url="sqlite+aiosqlite:///./test.db"
+local_control_plane_database_url="sqlite+aiosqlite:///./control_plane.test.db"
 
 umask 077
 {
@@ -152,10 +119,5 @@ echo "Pilot gcloud configuration ready: ${CONFIG_NAME}"
 echo "Project: ${PROJECT}"
 echo "Region: ${REGION}"
 echo "Secret-backed local environment written to ${ENV_FILE}"
-if command -v cloud-sql-proxy >/dev/null 2>&1; then
-  echo "Start the local database tunnel with:"
-  echo "  cloud-sql-proxy --port ${PROXY_PORT} ${CONNECTION_NAME}"
-else
-  echo "cloud-sql-proxy is not installed; install it before running against the pilot database."
-fi
-echo "Then load ${ENV_FILE} and start the tracker locally."
+echo "Local development uses separate SQLite tracker and control-plane files."
+echo "Load ${ENV_FILE} and start the tracker locally; the deployed pilot databases remain private."

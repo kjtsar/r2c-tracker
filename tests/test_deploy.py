@@ -71,10 +71,19 @@ class DeployScriptTest(unittest.TestCase):
             "PLATFORM_EMAIL_SMTP_PASSWORD=${PLATFORM_EMAIL_SMTP_PASSWORD_SECRET_NAME}:latest",
             script,
         )
+        self.assertIn(
+            "PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN=${PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_SECRET_NAME}:latest",
+            script,
+        )
+        self.assertIn("roles/secretmanager.secretVersionAdder", script)
         self.assertIn('not os.environ.get("DATABASE_URL_SECRET_NAME")', script)
         self.assertIn('not os.environ.get("TRACKER_ADMIN_PASS_SECRET_NAME")', script)
         self.assertIn('not os.environ.get("TRACKER_API_KEY_SECRET_NAME")', script)
         self.assertIn("--set-cloudsql-instances", script)
+        self.assertIn("--clear-cloudsql-instances", script)
+        self.assertIn('--network "${CLOUD_RUN_NETWORK}"', script)
+        self.assertIn('--subnet "${CLOUD_RUN_SUBNET}"', script)
+        self.assertIn('--vpc-egress "${CLOUD_RUN_VPC_EGRESS}"', script)
         self.assertIn("type=cloud-storage", script)
         self.assertIn("mount-path=/flightlogs-vol", script)
         self.assertIn('--no-traffic', script)
@@ -90,6 +99,7 @@ class DeployScriptTest(unittest.TestCase):
             "platform_admin.py",
             "platform_admin_identity.py",
             "platform_admin_auth.py",
+            "stripe_checkout.py",
             "turn_credentials.py",
         ):
             with self.subTest(module=module):
@@ -104,10 +114,22 @@ class DeployScriptTest(unittest.TestCase):
         self.assertIn('ALLOW_UNAUTHENTICATED}" != "1"', script)
         self.assertIn("CLOUDSDK_ACTIVE_CONFIG_NAME", script)
         self.assertIn("r2c-tracker-pilot-flightlogs", script)
+        self.assertIn('CLOUD_RUN_NETWORK="${CLOUD_RUN_NETWORK:-r2c-pilot-vpc}"', script)
+        self.assertIn(
+            'CLOUD_RUN_SUBNET="${CLOUD_RUN_SUBNET:-r2c-pilot-us-west1}"',
+            script,
+        )
+        self.assertIn('export CLOUD_SQL_INSTANCE="${CLOUD_SQL_INSTANCE:-}"', script)
         self.assertIn("https://api-staging.cgifederal-aim.com/nmsapi", script)
         self.assertIn("https://api-staging.cgifederal-aim.com/v1/auth/token", script)
         self.assertIn("r2c-google-oauth-client-id", script)
         self.assertIn("r2c-google-oauth-client-secret", script)
+        self.assertIn("r2c-managed-request-ingest-key", script)
+        self.assertIn('CONTROL_PLANE_MODE="${CONTROL_PLANE_MODE:-live}"', script)
+        self.assertIn('CONTROL_PLANE_MODE}" != "live"', script)
+        self.assertIn("The production pilot must keep organization provisioning in live mode.", script)
+        self.assertIn('PLATFORM_EMAIL_SMTP_HOST="${PLATFORM_EMAIL_SMTP_HOST:-}"', script)
+        self.assertIn("r2c-platform-email-gmail-refresh-token", script)
         self.assertIn("stun:stun.cloudflare.com:3478", script)
         self.assertIn("r2c-cloudflare-turn-key-id", script)
         self.assertIn("r2c-cloudflare-turn-api-token", script)
@@ -130,7 +152,9 @@ class DeployScriptTest(unittest.TestCase):
         self.assertIn(".env.pilot.local", script)
         self.assertIn('chmod 600 "${ENV_FILE}"', script)
         self.assertIn("auth print-access-token", script)
-        self.assertIn("cloud-sql-proxy --port", script)
+        self.assertIn("sqlite+aiosqlite:///./test.db", script)
+        self.assertIn("sqlite+aiosqlite:///./control_plane.test.db", script)
+        self.assertNotIn("cloud-sql-proxy", script)
         self.assertIn("FAA_NOTAM_CLIENT_ID", script)
         self.assertIn("FAA_NOTAM_CLIENT_SECRET", script)
         self.assertIn("CONTROL_PLANE_DATABASE_URL", script)

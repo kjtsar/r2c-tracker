@@ -10,9 +10,10 @@ import tempfile
 import unittest
 from contextlib import ExitStack
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import parse_qs, urlparse
 
 from fastapi.testclient import TestClient
@@ -58,6 +59,31 @@ class FakeGoogleOidcClient:
             email=self.email,
             name="Primary Administrator",
         )
+
+
+class FakeOrganizationEmailSender:
+    is_configured = True
+
+    def __init__(self):
+        self.password_resets = []
+        self.access_messages = []
+        self.activation_messages = []
+        self.administrator_change_messages = []
+
+    def send_organization_password_reset(self, **message):
+        self.password_resets.append(message)
+
+    def send_organization_access(self, **message):
+        self.access_messages.append(message)
+
+    def send_organization_activation(self, **message):
+        self.activation_messages.append(message)
+
+    def send_organization_administrator_changed(self, **message):
+        self.administrator_change_messages.append(message)
+
+    def send_organization_funding_exhausted(self, **message):
+        self.access_messages.append(message)
 
 
 HIDDEN_TOKEN_RE = re.compile(r'name="form_token" value="([^"]+)"')
@@ -179,6 +205,13 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn("now - lastPacketProgressAt >= 15000", script)
         self.assertNotIn("now - lastFrameProgressAt >= 6000", script)
 
+    def test_media_offer_posts_on_first_relay_candidate(self):
+        script = Path("static/video_media.js").read_text()
+
+        self.assertIn("waitForRelayCandidate(4000)", script)
+        self.assertIn("relay_candidate_ms: relayCandidateMs", script)
+        self.assertNotIn("waitForIce(5000)", script)
+
     def test_passive_stream_refresh_requires_an_advertised_r2c_stream(self):
         lingering_request = SimpleNamespace(
             id="request-1",
@@ -196,6 +229,25 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         status = main.organization_stream_status([], [lingering_request])
 
         self.assertFalse(status["active"])
+        self.assertFalse(status["awaiting_approval"])
+
+    def test_stream_status_marks_approval_wait_for_fast_reconciliation(self):
+        waiting_request = SimpleNamespace(
+            id="request-1",
+            device_name="Tablet 1",
+            state="awaiting_approval",
+            route_kind="routed",
+            estimated_uplink_bps=2_000_000,
+            selected_width=None,
+            selected_height=None,
+            selected_fps=None,
+            selected_bitrate_bps=None,
+            expires_at=datetime.now(),
+        )
+
+        status = main.organization_stream_status([], [waiting_request])
+
+        self.assertTrue(status["awaiting_approval"])
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -331,6 +383,21 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertNotIn('href="/docs"', guest_page.text)
 
         directory_page = self.client.get("/")
+        self.assertIn("Community-supported.", directory_page.text)
+        self.assertGreaterEqual(
+            directory_page.text.count('href="https://rid2caltopo.com/donations"'),
+            2,
+        )
+        self.assertNotIn('href="https://paypal.me/kjtgv"', directory_page.text)
+        self.assertIn("Contributions do not purchase access or priority.", directory_page.text)
+        self.assertNotIn("tax-deductible", directory_page.text.lower())
+        self.assertGreaterEqual(
+            directory_page.text.count(
+                'href="https://rid2caltopo.org/managed-pilot"'
+            ),
+            2,
+        )
+        self.assertIn("Request access", directory_page.text)
         self.assertNotIn('href="/r2c"', directory_page.text)
         self.assertNotIn('href="/admin"', directory_page.text)
         self.assertNotIn('href="/flightlogs/list"', directory_page.text)
@@ -369,6 +436,32 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn("User: Primary Administrator", admin_page.text)
         self.assertIn('href="/ncssar/admin"', admin_page.text)
         self.assertIn('href="/ncssar/admin/flights"', admin_page.text)
+        fake_checkout = SimpleNamespace(
+            is_configured=True,
+            create_checkout=Mock(
+                return_value="https://checkout.stripe.test/session"
+            ),
+        )
+        with patch.object(main, "stripe_checkout_provider", fake_checkout):
+            billing_page = self.client.get("/ncssar/admin")
+            self.assertIn("Continue to Stripe", billing_page.text)
+            checkout = self.client.post(
+                "/ncssar/billing/checkout",
+                data={
+                    "form_token": self.form_token(billing_page),
+                    "amount": "25.00",
+                },
+                follow_redirects=False,
+            )
+        self.assertEqual(303, checkout.status_code)
+        self.assertEqual(
+            "https://checkout.stripe.test/session",
+            checkout.headers["location"],
+        )
+        self.assertEqual(
+            Decimal("25.00"),
+            fake_checkout.create_checkout.call_args.kwargs["amount"],
+        )
 
     def test_platform_navigation_does_not_expose_legacy_admin_links(self):
         self.client.cookies.clear()
@@ -387,8 +480,17 @@ class OrganizationRouteFlowTest(unittest.TestCase):
 
         legacy_page = self.client.get("/r2c")
         self.assertEqual(200, legacy_page.status_code)
-        self.assertIn('href="/admin"', legacy_page.text)
-        self.assertIn('href="/flightlogs/list"', legacy_page.text)
+        self.assertNotIn('href="/admin"', legacy_page.text)
+        self.assertNotIn('href="/flightlogs/list"', legacy_page.text)
+        self.assertNotIn('href="/export"', legacy_page.text)
+        self.assertNotIn('href="/docs"', legacy_page.text)
+
+        retired_admin = self.client.get("/admin", follow_redirects=False)
+        self.assertEqual(303, retired_admin.status_code)
+        self.assertEqual(
+            "/platform-admin/login?next=%2Fplatform-admin%2Forganizations",
+            retired_admin.headers["location"],
+        )
 
     def test_records_admin_is_tenant_scoped_and_imports_namespaced_archive(self):
         ncssar = asyncio.run(
@@ -527,6 +629,28 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 "organizations/ncssar/2026/07/"
             )
         )
+        imported_flight_id = imported_flights[0].id
+        imported_log_url = (
+            f"/ncssar/admin/flights/{imported_flight_id}/log"
+        )
+        imported_page = self.client.get("/ncssar/admin/flights")
+        self.assertIn(f'href="{imported_log_url}"', imported_page.text)
+        self.assertIn(
+            'classList.toggle("has-overflow", hasOverflow)',
+            imported_page.text,
+        )
+        self.assertIn("new ResizeObserver(updateScrollHint)", imported_page.text)
+        with patch.object(main, "BASE_LOG_DIRECTORY", str(archive_root)):
+            downloaded_log = self.client.get(imported_log_url)
+            cross_tenant_log = self.client.get(
+                f"/ncssar/admin/flights/{exsar_flight_id}/log"
+            )
+        self.assertEqual(200, downloaded_log.status_code)
+        self.assertEqual("no-store", downloaded_log.headers["cache-control"])
+        downloaded_geojson = downloaded_log.json()
+        self.assertEqual(geojson["type"], downloaded_geojson["type"])
+        self.assertEqual(geojson["features"], downloaded_geojson["features"])
+        self.assertEqual(404, cross_tenant_log.status_code)
         self.assertEqual(
             {exsar_flight_id, legacy_flight_id},
             {
@@ -795,7 +919,6 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 "admin_name": "Primary Administrator",
                 "admin_email": "admin@ncssar.example",
                 "postal_address": "100 Rescue Way",
-                "pilot_acknowledged": "yes",
             },
             follow_redirects=True,
         )
@@ -805,6 +928,8 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn("Provisioning jobs", created.text)
         self.assertIn("Control-plane audit", created.text)
         self.assertIn("organization.created", created.text)
+        self.assertNotIn("pilot_acknowledged", created.text)
+        self.assertIn("Designators must be unique", created.text)
         activation_match = ACTIVATION_LINK_RE.search(created.text)
         self.assertIsNotNone(activation_match)
         idempotency_match = IDEMPOTENCY_RE.search(created.text)
@@ -819,25 +944,32 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             follow_redirects=True,
         )
         self.assertEqual(200, credited.status_code)
-        self.assertIn("Recorded $10.00 simulation credit", credited.text)
+        self.assertIn("Added $10.00 credit", credited.text)
+        self.assertIn("r2c-tracker.com/ncssar", credited.text)
         activation_url = html.unescape(activation_match.group(1))
         activation_path = urlparse(activation_url).path + "?" + urlparse(
             activation_url
         ).query
 
-        activation_page = self.client.get(activation_path)
-        self.assertEqual(200, activation_page.status_code)
-        activation_token = urlparse(activation_url).query.split("token=", 1)[1]
-        activated = self.client.post(
-            "/ncssar/activate",
-            data={
-                "form_token": self.form_token(activation_page),
-                "token": activation_token,
-                "password": "correct horse battery staple",
-                "password_confirm": "correct horse battery staple",
-            },
-            follow_redirects=True,
-        )
+        with patch.object(main, "google_oidc_client", FakeGoogleOidcClient()):
+            activation_page = self.client.get(activation_path)
+            self.assertEqual(200, activation_page.status_code)
+            activation_token = urlparse(activation_url).query.split("token=", 1)[1]
+            self.assertIn("or create an R2C Tracker password", activation_page.text)
+            oauth_start = self.client.post(
+                "/ncssar/activate/google",
+                data={
+                    "form_token": self.form_token(activation_page),
+                    "token": activation_token,
+                },
+                follow_redirects=False,
+            )
+            self.assertEqual(303, oauth_start.status_code)
+
+            activated = self.client.get(
+                "/google/callback?code=test-code&state=organization-state",
+                follow_redirects=True,
+            )
         self.assertEqual(200, activated.status_code)
         self.assertIn("NCSSAR administration", activated.text)
         self.assertIn("Credit balance:", activated.text)
@@ -903,6 +1035,221 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             ):
                 pass
 
+    def test_platform_admin_can_add_credit_in_live_mode(self):
+        organization = asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Primary Administrator",
+                admin_email="admin@ncssar.example",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=False,
+            )
+        )
+        with patch.object(main, "CONTROL_PLANE_SIMULATION", False):
+            page = self.client.get("/platform-admin/organizations")
+            nonce = IDEMPOTENCY_RE.search(page.text)
+            self.assertIsNotNone(nonce)
+            credited = self.client.post(
+                "/platform-admin/organizations/ncssar/credit",
+                data={
+                    "form_token": self.platform_form_token(page),
+                    "idempotency_key": nonce.group(1),
+                    "amount": "20.00",
+                },
+                follow_redirects=True,
+            )
+
+        self.assertEqual(200, credited.status_code)
+        self.assertIn("Added $20.00 credit", credited.text)
+        funded = asyncio.run(self.store.get_organization("NCSSAR"))
+        self.assertEqual(organization.id, funded.id)
+        self.assertEqual("funded", funded.lifecycle_state)
+        self.assertEqual(Decimal("20.0000"), funded.credit_balance)
+
+    def test_platform_admin_archive_requires_designator_and_disables_site(self):
+        organization = asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Primary Administrator",
+                admin_email="admin@ncssar.example",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        page = self.client.get("/platform-admin/organizations")
+        self.assertIn("Archive organization", page.text)
+
+        rejected = self.client.post(
+            "/platform-admin/organizations/ncssar/archive",
+            data={
+                "form_token": self.platform_form_token(page),
+                "confirmation": "WRONG",
+            },
+            follow_redirects=True,
+        )
+        self.assertIn("Type NCSSAR to confirm", rejected.text)
+        self.assertIsNotNone(
+            asyncio.run(self.store.get_organization(organization.designator))
+        )
+
+        archived = self.client.post(
+            "/platform-admin/organizations/ncssar/archive",
+            data={
+                "form_token": self.platform_form_token(rejected),
+                "confirmation": "NCSSAR",
+            },
+            follow_redirects=True,
+        )
+        self.assertIn("NCSSAR archived", archived.text)
+        self.assertIn("designator reserved", archived.text)
+        self.assertIn("Unarchive organization", archived.text)
+        self.assertEqual(404, self.client.get("/ncssar/login").status_code)
+
+        sender = FakeOrganizationEmailSender()
+        with patch.object(main, "platform_admin_email_sender", sender):
+            restored = self.client.post(
+                "/platform-admin/organizations/ncssar/unarchive",
+                data={"form_token": self.platform_form_token(archived)},
+                follow_redirects=True,
+            )
+        self.assertIn("NCSSAR unarchived", restored.text)
+        self.assertEqual(1, len(sender.activation_messages))
+        self.assertEqual(200, self.client.get("/ncssar/login").status_code)
+
+    def test_managed_request_is_authenticated_stored_and_shown_to_platform_admin(self):
+        request_data = {
+            "requester_name": "Jamie Responder",
+            "requester_email": "jamie@example.org",
+            "requester_phone": "+1 530 555 0100",
+            "organization_name": "Foothill Search and Rescue",
+            "designator": "FHSAR",
+            "source_host": "rid2caltopo.org",
+        }
+        with patch.object(main, "MANAGED_REQUEST_INGEST_KEY", "intake-secret"):
+            denied = self.client.post(
+                "/managed-access-requests",
+                data=request_data,
+            )
+            accepted = self.client.post(
+                "/managed-access-requests",
+                data=request_data,
+                headers={"Authorization": "Bearer intake-secret"},
+            )
+        self.assertEqual(403, denied.status_code)
+        self.assertEqual(200, accepted.status_code)
+        page = self.client.get("/platform-admin/organizations")
+        self.assertIn("Managed pilot requests", page.text)
+        self.assertIn("Jamie Responder", page.text)
+        self.assertIn("+1 530 555 0100", page.text)
+        self.assertIn("jamie@example.org", page.text)
+
+    def test_platform_admin_can_replace_organization_administrator_with_accountability_email(self):
+        organization = asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Former Administrator",
+                admin_email="former@ncssar.example",
+                admin_phone="530-555-0101",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=False,
+            )
+        )
+        asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+            )
+        )
+        sender = FakeOrganizationEmailSender()
+        with patch.object(main, "platform_admin_email_sender", sender):
+            page = self.client.get("/platform-admin/organizations")
+            changed = self.client.post(
+                "/platform-admin/organizations/ncssar/contact",
+                data={
+                    "form_token": self.platform_form_token(page),
+                    "legal_name": "Nevada County Sheriff's Search And Rescue",
+                    "admin_name": "New Administrator",
+                    "admin_email": "new@ncssar.example",
+                    "admin_phone": "+1 530 555 0199",
+                    "postal_address": "200 New Rescue Way",
+                },
+                follow_redirects=True,
+            )
+        self.assertIn("administrator replaced", changed.text)
+        self.assertIn("+1 530 555 0199", changed.text)
+        self.assertEqual(1, len(sender.activation_messages))
+        self.assertEqual(1, len(sender.administrator_change_messages))
+        self.assertEqual(
+            "former@ncssar.example",
+            sender.administrator_change_messages[0]["recipient"],
+        )
+        self.assertIsNone(
+            asyncio.run(
+                self.store.authenticate_user(
+                    "NCSSAR",
+                    "former@ncssar.example",
+                    "correct horse battery staple",
+                )
+            )
+        )
+        self.assertIsNotNone(
+            asyncio.run(
+                self.store.get_invitation("NCSSAR", "new@ncssar.example")
+            )
+        )
+
+    def test_active_organization_receives_access_email_instead_of_new_activation(self):
+        organization = asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Primary Administrator",
+                admin_email="admin@ncssar.example",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=False,
+            )
+        )
+        asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+            )
+        )
+        sender = FakeOrganizationEmailSender()
+        with (
+            patch.object(main, "CONTROL_PLANE_SIMULATION", False),
+            patch.object(main, "platform_admin_email_sender", sender),
+        ):
+            page = self.client.get("/platform-admin/organizations")
+            self.assertIn("Send access email", page.text)
+            sent = self.client.post(
+                "/platform-admin/organizations/ncssar/send-invitation",
+                data={"form_token": self.platform_form_token(page)},
+                follow_redirects=True,
+            )
+
+        self.assertIn("Administrator access email sent", sent.text)
+        self.assertEqual([], sender.activation_messages)
+        self.assertEqual(1, len(sender.access_messages))
+        self.assertEqual(
+            "https://r2c-tracker.com/ncssar/login",
+            sender.access_messages[0]["login_url"],
+        )
+        audit_events = asyncio.run(self.store.list_audit_events())
+        self.assertEqual(
+            "administrator.access_email_sent",
+            audit_events[0].event_type,
+        )
+
     def test_active_organization_user_can_sign_in_with_google(self):
         organization = asyncio.run(
             self.store.create_organization(
@@ -926,6 +1273,8 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         with patch.object(main, "google_oidc_client", FakeGoogleOidcClient()):
             login_page = self.client.get("/ncssar/login")
             self.assertIn("Continue with Google", login_page.text)
+            self.assertIn('name="password"', login_page.text)
+            self.assertIn("Forgot password?", login_page.text)
             start = self.client.get(
                 "/ncssar/google/start",
                 follow_redirects=False,
@@ -1333,14 +1682,30 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 simulation=True,
             )
         )
-
+        invitation = asyncio.run(
+            self.store.get_invitation(
+                organization.designator,
+                organization.primary_admin_email,
+            )
+        )
+        activation_url = self.tokens.activation_url(invitation)
+        activation_path = urlparse(activation_url).path + "?" + urlparse(
+            activation_url
+        ).query
         with patch.object(
             main,
             "google_oidc_client",
             FakeGoogleOidcClient(organization.primary_admin_email),
         ):
-            self.client.get(
-                "/ncssar/google/start",
+            activation_page = self.client.get(activation_path)
+            self.assertIn("Continue with Google", activation_page.text)
+            self.assertIn('name="password"', activation_page.text)
+            self.client.post(
+                "/ncssar/activate/google",
+                data={
+                    "form_token": self.form_token(activation_page),
+                    "token": parse_qs(urlparse(activation_url).query)["token"][0],
+                },
                 follow_redirects=False,
             )
             callback = self.client.get(
@@ -1357,6 +1722,78 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         admin_page = self.client.get("/ncssar/admin")
         self.assertEqual(200, admin_page.status_code)
         self.assertIn("active", admin_page.text)
+
+    def test_pending_member_cannot_activate_from_ordinary_google_login(self):
+        organization = asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Primary Administrator",
+                admin_email="admin@ncssar.example",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        with patch.object(
+            main,
+            "google_oidc_client",
+            FakeGoogleOidcClient(organization.primary_admin_email),
+        ):
+            self.client.get("/ncssar/google/start", follow_redirects=False)
+            callback = self.client.get(
+                "/google/callback?code=test-code&state=organization-state",
+                follow_redirects=False,
+            )
+        self.assertEqual("/ncssar/login", callback.headers["location"])
+
+    def test_forgot_password_is_non_enumerating_and_uses_fragment_token(self):
+        organization = asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Primary Administrator",
+                admin_email="admin@ncssar.example",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "original complex password",
+            )
+        )
+        sender = FakeOrganizationEmailSender()
+        with patch.object(main, "platform_admin_email_sender", sender):
+            request_page = self.client.get("/ncssar/forgot-password")
+            known = self.client.post(
+                "/ncssar/forgot-password",
+                data={
+                    "form_token": self.form_token(request_page),
+                    "email": organization.primary_admin_email,
+                },
+                follow_redirects=True,
+            )
+            request_page = self.client.get("/ncssar/forgot-password")
+            unknown = self.client.post(
+                "/ncssar/forgot-password",
+                data={
+                    "form_token": self.form_token(request_page),
+                    "email": "unknown@example.test",
+                },
+                follow_redirects=True,
+            )
+
+        generic = "If that address is registered, a password-reset link has been sent."
+        self.assertIn(generic, known.text)
+        self.assertIn(generic, unknown.text)
+        self.assertEqual(1, len(sender.password_resets))
+        reset_url = sender.password_resets[0]["reset_url"]
+        self.assertEqual("", urlparse(reset_url).query)
+        self.assertIn("token", parse_qs(urlparse(reset_url).fragment))
 
     def test_cross_tenant_session_is_rejected(self):
         asyncio.run(

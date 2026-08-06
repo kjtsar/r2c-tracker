@@ -93,15 +93,14 @@
       }
     </style>
     {% block extra_head %}{% endblock %}
-    <link rel="icon" type="image/png" href="/static/favicon-96x96.png" sizes="96x96" />
-    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-    <link rel="shortcut icon" href="/static/favicon.ico" />
+    <link rel="icon" type="image/png" href="/static/app-icon-orange.png" sizes="512x512" />
+    <link rel="apple-touch-icon" href="/static/app-icon-orange.png" />
   </head>
 
   {% set navigation = template_navigation(request, organization_page_designator | default(None)) %}
   <main>
     <a class="site-home" href="{{ navigation.home_url }}">
-      <img src="/static/favicon-96x96.png" alt="R2C Tracker icon">
+      <img src="/static/app-icon-orange.png" alt="R2C Tracker icon">
       <span>R2C Tracker</span>
     </a>
     {% if organization_page_designator is defined %}
@@ -263,11 +262,7 @@
       {% elif navigation.scope == "public" %}
       <p><a href="/versions" style="color: #7f8c8d; text-decoration: none; font-size: 0.8em;">Tracker Version {{ tracker_version }}</a></p>
       {% else %}
-      <p><a href="/r2c" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">R2C Instance Status</a></p>
-      <p><a href="/flightlogs/list" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Admin Flight Logs</a></p>
-      <p><a href="/admin" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Admin Access</a></p>
-      <p><a href="/export" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Export as CSV</a></p>
-      <p><a href="/docs" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Docs</a></p>
+      <p><a href="/" style="color: #bdc3c7; text-decoration: none; font-size: 0.8em;">Organization Directory</a></p>
       <p><a href="/versions" style="color: #7f8c8d; text-decoration: none; font-size: 0.8em;">Tracker Version {{ tracker_version }}</a></p>
       {% endif %}
     </footer>

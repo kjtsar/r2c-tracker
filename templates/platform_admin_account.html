@@ -38,6 +38,25 @@
     <strong>{{ platform_admin.display_name }}</strong><br>
     {{ platform_admin.email }}
   </p>
+  {% if gmail_setup_enabled %}
+  <div style="margin: 22px 0; padding: 16px; border: 1px solid #ccd8df; border-radius: 9px;">
+    <h2 style="margin-top: 0; font-size: 1.15rem;">Invitation email</h2>
+    {% if email_sender_configured %}
+    <p>Gmail sending is configured for invitations and password resets.</p>
+    {% else %}
+    <p>
+      Connect the platform Gmail account so R2C Tracker can send organization
+      invitations and password-reset links. Access is limited to sending mail;
+      R2C Tracker cannot read the mailbox.
+    </p>
+    {% endif %}
+    <div class="account-actions">
+      <a class="button" href="/platform-admin/gmail/start">
+        {% if email_sender_configured %}Reconnect Gmail sender{% else %}Connect Gmail sender{% endif %}
+      </a>
+    </div>
+  </div>
+  {% endif %}
   <form class="account-form" method="post"
         action="/platform-admin/account/password">
     <input type="hidden" name="form_token" value="{{ csrf_token }}">

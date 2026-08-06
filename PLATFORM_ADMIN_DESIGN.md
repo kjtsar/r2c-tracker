@@ -69,7 +69,7 @@ identity generation unusable.
 - immutable organization ID;
 - official legal/display name;
 - normalized, unique designator;
-- assigned hostname;
+- assigned tenant path;
 - lifecycle state;
 - provisioning state;
 - trial activation and expiration timestamps;
@@ -121,19 +121,23 @@ Payment-provider webhooks are reconciled into ledger entries using idempotency
 keys.
 
 The implemented ledger is append-only at the service boundary and uses unique
-idempotency keys. Positive entries increase the organization's displayed credit
-balance and negative entries decrease it. Payment collection remains disabled;
-the current code supports simulation and future webhook reconciliation only.
+idempotency keys. Positive entries record deposited funds and negative entries
+record refunds or financial adjustments. Available credit is deposited funds
+minus cumulative GCP usage cost attributed to the organization. A funded account
+enters a 30-day grace period when that available credit reaches zero. Adding
+enough funds during the grace period returns the account to funded status.
+Payment collection remains disabled; platform administrators can record manual
+deposits while future payment-provider reconciliation remains pending.
 
 ### provisioning_jobs
 
 Each organization onboarding request records independently retryable steps:
 
-1. reserve designator and hostname;
+1. reserve designator and tenant path;
 2. create tenant database boundary;
 3. create tenant object-storage boundary and retention rules;
 4. create tenant secrets;
-5. configure hostname routing;
+5. configure tenant path routing;
 6. run health checks;
 7. issue a short-lived activation link;
 8. start the trial when the administrator activates the account.
@@ -186,11 +190,16 @@ projects on the billing account. Until Google's first standard or detailed
 export table arrives, the dashboard reports an export-pending state with zero
 values rather than presenting illustrative costs as live.
 
-The initial live snapshot treats all Google Cloud cost as unallocated platform
-cost. Per-organization attribution intentionally remains zero until
-application-level aggregate usage meters and organization commercial records
-exist. This prevents project-wide infrastructure costs from being assigned to
-an organization using unsupported assumptions.
+The live dashboard performs shadow allocation only. Compute, network (including
+TURN relay), storage, and database costs are distributed in proportion to their
+matching privacy-safe organization meters. A category with no measured usage,
+and the billing export's unclassified `other` cost, is divided equally among
+fully provisioned, non-archived organizations. Pending applicants and archived
+organizations do not share platform costs. Sub-micro-dollar rounding is
+reconciled deterministically so attributed plus unallocated cost always matches
+the Google bill. Shadow allocations are not written to the billing ledger and
+do not consume prepaid credit. This lets the platform compare the allocation
+model with the Google bill before any organization is charged.
 
 ## Device enrollment QR boundary
 

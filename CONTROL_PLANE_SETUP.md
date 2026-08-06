@@ -88,17 +88,17 @@ Cloud SQL creation and payment-provider enrollment can incur charges or create
 external obligations, so they are intentionally not performed by the local
 simulation setup.
 
-## Shared pilot deployment
+## Hosted evaluation deployment
 
-The initial hosted evaluation runs on `https://r2c-tracker.com` in the
-`r2c-tracker-pilot` project. The control plane remains in `simulation` mode:
+The hosted evaluation runs on `https://r2c-tracker.com` in the isolated
+`r2c-tracker-pilot` project. The control plane uses `live` onboarding mode:
 
 - onboarding records, trials, balances, roles, and enrollment campaigns persist
-- the control plane uses the separate `control_plane` database inside the
-  existing pilot Cloud SQL instance
-- no email is sent
+- the control plane uses a separate database on the pilot PostgreSQL VM
+- administrator activation email is sent through the Gmail API using the
+  send-only OAuth scope
 - no payment is collected
-- no tenant infrastructure or app credential is issued
+- tenant-scoped accounts and revocable app credentials may be issued
 
 Prepare or verify the pilot resources with:
 
@@ -139,12 +139,24 @@ redirect URI and store both values without printing them:
 ./setup_google_oauth_secrets.sh /path/to/client_secret.json
 ```
 
-The application requests only `openid email profile`. It verifies the signed
+Normal sign-in requests only `openid email profile`. It verifies the signed
 ID token, audience, issuer, one-time nonce, and `email_verified`, then requires
-an exact match with the current infrastructure identity. Google access and
-refresh tokens are not retained.
+an exact match with the current infrastructure identity. The authenticated
+platform-account setup action additionally requests `gmail.send` and stores the
+offline credential directly in Secret Manager. The runtime cannot read Gmail.
 
-The password setup fallback uses:
+For the guarded pilot, deploy the simulation-mode setup revision, sign in at
+`/platform-admin/account`, and select **Connect Gmail sender**. After consent,
+deploy live mode with the resulting secret mapped read-only:
+
+```bash
+CONTROL_PLANE_MODE=live \
+PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_SECRET_NAME=r2c-platform-email-gmail-refresh-token \
+PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_TARGET= \
+./deploy_pilot.sh APP_VERSION_CODE
+```
+
+The optional STARTTLS SMTP fallback for self-hosted deployments uses:
 
 - `PLATFORM_EMAIL_SMTP_HOST`
 - `PLATFORM_EMAIL_SMTP_PORT` (normally `587`)
@@ -158,16 +170,15 @@ message per minute and five per hour, and create a hashed single-use token that
 expires after five minutes. The emailed link carries the token after `#`, so
 the token never enters the HTTP URL received or logged by Cloud Run.
 
-Configure the pilot sender without exposing its password at the shell prompt:
+Configure the SMTP fallback without exposing its password at the shell prompt:
 
 ```bash
 ./setup_pilot_email.sh SMTP_HOST SMTP_USER FROM_ADDRESS
 ```
 
 The script prompts without echo, writes a new Secret Manager version, grants
-only the pilot runtime service account access, and prints the simulation-mode
-deployment command. Qualify delivery to a test address before setting
-`CONTROL_PLANE_MODE=live`.
+only the pilot runtime service account access, and prints the live deployment
+command. The hosted pilot uses Gmail API OAuth instead.
 
 Use a tagged, zero-traffic canary before promoting a revision:
 
@@ -188,8 +199,8 @@ creation, or real device credentials, split the environments:
 
 Pending organization members can activate immediately with a verified Google
 account whose email exactly matches their membership record. An activation
-email is not sent unless outbound SMTP is configured; the administration page
-states this explicitly.
+email is not sent unless a Gmail API or SMTP sender is configured; the
+administration page states this explicitly.
 
 | Boundary | Test | Production |
 | --- | --- | --- |

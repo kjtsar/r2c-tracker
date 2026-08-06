@@ -14,13 +14,16 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 import main
 from control_plane import ControlPlaneStore
 from platform_admin import (
+    AggregateUsage,
     BigQueryBillingSnapshotProvider,
+    CostBreakdown,
+    allocate_platform_costs,
     build_illustrative_platform_snapshot,
     build_pending_platform_snapshot,
     public_snapshot_dict,
 )
 from platform_admin_identity import PlatformAdminIdentity
-from platform_admin_auth import GoogleIdentity
+from platform_admin_auth import GoogleGmailAuthorization, GoogleIdentity
 
 
 class StaticPlatformAdminIdentityProvider:
@@ -56,6 +59,15 @@ class FakeGoogleOidcClient:
             subject="google-subject-123",
             email=self.email,
             name="Platform Administrator",
+        )
+
+    def gmail_authorization_request(self, redirect_uri):
+        return self.authorization_request(redirect_uri)
+
+    def exchange_gmail_code(self, **_kwargs):
+        return GoogleGmailAuthorization(
+            identity=self.exchange_code(),
+            refresh_token="gmail-refresh-token",
         )
 
 
@@ -229,6 +241,69 @@ class BigQueryBillingSnapshotProviderTest(unittest.TestCase):
         self.assertNotIn("FORMAT_DATE('%Y%m', CURRENT_DATE('UTC'))", client.queries[0])
         self.assertNotIn("flight", client.queries[0].lower())
 
+    def test_metered_costs_are_proportional_and_other_is_shared_equally(self):
+        allocations, unallocated = allocate_platform_costs(
+            CostBreakdown(
+                compute=Decimal("9.00"),
+                network=Decimal("6.00"),
+                storage=Decimal("3.00"),
+                database=Decimal("4.00"),
+                other=Decimal("2.00"),
+            ),
+            {
+                "one": AggregateUsage(
+                    compute_units=Decimal("1"),
+                    network_bytes=100,
+                    storage_byte_days=30,
+                    database_units=Decimal("1"),
+                ),
+                "two": AggregateUsage(
+                    compute_units=Decimal("2"),
+                    network_bytes=100,
+                    turn_relay_bytes=200,
+                    database_units=Decimal("3"),
+                ),
+            },
+        )
+
+        self.assertEqual(Decimal("3.000000"), allocations["one"].compute)
+        self.assertEqual(Decimal("6.000000"), allocations["two"].compute)
+        self.assertEqual(Decimal("1.500000"), allocations["one"].network)
+        self.assertEqual(Decimal("4.500000"), allocations["two"].network)
+        self.assertEqual(Decimal("3.000000"), allocations["one"].storage)
+        self.assertEqual(Decimal("1.000000"), allocations["one"].database)
+        self.assertEqual(Decimal("3.000000"), allocations["two"].database)
+        self.assertEqual(Decimal("1.000000"), allocations["one"].other)
+        self.assertEqual(Decimal("1.000000"), allocations["two"].other)
+        self.assertEqual(Decimal("0.000000"), unallocated)
+
+    def test_cost_category_without_usage_meter_is_shared_equally(self):
+        allocations, unallocated = allocate_platform_costs(
+            CostBreakdown(compute=Decimal("5.00"), network=Decimal("7.00")),
+            {"one": AggregateUsage(compute_units=Decimal("1"))},
+        )
+
+        self.assertEqual(Decimal("5.000000"), allocations["one"].compute)
+        self.assertEqual(Decimal("7.000000"), allocations["one"].network)
+        self.assertEqual(Decimal("0.000000"), unallocated)
+
+    def test_shared_cost_rounding_still_reconciles_to_the_google_bill(self):
+        allocations, unallocated = allocate_platform_costs(
+            CostBreakdown(other=Decimal("1.00")),
+            {
+                "one": AggregateUsage(),
+                "two": AggregateUsage(),
+                "three": AggregateUsage(),
+            },
+        )
+
+        attributed = sum(
+            (allocation.total for allocation in allocations.values()),
+            Decimal("0"),
+        )
+        self.assertEqual(Decimal("1.00"), attributed)
+        self.assertEqual(Decimal("0.000000"), unallocated)
+
     def test_latest_prior_period_remains_visible_and_is_marked_stale(self):
         through = datetime(2026, 6, 30, 23, 0, tzinfo=UTC)
         client = FakeBigQueryClient(
@@ -321,6 +396,8 @@ class PlatformAdminAuthenticationTest(unittest.TestCase):
 
     def test_tracker_admin_credentials_do_not_grant_platform_access(self):
         page = self.client.get("/platform-admin/login")
+        self.assertNotIn("platform@example.test", page.text)
+        self.assertNotIn("Administrator:", page.text)
         response = self.client.post(
             "/platform-admin/login",
             data={
@@ -382,7 +459,7 @@ class PlatformAdminAuthenticationTest(unittest.TestCase):
         self.assertEqual(303, response.status_code)
         self.assertIn("/platform-admin/login", response.headers["location"])
         login = self.client.get("/platform-admin/login")
-        self.assertIn("replacement@example.test", login.text)
+        self.assertNotIn("replacement@example.test", login.text)
 
     def test_matching_verified_google_identity_creates_session(self):
         with patch.object(main, "google_oidc_client", FakeGoogleOidcClient()):
@@ -432,6 +509,45 @@ class PlatformAdminAuthenticationTest(unittest.TestCase):
                 follow_redirects=False,
             ).status_code,
         )
+
+    def test_authenticated_admin_can_authorize_send_only_gmail(self):
+        page = self.client.get("/platform-admin/login")
+        self.client.post(
+            "/platform-admin/login",
+            data={
+                "form_token": self.form_token(page),
+                "email": "platform@example.test",
+                "password": "platform secret phrase",
+                "next": "/platform-admin/account",
+            },
+            follow_redirects=False,
+        )
+        stored = []
+        with (
+            patch.object(main, "google_oidc_client", FakeGoogleOidcClient()),
+            patch.object(
+                main,
+                "PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_TARGET",
+                "projects/test/secrets/gmail-refresh",
+            ),
+            patch.object(
+                main,
+                "store_gmail_refresh_token",
+                side_effect=stored.append,
+            ),
+        ):
+            start = self.client.get(
+                "/platform-admin/gmail/start",
+                follow_redirects=False,
+            )
+            callback = self.client.get(
+                "/platform-admin/google/callback?code=test-code&state=test-state",
+                follow_redirects=False,
+            )
+
+        self.assertEqual(303, start.status_code)
+        self.assertEqual("/platform-admin/account", callback.headers["location"])
+        self.assertEqual(["gmail-refresh-token"], stored)
 
     def test_email_setup_link_sets_password_once(self):
         sender = FakeEmailSender()

@@ -54,7 +54,7 @@ class ControlPlaneStoreTest(unittest.TestCase):
         organization = self.create_organization()
 
         self.assertEqual("NCSSAR", organization.designator)
-        self.assertEqual("ncssar.r2c-tracker.com", organization.hostname)
+        self.assertEqual("r2c-tracker.com/ncssar", organization.hostname)
         self.assertEqual("simulation ready", organization.provisioning_state)
         self.assertEqual("restricted", organization.records_visibility)
         self.assertEqual(730, organization.record_retention_days)
@@ -87,6 +87,8 @@ class ControlPlaneStoreTest(unittest.TestCase):
         )
         pending = asyncio.run(self.store.get_organization("LIVESAR"))
         self.assertEqual("activation pending", pending.provisioning_state)
+        promoted_job = asyncio.run(self.store.list_provisioning_jobs())[0]
+        self.assertFalse(promoted_job.simulation)
 
         invitation = asyncio.run(
             self.store.get_invitation("LIVESAR", "admin@livesar.example")
@@ -340,8 +342,123 @@ class ControlPlaneStoreTest(unittest.TestCase):
     def test_designator_and_hostname_are_unique(self):
         self.create_organization()
 
-        with self.assertRaises(DuplicateOrganizationError):
+        with self.assertRaisesRegex(
+            DuplicateOrganizationError,
+            "NCSSAR is already in use",
+        ):
             self.create_organization(admin_email="second@example.org")
+
+    def test_archiving_disables_site_access_and_keeps_designator_reserved(self):
+        organization = self.create_organization()
+
+        archived = asyncio.run(
+            self.store.archive_organization(
+                designator=organization.designator,
+                actor_id="platform-admin",
+                now=self.now + timedelta(hours=1),
+            )
+        )
+
+        self.assertEqual("archived", archived.lifecycle_state)
+        self.assertEqual("archived", archived.provisioning_state)
+        self.assertIsNone(
+            asyncio.run(self.store.get_organization(organization.designator))
+        )
+        self.assertEqual(
+            "archived",
+            asyncio.run(
+                self.store.get_organization(
+                    organization.designator,
+                    include_archived=True,
+                )
+            ).lifecycle_state,
+        )
+        with self.assertRaises(DuplicateOrganizationError):
+            self.create_organization(admin_email="replacement@example.org")
+        audit_events = asyncio.run(self.store.list_audit_events())
+        self.assertEqual("organization.archived", audit_events[0].event_type)
+
+    def test_unarchive_restores_org_and_requires_fresh_administrator_activation(self):
+        organization = self.create_organization(admin_phone="530-555-0102")
+        asyncio.run(
+            self.store.archive_organization(
+                designator=organization.designator,
+                actor_id="platform-admin",
+                now=self.now + timedelta(hours=1),
+            )
+        )
+        restored = asyncio.run(
+            self.store.unarchive_organization(
+                designator=organization.designator,
+                actor_id="platform-admin",
+                now=self.now + timedelta(hours=2),
+            )
+        )
+        self.assertEqual("trial", restored.lifecycle_state)
+        self.assertEqual("simulation ready", restored.provisioning_state)
+        self.assertEqual("530-555-0102", restored.primary_admin_phone)
+        self.assertIsNotNone(
+            asyncio.run(
+                self.store.get_invitation(
+                    restored.designator,
+                    restored.primary_admin_email,
+                )
+            )
+        )
+        audit_events = asyncio.run(self.store.list_audit_events())
+        self.assertEqual("organization.unarchived", audit_events[0].event_type)
+
+    def test_managed_access_requests_are_deduplicated_and_retain_phone(self):
+        values = {
+            "requester_name": "Jamie Responder",
+            "requester_email": "jamie@example.org",
+            "requester_phone": "+1 530 555 0100",
+            "organization_name": "Foothill Search and Rescue",
+            "designator": "FHSAR",
+            "source_host": "rid2caltopo.org",
+            "now": self.now,
+        }
+        first = asyncio.run(self.store.create_managed_access_request(**values))
+        second = asyncio.run(self.store.create_managed_access_request(**values))
+        requests = asyncio.run(self.store.list_managed_access_requests())
+        self.assertEqual(first.id, second.id)
+        self.assertEqual(1, len(requests))
+        self.assertEqual("+1 530 555 0100", requests[0].requester_phone)
+
+    def test_replacement_administrator_activation_does_not_restart_trial(self):
+        organization = self.create_organization(simulation=False)
+        first_activation = self.now + timedelta(hours=1)
+        asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+                first_activation,
+            )
+        )
+        before = asyncio.run(self.store.get_organization(organization.designator))
+        asyncio.run(
+            self.store.update_organization_administrator(
+                designator=organization.designator,
+                legal_name=organization.legal_name,
+                admin_name="Replacement Administrator",
+                admin_email="replacement@example.org",
+                admin_phone="530-555-0199",
+                postal_address="200 Rescue Way",
+                actor_id="platform-admin",
+                now=first_activation + timedelta(days=2),
+            )
+        )
+        asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                "replacement@example.org",
+                "another correct horse battery staple",
+                first_activation + timedelta(days=3),
+            )
+        )
+        after = asyncio.run(self.store.get_organization(organization.designator))
+        self.assertEqual(before.trial_ends_at, after.trial_ends_at)
 
     def test_owner_can_activate_and_authenticate(self):
         organization = self.create_organization()
@@ -568,6 +685,7 @@ class ControlPlaneStoreTest(unittest.TestCase):
                 organization_id=organization.id,
                 requester_user_id=owner.id,
                 browser_offer_sdp=offer_sdp,
+                relay_candidate_ms=321,
                 now=self.now + timedelta(seconds=31),
             )
         )
@@ -631,6 +749,7 @@ class ControlPlaneStoreTest(unittest.TestCase):
                 organization_id=organization.id,
                 requester_user_id=owner.id,
                 browser_offer_sdp=media_offer_sdp,
+                relay_candidate_ms=654,
                 now=self.now + timedelta(seconds=34),
             )
         )
@@ -748,6 +867,21 @@ class ControlPlaneStoreTest(unittest.TestCase):
                 "video.requested",
             ],
             [event.event_type for event in audit_events[:7]],
+        )
+        audit_by_type = {
+            event.event_type: event for event in audit_events[:7]
+        }
+        self.assertEqual(
+            321,
+            audit_by_type["video.preflight_started"].details[
+                "browser_relay_candidate_ms"
+            ],
+        )
+        self.assertEqual(
+            654,
+            audit_by_type["video.media_signaling_started"].details[
+                "browser_relay_candidate_ms"
+            ],
         )
 
         failed_low_request = asyncio.run(
@@ -1031,12 +1165,28 @@ class ControlPlaneStoreTest(unittest.TestCase):
 
     def test_verified_google_email_activates_exact_pending_organization_user(self):
         organization = self.create_organization()
+        invitation = asyncio.run(
+            self.store.get_invitation(
+                organization.designator,
+                organization.primary_admin_email,
+            )
+        )
+
+        without_invitation = asyncio.run(
+            self.store.authorize_google_user(
+                organization.designator,
+                organization.primary_admin_email,
+                self.now,
+            )
+        )
+        self.assertIsNone(without_invitation)
 
         authorized = asyncio.run(
             self.store.authorize_google_user(
                 organization.designator.lower(),
                 organization.primary_admin_email.upper(),
                 self.now + timedelta(minutes=1),
+                activation_nonce=invitation.activation_nonce,
             )
         )
 
@@ -1051,6 +1201,61 @@ class ControlPlaneStoreTest(unittest.TestCase):
                 )
             )
         )
+
+    def test_organization_password_reset_is_single_use_and_non_enumerating(self):
+        organization = self.create_organization()
+        asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "original complex password",
+                now=self.now,
+            )
+        )
+        self.assertIsNone(
+            asyncio.run(
+                self.store.issue_organization_password_reset(
+                    designator=organization.designator,
+                    email="unknown@example.org",
+                    now=self.now,
+                )
+            )
+        )
+        token = asyncio.run(
+            self.store.issue_organization_password_reset(
+                designator=organization.designator,
+                email=organization.primary_admin_email,
+                now=self.now,
+            )
+        )
+        reset = asyncio.run(
+            self.store.set_organization_password_from_reset(
+                designator=organization.designator,
+                token=token,
+                new_password="replacement complex password",
+                now=self.now + timedelta(minutes=14, seconds=59),
+            )
+        )
+        self.assertIsNotNone(reset)
+        self.assertIsNone(
+            asyncio.run(
+                self.store.set_organization_password_from_reset(
+                    designator=organization.designator,
+                    token=token,
+                    new_password="replayed complex password",
+                    now=self.now + timedelta(minutes=15),
+                )
+            )
+        )
+        signed_in = asyncio.run(
+            self.store.authenticate_user(
+                organization.designator,
+                organization.primary_admin_email,
+                "replacement complex password",
+                self.now + timedelta(minutes=16),
+            )
+        )
+        self.assertIsNotNone(signed_in)
 
     def test_ledger_is_idempotent_and_balance_is_organization_visible(self):
         organization = self.create_organization()
@@ -1100,6 +1305,119 @@ class ControlPlaneStoreTest(unittest.TestCase):
                     now=self.now,
                 )
             )
+
+    def test_deposited_credit_is_consumed_by_cumulative_gcp_usage(self):
+        organization = self.create_organization()
+        asyncio.run(
+            self.store.append_ledger_entry(
+                organization_id=organization.id,
+                entry_type="credit",
+                amount=Decimal("10.00"),
+                description="Prepaid account credit",
+                idempotency_key="credit-ncssar-funded-1",
+                created_by_type="platform_admin",
+                created_by_id="platform-admin",
+                now=self.now,
+            )
+        )
+
+        funded = asyncio.run(self.store.get_organization("NCSSAR"))
+        self.assertEqual("funded", funded.lifecycle_state)
+        self.assertEqual("prepaid credit", funded.billing_mode)
+        self.assertEqual(Decimal("10.0000"), funded.credit_balance)
+        self.assertIsNone(funded.trial_ends_at)
+
+        asyncio.run(
+            self.store.record_daily_usage(
+                organization_id=organization.id,
+                usage_date="2026-07-30",
+                compute_cost=Decimal("4.00"),
+                network_cost=Decimal("6.00"),
+                now=self.now + timedelta(days=1),
+            )
+        )
+
+        grace = asyncio.run(self.store.get_organization("NCSSAR"))
+        self.assertEqual("grace", grace.lifecycle_state)
+        self.assertEqual("30-day grace", grace.billing_mode)
+        self.assertEqual(Decimal("0.00"), grace.credit_balance)
+        self.assertEqual(
+            self.now + timedelta(days=31),
+            grace.trial_ends_at,
+        )
+        notifications = asyncio.run(
+            self.store.list_pending_billing_notifications()
+        )
+        self.assertEqual(1, len(notifications))
+        self.assertEqual("funding_exhausted", notifications[0].notification_type)
+        self.assertEqual("admin@ncssar.example", notifications[0].administrator_email)
+        asyncio.run(
+            self.store.mark_billing_notification_sent(notifications[0].id)
+        )
+        self.assertEqual(
+            (),
+            asyncio.run(self.store.list_pending_billing_notifications()),
+        )
+
+        asyncio.run(
+            self.store.append_ledger_entry(
+                organization_id=organization.id,
+                entry_type="credit",
+                amount=Decimal("5.00"),
+                description="Additional prepaid account credit",
+                idempotency_key="credit-ncssar-funded-2",
+                created_by_type="platform_admin",
+                created_by_id="platform-admin",
+                now=self.now + timedelta(days=2),
+            )
+        )
+        refunded = asyncio.run(self.store.get_organization("NCSSAR"))
+        self.assertEqual("funded", refunded.lifecycle_state)
+        self.assertEqual(Decimal("5.0000"), refunded.credit_balance)
+        self.assertIsNone(refunded.trial_ends_at)
+
+    def test_prefunded_live_account_does_not_start_trial_on_activation(self):
+        organization = self.create_organization(
+            designator="FUNDEDSAR",
+            admin_email="admin@fundedsar.example",
+            simulation=False,
+        )
+        asyncio.run(
+            self.store.append_ledger_entry(
+                organization_id=organization.id,
+                entry_type="credit",
+                amount=Decimal("25.00"),
+                description="Prepaid account credit",
+                idempotency_key="credit-fundedsar-1",
+                created_by_type="platform_admin",
+                created_by_id="platform-admin",
+                now=self.now,
+            )
+        )
+        asyncio.run(
+            self.store.mark_organization_invitation_sent(
+                organization_id=organization.id,
+                actor_id="platform-admin",
+                now=self.now,
+            )
+        )
+        invitation = asyncio.run(
+            self.store.get_invitation("FUNDEDSAR", "admin@fundedsar.example")
+        )
+        asyncio.run(
+            self.store.activate_owner(
+                "FUNDEDSAR",
+                "admin@fundedsar.example",
+                "generated complex password",
+                now=self.now + timedelta(hours=1),
+                activation_nonce=invitation.activation_nonce,
+            )
+        )
+
+        activated = asyncio.run(self.store.get_organization("FUNDEDSAR"))
+        self.assertEqual("funded", activated.lifecycle_state)
+        self.assertEqual(Decimal("25.0000"), activated.credit_balance)
+        self.assertIsNone(activated.trial_ends_at)
 
     def test_daily_usage_contains_aggregates_only(self):
         organization = self.create_organization()

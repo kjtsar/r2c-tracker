@@ -47,5 +47,5 @@ pilot_gcloud secrets add-iam-policy-binding "${SMTP_SECRET}" \
   --role=roles/secretmanager.secretAccessor >/dev/null
 
 echo "Pilot SMTP secret is ready."
-echo "Qualify email in simulation mode before changing CONTROL_PLANE_MODE to live:"
-echo "PLATFORM_EMAIL_SMTP_HOST='${SMTP_HOST}' PLATFORM_EMAIL_SMTP_USER='${SMTP_USER}' PLATFORM_EMAIL_FROM='${FROM_ADDRESS}' PLATFORM_EMAIL_SMTP_PASSWORD_SECRET_NAME='${SMTP_SECRET}' ./deploy_pilot.sh APP_VERSION_CODE"
+echo "Deploy live provisioning with:"
+echo "PLATFORM_EMAIL_SMTP_HOST='${SMTP_HOST}' PLATFORM_EMAIL_SMTP_USER='${SMTP_USER}' PLATFORM_EMAIL_FROM='${FROM_ADDRESS}' PLATFORM_EMAIL_SMTP_PASSWORD_SECRET_NAME='${SMTP_SECRET}' CONTROL_PLANE_MODE=live ./deploy_pilot.sh APP_VERSION_CODE"

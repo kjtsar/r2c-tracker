@@ -10,7 +10,10 @@ The pilot environment is isolated from `tracker.kjt.us`.
 - Cloud Run service: `r2c-tracker-pilot`
 - runtime service account:
   `r2c-tracker-runtime@r2c-tracker-pilot.iam.gserviceaccount.com`
-- Cloud SQL instance: `r2c-tracker-pilot:us-west1:r2c-pilot-pg`
+- PostgreSQL host: isolated databases on the existing free-tier `e2-micro` in
+  `shaped-splicer-482602-v1`
+- network path: Cloud Run Direct VPC egress through the dedicated
+  `r2c-pilot-vpc` subnet, peered with the database VM's VPC
 - Cloud Storage bucket: `r2c-tracker-pilot-flightlogs`
 
 The project has a monthly USD 25 budget alert. A budget sends notifications; it
@@ -18,10 +21,12 @@ does not stop resources or cap spending.
 
 ## Provisioned data resources
 
-The pilot database is PostgreSQL 17 Enterprise on the shared-core
-`db-f1-micro` tier. It is zonal, has 10 GB SSD storage, seven retained daily
-backups, and deletion protection. This is a test configuration without a Cloud
-SQL SLA, not the eventual production sizing.
+The pilot uses separate empty `r2c_pilot_tracker` and
+`r2c_pilot_control_plane` databases and a dedicated least-privilege role on the
+existing PostgreSQL VM. The production databases used by `tracker.kjt.us` are
+not shared with the pilot. Cloud Run reaches the VM's private address through
+Direct VPC egress and bidirectional VPC peering. The isolated pilot proxy is
+reachable only from `172.20.0.0/26` on TCP 5433.
 
 Flight logs are stored in the private, uniform-access
 `r2c-tracker-pilot-flightlogs` bucket. Cloud Run mounts that bucket at
@@ -57,15 +62,12 @@ Run:
 
 The script creates or updates a named `gcloud` configuration called
 `r2c-tracker-pilot`. It does not replace the default configuration used for the
-legacy tracker. It verifies the pilot database and bucket and writes generated
+legacy tracker. It verifies the pilot database VM and bucket and writes generated
 runtime values to the ignored, mode-0600 file `.env.pilot.local`.
 
-For local access to the Cloud SQL database, install the Cloud SQL Auth Proxy and
-run:
-
-```bash
-cloud-sql-proxy --port 5433 r2c-tracker-pilot:us-west1:r2c-pilot-pg
-```
+Local development intentionally uses separate SQLite tracker and control-plane
+files. The VM PostgreSQL port is private to the deployed pilot network and is
+not exposed for workstation access.
 
 In another shell, load the private environment and start the tracker:
 
@@ -92,9 +94,10 @@ Then run:
 ./deploy_pilot.sh R2C_RECOMMENDED_APP_VERSION_CODE
 ```
 
-The wrapper pins the project, region, service, database, bucket, service
-account, and Secret Manager names. It refuses to deploy if the project or
-service name is changed away from the pilot identifiers.
+The wrapper pins the project, region, service, dedicated VPC network and subnet,
+bucket, service account, and Secret Manager names. It explicitly clears any
+Cloud SQL attachment and refuses to deploy if the project or service name is
+changed away from the pilot identifiers.
 
 The pilot also defaults to the FAA staging API and token endpoints used by the
 currently qualified RID2Caltopo configuration. Production FAA endpoints remain
