@@ -162,27 +162,45 @@ FLIGHTLOGS_VOLUME_NAME="${FLIGHTLOGS_VOLUME_NAME:-flightlogs}"
 CLOUD_RUN_MEMORY="${CLOUD_RUN_MEMORY:-}"
 ALLOW_UNAUTHENTICATED="${ALLOW_UNAUTHENTICATED:-0}"
 TRACKER_VERSION="${TRACKER_VERSION:-$(git describe --tags --always 2>/dev/null || echo unknown)}"
-TRACKER_RECENT_VERSIONS="${TRACKER_RECENT_VERSIONS:-$(python3 - <<'PY'
+if [ -z "${TRACKER_RECENT_VERSIONS:-}" ]; then
+TRACKER_RECENT_VERSIONS="$(python3 - <<'PY'
 import json
 import subprocess
+from pathlib import Path
 
 def run(cmd):
     return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout.strip()
 
 try:
+    documented = {}
+    active_tag = None
+    for raw_line in Path("changes.txt").read_text().splitlines():
+        clean_line = raw_line.strip()
+        if clean_line.startswith("v") and clean_line.endswith(": deployed"):
+            active_tag = clean_line.removesuffix(": deployed")
+            documented[active_tag] = []
+            continue
+        if raw_line.startswith("v") and raw_line.rstrip().endswith(":"):
+            active_tag = None
+            continue
+        if active_tag and raw_line.lstrip().startswith("*"):
+            documented[active_tag].append(raw_line.strip())
     tags = run(["git", "tag", "--sort=-creatordate"]).splitlines()
     versions = []
     for tag in [tag.strip() for tag in tags if tag.strip()][:10]:
         versions.append({
             "tag": tag,
             "date": run(["git", "log", "-1", "--date=short", "--format=%ad", tag]),
-            "summary": run(["git", "log", "-1", "--format=%s", tag]),
+            "summary": " ".join(documented.get(tag, [])) or run(
+                ["git", "log", "-1", "--format=%s", tag]
+            ),
         })
     print(json.dumps(versions))
 except Exception:
     print("[]")
 PY
-)}"
+)"
+fi
 GCLOUD_PROJECT="${GCLOUD_PROJECT:-$(gcloud config get-value project 2>/dev/null || true)}"
 GCLOUD_ACCOUNT="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | head -n 1 || true)"
 
