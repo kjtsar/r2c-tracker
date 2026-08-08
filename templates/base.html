@@ -91,6 +91,15 @@
           color: #183153;
           letter-spacing: 0.04em;
       }
+      .caltopo-relationship {
+          max-width: 1000px;
+          margin: 28px auto 8px;
+          padding: 14px 18px;
+          border-top: 1px solid #c8d6e2;
+          color: #53697d;
+          font-size: 0.85rem;
+          line-height: 1.45;
+      }
     </style>
     {% block extra_head %}{% endblock %}
     <link rel="icon" type="image/png" href="/static/app-icon-orange.png" sizes="512x512" />
@@ -118,6 +127,12 @@
 
     {% endblock %}
   </main>
+
+  <aside class="caltopo-relationship" aria-label="CalTopo relationship">
+    RID2Caltopo is an independent project and is not affiliated with or endorsed by CalTopo.
+    It uses the CalTopo Teams API. The RID2Caltopo developer thanks the CalTopo team for its
+    excellent product and support of the Teams API.
+  </aside>
   
 {% if enable_live_refresh | default(True) %}
 <script>

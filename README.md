@@ -162,7 +162,7 @@ documented in [PILOT_SETUP.md](PILOT_SETUP.md).
 - [Google Cloud reproduction/setup guide](/Users/kjt/Projects/r2c-tracker/GCLOUD_SETUP.md)
 
 ## Flight Archive Recovery
-For a managed organization such as `NCSSAR`:
+For a managed organization such as `mySAR`:
 
 1. Sign in through `/<designator>/admin` and open **Manage flight records**.
 2. Download the organization's current full CSV and flight-log archive as a

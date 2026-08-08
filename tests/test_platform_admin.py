@@ -161,7 +161,12 @@ class PlatformAdminSnapshotTest(unittest.TestCase):
         self.assertIn("Design prototype:", rendered)
         self.assertIn("Organization and contact records are also illustrative.", rendered)
         self.assertIn("Tenant privacy boundary:", rendered)
+        self.assertIn("not affiliated with or endorsed by CalTopo", rendered)
+        self.assertIn("support of the Teams API", rendered)
+        self.assertNotIn("NCSSAR", rendered)
         self.assertNotIn("Delete Entire Database", rendered)
+        template_source = (repo / "templates" / "platform_admin.html").read_text()
+        self.assertIn('placeholder="mySAR"', template_source)
 
     def test_template_distinguishes_pending_live_export_from_prototype(self):
         repo = pathlib.Path(__file__).resolve().parents[1]

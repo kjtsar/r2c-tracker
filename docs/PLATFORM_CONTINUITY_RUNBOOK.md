@@ -21,7 +21,7 @@ Never place secret values in this repository or the recovery checklist. Record s
 ## Reconstruction sequence
 
 1. Declare the recovery event, preserve the failed environment, and select a known-good source revision and image digest.
-2. Establish a clean project or isolated recovery environment under an NCSSAR-controlled owner and billing account.
+2. Establish a clean project or isolated recovery environment under a program-operator-controlled owner and billing account.
 3. Recreate least-privilege runtime, deployment, monitoring, and recovery identities; require separate MFA-protected administrators.
 4. Recreate the private database network path. Do not expose PostgreSQL or administrative access broadly to the internet.
 5. Restore the database into isolation, validate schema/integrity and organization counts, and rotate all credentials reachable from the failed environment.

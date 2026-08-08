@@ -1,7 +1,7 @@
 # r2c-tracker Incident Response Runbook
 
-Status: interim pilot procedure, pending NCSSAR Board approval
-Security contact: `kjtsar@kjt.us` (replace with an NCSSAR-controlled address)
+Status: interim pilot procedure, pending program-operator approval
+Security contact: `kjtsar@kjt.us` (replace with a program-operator-controlled address)
 
 This runbook governs suspected compromise, cross-organization access, material service abuse, or loss of trustworthy operational state. Response is best effort; these targets are not a service-level agreement.
 
@@ -50,7 +50,7 @@ For Critical or High events:
 
 ## Evidence and privacy
 
-- Store the incident register in an NCSSAR-controlled location with access limited to responders and the Board liaison.
+- Store the incident register in a program-operator-controlled location with access limited to responders and the governance liaison.
 - Use UTC timestamps and record original log/query references, hashes for exported evidence, and every containment change.
 - Do not collect raw media, precise locations, flight records, passwords, OAuth codes, reset links, API tokens, or full session cookies unless essential. Redact before sharing.
 - Retain security/audit evidence according to the Board-approved records schedule and any legal hold. Do not invent a retention period before that schedule exists.

@@ -2,7 +2,7 @@
 
 ## Scope
 
-This policy covers the r2c-tracker service and its organization control plane. RID2Caltopo Android, Apple, and website findings that affect the hosted service may also be reported here until NCSSAR establishes a program-wide security address.
+This policy covers the r2c-tracker service and its organization control plane. RID2Caltopo Android, Apple, and website findings that affect the hosted service may also be reported here until the program operator establishes a program-wide security address.
 
 The software is a supplemental, best-effort public-safety tool. It is not a certified dispatch, navigation, collision-avoidance, aviation, or life-safety system and must not be the sole source for operational decisions.
 
@@ -32,7 +32,7 @@ Critical examples include cross-organization access, active credential disclosur
 
 ## Disclosure
 
-Please allow time for validation, affected-agency coordination, remediation, and safe deployment before public disclosure. NCSSAR or the current maintainer will coordinate disclosure timing in good faith but cannot promise a fixed embargo or bounty.
+Please allow time for validation, affected-agency coordination, remediation, and safe deployment before public disclosure. The program operator or current maintainer will coordinate disclosure timing in good faith but cannot promise a fixed embargo or bounty.
 
 ## Supported versions
 
@@ -40,4 +40,8 @@ Only the currently deployed pilot revision and current mobile releases are suppo
 
 ## Security ownership transition
 
-This contact and policy are interim. Adoption should replace the personal contact with an NCSSAR-controlled security address, at least two authorized responders, and a Board-approved incident-response and notification process.
+This contact and policy are interim. Adoption should replace the personal contact with a program-operator-controlled security address, at least two authorized responders, and an approved incident-response and notification process.
+
+## CalTopo relationship
+
+RID2Caltopo is an independent project and is not affiliated with or endorsed by CalTopo. It uses the CalTopo Teams API. The RID2Caltopo developer thanks the CalTopo team for its excellent product and support of the Teams API.

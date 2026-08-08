@@ -35,7 +35,7 @@ After successful IAP login:
 3. Plan Cloud NAT or another controlled egress path, then remove the VM public IP.
 4. Evaluate Secure Boot compatibility separately; do not enable it without a rollback plan.
 5. Establish encrypted snapshot/backup separation and perform an isolated restoration test.
-6. Configure alerts and test delivery to two NCSSAR-controlled responders.
+6. Configure alerts and test delivery to two program-operator-controlled responders.
 
 ## Stop condition
 

@@ -1,6 +1,6 @@
 # r2c-tracker Security Monitoring Standard
 
-Status: minimum design; alert delivery is not complete until two NCSSAR-controlled responders are configured and tested
+Status: minimum design; alert delivery is not complete until two program-operator-controlled responders are configured and tested
 
 ## Required detections
 
@@ -25,7 +25,7 @@ Access to security logs is limited to authorized responders and is itself audite
 
 ## Alert operation
 
-- Every Critical/High alert routes to at least two separately held NCSSAR-controlled destinations.
+- Every Critical/High alert routes to at least two separately held program-operator-controlled destinations.
 - Alerts include the relevant runbook, project/service, UTC window, and safe investigation query; never include a secret or raw operational record.
 - Test delivery quarterly and after channel/IAM changes. Record receipt by both responders.
 - Review alert rules monthly during the pilot for blind spots and noise. A noisy alert must be tuned, not silently disabled.
@@ -33,4 +33,4 @@ Access to security logs is limited to authorized responders and is itself audite
 
 ## Current implementation status
 
-As of August 7, 2026, the Google Cloud project has no configured notification channel, alert policy, or custom log-based metric. Application logs already emit several authentication, device mismatch, video lifecycle, and error events, but alert delivery and retention approval remain open. Creating useful notification channels requires Board-designated responder addresses or an NCSSAR-controlled group.
+As of August 7, 2026, the Google Cloud project has no configured notification channel, alert policy, or custom log-based metric. Application logs already emit several authentication, device mismatch, video lifecycle, and error events, but alert delivery and retention approval remain open. Creating useful notification channels requires governance-designated responder addresses or a program-operator-controlled group.

@@ -94,9 +94,9 @@ def build_illustrative_platform_snapshot(
     generated_at = now or datetime.now(tz=UTC)
     organizations = (
         OrganizationBillingSummary(
-            legal_name="North County Search and Rescue",
-            designator="NCSSAR",
-            hostname="r2c-tracker.com/ncssar",
+            legal_name="My Search and Rescue",
+            designator="mySAR",
+            hostname="r2c-tracker.com/mysar",
             primary_admin_name="Site administrator",
             primary_admin_email="admin@example.invalid",
             account_status="trial",

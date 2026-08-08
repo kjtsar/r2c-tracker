@@ -293,7 +293,7 @@ sends:
   "guid": "zone-alpha",
   "mappedId": "1SAR7DJ",
   "trackLabel": "1SAR7DJ",
-  "org": "NCSSAR",
+  "org": "mySAR",
   "model": "Mavic 3",
   "ownerName": "Pilot"
 }

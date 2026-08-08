@@ -1,3 +1,7 @@
+v1.4.23: pending
+* Replaced named-team examples and interim ownership language with neutral mySAR or program-operator wording while preserving the separately directed Board review package.
+* Clarified throughout the public tracker interface that RID2Caltopo is an independent project, is not affiliated with or endorsed by CalTopo, uses the CalTopo Teams API, and appreciates the CalTopo team's product and API support.
+
 v1.4.22: deployed
 * Strengthened managed-access terms to describe RID2Caltopo and R2C Tracker as best-effort, as-is services without express or implied guarantees and to require independent verification of safety-critical information.
 * Fixed restored-organization invitations and Google administrator activation redirects in guarded pilot deployments.
