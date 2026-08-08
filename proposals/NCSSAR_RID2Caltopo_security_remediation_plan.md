@@ -15,13 +15,14 @@ The current service remains a controlled, best-effort pilot. This plan does not 
 | Workstream | Status | Evidence and remaining work |
 |---|---|---|
 | Database-host exposure | Partially remediated | Live controls now include deletion protection, removal of unused HTTP/HTTPS tags, a logged public-RDP deny, and an additive IAP SSH path. PostgreSQL 5433 remains subnet-limited. Public SSH remains temporarily until a brief restart repairs guest key/OS Login handling and proves IAP access; public-IP removal, Secure Boot evaluation, backup/restore evidence, and alerting remain open. |
-| Tenant authorization | Implemented and tested; independent review open | A documented authorization matrix and executable route inventory cover organization/platform routes and state-changing interfaces. The production-Python test gate passes 227 tests, including current cross-tenant and scoped-storage cases. Archive restore now limits upload size, total entries, flight-log count, individual log size, and expanded bytes. Focused independent adversarial review and additional replay/race/resource-exhaustion testing remain required. |
+| Tenant authorization | Implemented and tested; independent review open | A documented authorization matrix and executable route inventory cover organization/platform routes and state-changing interfaces. The production-Python test gate passes 228 tests, including current cross-tenant and scoped-storage cases. The public directory now lists only organizations explicitly marked public; restricted organizations remain available only through their direct sign-in URLs and authenticated access. Archive restore now limits upload size, total entries, flight-log count, individual log size, and expanded bytes. Focused independent adversarial review and additional replay/race/resource-exhaustion testing remain required. |
 | Server and browser-edge assurance | Implemented and live-verified; independent review open | The retired global administrator is disabled by default, missing tracker API credentials fail closed, browser CORS is origin/method/header restricted, production HSTS is enabled, outbound weather requests are bounded, and billing table identifiers are validated. Live verification confirmed HSTS and rejection of an untrusted CORS preflight without an allow-origin header. Independent edge/header review and rate-limit/load testing remain open. |
 | Server software assurance | Implemented; cross-platform expansion open | The container installs an exact dependency lock and the repository now carries an Apache 2.0 license. CI runs the full tests, dependency audit, medium/high static analysis, tracked-source secret-baseline enforcement, and CycloneDX SBOM generation; Dependabot is configured. The latest audit reported no known dependency vulnerabilities. Hash pinning, container/history/license-policy scanning, protected release governance, and Android/Apple/website/bundled-media SBOMs remain open. |
 | Incident response and continuity | Drafted; institutional approval/exercises open | Interim `SECURITY.md`, incident-response, monitoring, platform-continuity, cloud-hardening, authorization, and public-safety review documents now exist. Board approval, NCSSAR-controlled contacts, two tested alert destinations, backup separation, tabletop, and independent reconstruction exercise remain open. |
-| Public-safety acknowledgments | Published and source/test verified; field review open | Android and Apple build 124 source is tagged as 2.0.2, and managed-access acknowledgment tests passed. Both public RID2Caltopo domains render the versioned best-effort/as-is/as-available and independent-verification language. Store-distributed physical-device review, degraded-state exercises, Board training language, and managed-video physical qualification remain open. |
+| Public-safety acknowledgments | Published and source/test verified; field review open | Android and Apple build 125 source is tagged as 2.0.3, and managed-access acknowledgment tests passed. Both public RID2Caltopo domains render the versioned best-effort/as-is/as-available and independent-verification language. Public examples use `mySAR`; the apps, website, and tracker state that RID2Caltopo is independent, is not affiliated with or endorsed by CalTopo, and uses the CalTopo Teams API. Store-distributed physical-device review, degraded-state exercises, Board training language, and managed-video physical qualification remain open. |
+| External product name and API relationship | Disclosure published; direct review open | Public surfaces now disclose independence from CalTopo, use of its Teams API, and appreciation for the CalTopo product and API support. The developer plans to brief CalTopo founder Matt Jacobs and request direct review. Written confirmation of acceptable naming, API use, and any preferred attribution remains open and should be retained with the program records. |
 
-The source changes described in this update are committed and tagged as tracker v1.4.22 and RID2Caltopo 2.0.2 build 124. Cloud Run revision `r2c-tracker-pilot-00089-8gd` served 100 percent of pilot traffic after deployment. The live `/versions` page showed v1.4.22, both public RID2Caltopo domains rendered the versioned acknowledgment, and the tracker remained available during post-deployment verification.
+The source changes described in this update are committed and tagged as tracker v1.4.24 and RID2Caltopo 2.0.3 build 125. Cloud Run revision `r2c-tracker-pilot-00092-m68` served 100 percent of pilot traffic after deployment. The live `/versions` page showed v1.4.24, both public RID2Caltopo domains rendered the versioned acknowledgment and neutral `mySAR` examples, the public tracker directory did not disclose the restricted NCSSAR tenant, and its direct sign-in route remained available. The website publication is checkpointed at commit `de3a473`, Cloudflare Worker version `8c95a50d-9941-4c06-920c-d9837639df52`, and Sites version 16.
 
 ## Accepted organization records model
 
@@ -179,7 +180,7 @@ Priority: after P0 host hardening and P1 tenant-boundary work; not a routine org
 
 ### P2-1 Secure the software supply chain
 
-Status: **Server baseline implemented; full program coverage remains open.** The server gate passed 227 tests, dependency audit, medium/high static analysis, secret-baseline enforcement, and SBOM generation under Python 3.12 on August 8, 2026. The repository now includes the Apache 2.0 license stated for the open-source program.
+Status: **Server baseline implemented; full program coverage remains open.** The server gate passed 228 tests, dependency audit, medium/high static analysis, secret-baseline enforcement, and SBOM generation under Python 3.12 on August 8, 2026. The repository now includes the Apache 2.0 license stated for the open-source program.
 
 1. Replace floating production dependencies with reviewed locked or hash-pinned sets.
 2. Generate SBOMs for the server, Android, Apple, websites, container, and bundled media components.
@@ -207,6 +208,17 @@ Status: **Open.** Source/server tests do not establish physical Android or Apple
 3. Do not advertise production readiness until both the operational and security leads approve the tested scope.
 
 Exit evidence: signed platform-by-platform qualification matrix.
+
+### P2-4 Confirm the CalTopo name and Teams API relationship
+
+Status: **Public disclosure implemented; direct vendor review open.** Public materials describe RID2Caltopo as independent and not affiliated with or endorsed by CalTopo, identify use of the CalTopo Teams API, and thank the CalTopo team for its product and API support.
+
+1. Provide CalTopo founder Matt Jacobs a demonstration of the RID2Caltopo and r2c-tracker ecosystem.
+2. Request written confirmation regarding the RID2Caltopo name, Teams API use, attribution, branding, and any applicable terms or limits.
+3. Preserve the response and any resulting commitments in the Board's program records.
+4. Update public language or product naming promptly if CalTopo requests a reasonable change or counsel identifies a material trademark or contract risk.
+
+Exit evidence: retained written vendor response and Board disposition of any requested changes.
 
 ## Program stop conditions
 
