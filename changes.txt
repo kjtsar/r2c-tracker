@@ -1,4 +1,4 @@
-v1.4.22: pending
+v1.4.22: deployed
 * Strengthened managed-access terms to describe RID2Caltopo and R2C Tracker as best-effort, as-is services without express or implied guarantees and to require independent verification of safety-critical information.
 * Fixed restored-organization invitations and Google administrator activation redirects in guarded pilot deployments.
 * Disabled the retired global administration interface by default and made missing tracker API credentials fail closed.
