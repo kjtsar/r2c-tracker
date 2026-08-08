@@ -4440,7 +4440,10 @@ async def organization_directory(
                 (
                     organization
                     for organization in await control_plane_store.list_organizations()
-                    if organization.lifecycle_state != "archived"
+                    if (
+                        organization.lifecycle_state != "archived"
+                        and organization.records_visibility == "public"
+                    )
                 ),
                 key=lambda organization: (
                     organization.legal_name.casefold(),

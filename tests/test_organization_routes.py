@@ -710,7 +710,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertEqual(1, len(names))
         self.assertTrue(names[0].startswith("2026/07/flightlog_"))
 
-    def test_directory_is_sorted_and_restricted_organizations_require_login(self):
+    def test_directory_lists_only_public_organizations_and_restricted_organizations_require_login(self):
         zulu = asyncio.run(
             self.store.create_organization(
                 legal_name="Zulu County Search and Rescue",
@@ -761,8 +761,9 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn("https://www.rid2caltopo.com/tracker", directory.text)
         self.assertIn('href="/acsar"', directory.text)
         self.assertIn('href="/zcsar"', directory.text)
-        self.assertIn(hidden.legal_name, directory.text)
-        self.assertIn("Sign-in required", directory.text)
+        self.assertNotIn(hidden.legal_name, directory.text)
+        self.assertNotIn('href="/hcsar"', directory.text)
+        self.assertNotIn("Sign-in required", directory.text)
         self.assertLess(
             directory.text.index(alpha.legal_name),
             directory.text.index(zulu.legal_name),

@@ -202,15 +202,17 @@
       <a href="/{{ organization.designator | lower }}">
         <strong>{{ organization.legal_name }}</strong>
         <span>
-          {{ organization.designator }} ·
-          {{ "Public" if organization.records_visibility == "public" else "Sign-in required" }}
+          {{ organization.designator }} · Public
         </span>
       </a>
     </li>
     {% endfor %}
   </ul>
   {% else %}
-  <p class="directory-empty">No organizations are available yet.</p>
+  <p class="directory-empty">
+    No public organizations are listed. Use your organization&apos;s direct sign-in link or
+    <a href="https://rid2caltopo.org/managed-pilot">request access</a>.
+  </p>
   {% endif %}
 </dialog>
 
