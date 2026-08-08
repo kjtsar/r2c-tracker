@@ -63,7 +63,7 @@ ONBOARDING_STEPS = (
     "run tenant health checks",
     "prepare administrator activation",
 )
-MANAGED_ACCESS_TERMS_VERSION = "2026-08-06"
+MANAGED_ACCESS_TERMS_VERSION = "2026-08-07"
 
 # A preflight can under-report when the synthetic TURN probe itself stalls.
 # Keep the exception deliberately narrow: only the smallest field-usable
@@ -1988,11 +1988,11 @@ class ControlPlaneStore:
             raise InvalidOrganizationError("Enter the organization's official name.")
         if not terms_acknowledged:
             raise InvalidOrganizationError(
-                "Acknowledge the managed-service safety terms before requesting access."
+                "Acknowledge the managed-service best-effort safety terms before requesting access."
             )
         if clean_terms_version != MANAGED_ACCESS_TERMS_VERSION:
             raise InvalidOrganizationError(
-                "Review and acknowledge the current managed-service safety terms."
+                "Review and acknowledge the current managed-service best-effort safety terms."
             )
         async with self.sessions() as session:
             existing = await session.scalar(

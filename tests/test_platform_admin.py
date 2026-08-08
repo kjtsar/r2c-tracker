@@ -345,6 +345,13 @@ class BigQueryBillingSnapshotProviderTest(unittest.TestCase):
             provider._billing_table_id(),
         )
 
+    def test_invalid_billing_table_identifier_is_ignored(self):
+        client = FakeBigQueryClient(
+            table_ids=("gcp_billing_export_v1_valid`; SELECT 1; --",),
+        )
+
+        self.assertIsNone(self.provider(client)._billing_table_id())
+
 
 class PlatformAdminAuthenticationTest(unittest.TestCase):
     def setUp(self):

@@ -1730,13 +1730,18 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             activation_page = self.client.get(activation_path)
             self.assertIn("Continue with Google", activation_page.text)
             self.assertIn('name="password"', activation_page.text)
-            self.client.post(
+            google_start = self.client.post(
                 "/ncssar/activate/google",
                 data={
                     "form_token": self.form_token(activation_page),
                     "token": parse_qs(urlparse(activation_url).query)["token"][0],
                 },
                 follow_redirects=False,
+            )
+            self.assertEqual(303, google_start.status_code)
+            self.assertIn(
+                "form-action 'self' https://accounts.google.com",
+                google_start.headers["content-security-policy"],
             )
             callback = self.client.get(
                 "/google/callback"

@@ -80,6 +80,7 @@ class PlatformBillingSnapshot:
 
 PROJECT_ID_RE = re.compile(r"^[a-z][a-z0-9-]{4,61}[a-z0-9]$")
 DATASET_ID_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,1023}$")
+TABLE_ID_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,1023}$")
 BILLING_TABLE_PREFIXES = (
     "gcp_billing_export_resource_v1_",
     "gcp_billing_export_v1_",
@@ -350,7 +351,7 @@ class BigQueryBillingSnapshotProvider:
             candidates = sorted(
                 table_name
                 for table_name in table_names
-                if table_name.startswith(prefix)
+                if table_name.startswith(prefix) and TABLE_ID_RE.fullmatch(table_name)
             )
             if candidates:
                 return candidates[0]
@@ -360,6 +361,9 @@ class BigQueryBillingSnapshotProvider:
         projects = ", ".join(
             f"'{project_id}'" for project_id in self.included_project_ids
         )
+        # BigQuery does not parameterize identifiers. Every interpolated value
+        # is constrained by PROJECT_ID_RE, DATASET_ID_RE, or TABLE_ID_RE before
+        # this query is assembled.
         return f"""
 WITH scoped_costs AS (
   SELECT
@@ -399,7 +403,7 @@ SELECT
       r'(compute|cloud run|cloud functions|app engine)'
     ) THEN net_cost ELSE 0 END) AS compute_cost
 FROM net_costs
-""".strip()
+""".strip()  # nosec B608
 
     def load_snapshot(
         self,

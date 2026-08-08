@@ -129,7 +129,10 @@ class DeployScriptTest(unittest.TestCase):
         self.assertIn('CONTROL_PLANE_MODE}" != "live"', script)
         self.assertIn("The production pilot must keep organization provisioning in live mode.", script)
         self.assertIn('PLATFORM_EMAIL_SMTP_HOST="${PLATFORM_EMAIL_SMTP_HOST:-}"', script)
-        self.assertIn("r2c-platform-email-gmail-refresh-token", script)
+        self.assertIn(
+            'PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_SECRET_NAME="${PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_SECRET_NAME:-r2c-platform-email-gmail-refresh-token}"',
+            script,
+        )
         self.assertIn("stun:stun.cloudflare.com:3478", script)
         self.assertIn("r2c-cloudflare-turn-key-id", script)
         self.assertIn("r2c-cloudflare-turn-api-token", script)

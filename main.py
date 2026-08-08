@@ -93,10 +93,13 @@ DB_USER = os.environ.get("DB_USER", "undefined")
 DB_PASS = os.environ.get("DB_PASS", "undefined")
 DB_NAME = os.environ.get("DB_NAME", "undefined")
 API_KEY_NAME = "X-SAR-Token"
-TRACKER_API_KEY = os.environ.get("TRACKER_API_KEY", "replace-with-token")
+TRACKER_API_KEY = os.environ.get("TRACKER_API_KEY", "").strip()
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 TRACKER_ADMIN_USER = os.environ.get("TRACKER_ADMIN_USER", "admin")
-TRACKER_ADMIN_PASS = os.environ.get("TRACKER_ADMIN_PASS", "replace-with-password")
+TRACKER_ADMIN_PASS = os.environ.get("TRACKER_ADMIN_PASS", "")
+LEGACY_ADMIN_ENABLED = os.environ.get(
+    "LEGACY_ADMIN_ENABLED", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
 PLATFORM_BILLING_SOURCE = os.environ.get(
     "PLATFORM_BILLING_SOURCE", "illustrative"
 ).strip().lower()
@@ -129,6 +132,14 @@ MANAGED_REQUEST_INGEST_KEY = os.environ.get(
 CONTROL_PLANE_PUBLIC_URL = os.environ.get(
     "CONTROL_PLANE_PUBLIC_URL", "https://r2c-tracker.com"
 ).strip()
+CORS_ALLOWED_ORIGINS = tuple(
+    origin.strip().rstrip("/")
+    for origin in os.environ.get(
+        "CORS_ALLOWED_ORIGINS",
+        CONTROL_PLANE_PUBLIC_URL,
+    ).split(",")
+    if origin.strip()
+)
 SESSION_COOKIE_HTTPS_ONLY = (
     os.environ.get("SESSION_COOKIE_HTTPS_ONLY", "false").strip().lower()
     in {"1", "true", "yes", "on"}
@@ -158,6 +169,66 @@ CLOUDFLARE_TURN_API_TOKEN = os.environ.get(
 CLOUDFLARE_TURN_CREDENTIAL_TTL_SECONDS = int(
     os.environ.get("CLOUDFLARE_TURN_CREDENTIAL_TTL_SECONDS", "3600")
 )
+MAX_ARCHIVE_UPLOAD_BYTES = int(
+    os.environ.get("MAX_ARCHIVE_UPLOAD_BYTES", str(100 * 1024 * 1024))
+)
+MAX_ARCHIVE_MEMBERS = int(os.environ.get("MAX_ARCHIVE_MEMBERS", "10000"))
+MAX_FLIGHT_LOG_MEMBERS = int(os.environ.get("MAX_FLIGHT_LOG_MEMBERS", "5000"))
+MAX_FLIGHT_LOG_BYTES = int(
+    os.environ.get("MAX_FLIGHT_LOG_BYTES", str(16 * 1024 * 1024))
+)
+MAX_ARCHIVE_EXPANDED_BYTES = int(
+    os.environ.get("MAX_ARCHIVE_EXPANDED_BYTES", str(512 * 1024 * 1024))
+)
+
+
+async def read_upload_with_limit(
+    upload: UploadFile,
+    max_bytes: int = MAX_ARCHIVE_UPLOAD_BYTES,
+) -> bytes:
+    """Read an upload without allowing an unbounded in-memory allocation."""
+    chunks = []
+    total = 0
+    while True:
+        chunk = await upload.read(min(1024 * 1024, max_bytes - total + 1))
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError(
+                f"Archive exceeds the {max_bytes // (1024 * 1024)} MiB upload limit."
+            )
+        chunks.append(chunk)
+
+
+def reviewed_flight_archive_members(tar: tarfile.TarFile) -> list[tarfile.TarInfo]:
+    """Select bounded JSON flight logs and reject archive resource exhaustion."""
+    selected = []
+    expanded_bytes = 0
+    for member_count, member in enumerate(tar, start=1):
+        if member_count > MAX_ARCHIVE_MEMBERS:
+            raise ValueError(
+                f"Archive contains more than {MAX_ARCHIVE_MEMBERS} entries."
+            )
+        if not (
+            member.isfile()
+            and member.name.endswith(".json")
+            and "flightlog_" in os.path.basename(member.name)
+        ):
+            continue
+        if member.size < 0 or member.size > MAX_FLIGHT_LOG_BYTES:
+            raise ValueError(
+                f"{member.name} exceeds the per-flight-log size limit."
+            )
+        selected.append(member)
+        if len(selected) > MAX_FLIGHT_LOG_MEMBERS:
+            raise ValueError(
+                f"Archive contains more than {MAX_FLIGHT_LOG_MEMBERS} flight logs."
+            )
+        expanded_bytes += member.size
+        if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES:
+            raise ValueError("Archive expands beyond the permitted flight-log limit.")
+    return sorted(selected, key=lambda member: member.name)
 
 
 class DeviceEnrollmentRedeemRequest(BaseModel):
@@ -764,6 +835,10 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 @app.middleware("http")
 async def protect_control_plane_pages(request: Request, call_next):
     response = await call_next(request)
+    if SESSION_COOKIE_HTTPS_ONLY:
+        response.headers["Strict-Transport-Security"] = (
+            "max-age=31536000; includeSubDomains"
+        )
     path = request.url.path
     if path.startswith("/static/") and path.endswith(".js"):
         response.headers["Cache-Control"] = "no-cache, max-age=0"
@@ -792,7 +867,7 @@ async def protect_control_plane_pages(request: Request, call_next):
             "default-src 'self'; "
             "style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data:; "
-            "form-action 'self'; "
+            "form-action 'self' https://accounts.google.com; "
             "frame-ancestors 'none'; "
             "base-uri 'none'"
         )
@@ -3086,9 +3161,10 @@ r2c_hub = R2CCoordinationHub()
 # This allows your drone app to send PUT requests without being blocked
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=list(CORS_ALLOWED_ORIGINS),
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", API_KEY_NAME],
 )
 
 templates = Jinja2Templates(directory="templates")
@@ -3118,6 +3194,16 @@ def clear_organization_session(request: Request) -> None:
 
 
 def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
+    if not LEGACY_ADMIN_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="The global administration interface has been retired.",
+        )
+    if not TRACKER_ADMIN_PASS:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Legacy administration is not configured.",
+        )
     if credentials is None:
         return False
     if (not secrets.compare_digest(credentials.username, TRACKER_ADMIN_USER)
@@ -3272,7 +3358,7 @@ async def organization_page_identity(
 
 
 def opt_check_admin(credentials: HTTPBasicCredentials = Depends(security)):
-    if credentials is None:
+    if credentials is None or not LEGACY_ADMIN_ENABLED or not TRACKER_ADMIN_PASS:
         return False
     admin_user = secrets.compare_digest(credentials.username, TRACKER_ADMIN_USER)
     admin_pass = secrets.compare_digest(credentials.password, TRACKER_ADMIN_PASS)
@@ -3390,8 +3476,9 @@ def get_weather(ts_sec, lat, lon):
     d_str = utc_dt.strftime("%Y-%m-%d")
     dt_str = utc_dt.strftime("%Y-%m-%dT%H:%M")
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&start_date={d_str}&end_date={d_str}&start_hour={dt_str}&end_hour={dt_str}&hourly=temperature_2m,relative_humidity_2m,dew_point_2m,precipitation,wind_speed_10m,wind_gusts_10m,cloud_cover&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch"
+    res = None
     try:
-        res = requests.get(url).json()
+        res = requests.get(url, timeout=(3.05, 10)).json()
         if not res or not 'hourly' in res:
             raise ValueError("open-meteo.com() missing expected response.")
         hourly = res['hourly']
@@ -3501,7 +3588,7 @@ async def authenticate_tracker_session(
     token: Optional[str],
 ) -> tuple[bool, Optional[DeviceCredentialRecord]]:
     normalized = _normalize_tracker_token(token)
-    if normalized == _normalize_tracker_token(TRACKER_API_KEY):
+    if TRACKER_API_KEY and normalized == _normalize_tracker_token(TRACKER_API_KEY):
         return True, None
     if control_plane_store is None or not normalized.startswith("r2c_dev_"):
         return False, None
@@ -6802,17 +6889,9 @@ async def organization_import_flight_archive(
     written_paths = []
     skipped_files = []
     try:
-        archive_bytes = io.BytesIO(await file.read())
+        archive_bytes = io.BytesIO(await read_upload_with_limit(file))
         with tarfile.open(fileobj=archive_bytes, mode="r:*") as tar:
-            members = sorted(
-                (
-                    member for member in tar.getmembers()
-                    if member.isfile()
-                    and member.name.endswith(".json")
-                    and "flightlog_" in os.path.basename(member.name)
-                ),
-                key=lambda member: member.name,
-            )
+            members = reviewed_flight_archive_members(tar)
             for member in members:
                 extracted = tar.extractfile(member)
                 if extracted is None:
@@ -8118,14 +8197,10 @@ async def import_flight_archive(
             flash(request, "Archive import requires an empty flights table to avoid duplicates.", "warning")
             return RedirectResponse(url=admin_url(start_date, end_date), status_code=status.HTTP_303_SEE_OTHER)
 
-        content = await file.read()
+        content = await read_upload_with_limit(file)
         archive_bytes = io.BytesIO(content)
         with tarfile.open(fileobj=archive_bytes, mode="r:*") as tar:
-            members = [
-                member for member in tar.getmembers()
-                if member.isfile() and member.name.endswith(".json") and "flightlog_" in os.path.basename(member.name)
-            ]
-            members.sort(key=lambda member: member.name)
+            members = reviewed_flight_archive_members(tar)
 
             for member in members:
                 extracted = tar.extractfile(member)

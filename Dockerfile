@@ -9,9 +9,11 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
     
-# Install dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install the reviewed dependency resolution used by the pilot image. Keep
+# requirements.txt as the human-maintained input and regenerate the lock
+# deliberately so an unrelated deployment cannot float package versions.
+COPY requirements.txt requirements.lock ./
+RUN pip install --no-cache-dir -r requirements.lock
 
 
 # Copy the application code

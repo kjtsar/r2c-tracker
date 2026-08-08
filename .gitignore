@@ -7,6 +7,7 @@ test.db
 .env.*.local
 test
 trackerLog.txt
+security-artifacts/
 
 # Local editor lock and backup files
 *~

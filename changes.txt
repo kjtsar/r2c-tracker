@@ -1,3 +1,11 @@
+v1.4.22: pending
+* Strengthened managed-access terms to describe RID2Caltopo and R2C Tracker as best-effort, as-is services without express or implied guarantees and to require independent verification of safety-critical information.
+* Fixed restored-organization invitations and Google administrator activation redirects in guarded pilot deployments.
+* Disabled the retired global administration interface by default and made missing tracker API credentials fail closed.
+* Restricted browser cross-origin access, enabled production HSTS, bounded archive restore uploads and expansion, added outbound request timeouts, and validated billing-export table identifiers.
+* Locked the reviewed server dependency set and added authorization-inventory tests, dependency and static analysis, secret scanning, an SBOM, Dependabot, security policy, and incident, monitoring, continuity, cloud-hardening, and public-safety runbooks.
+* Added the Apache 2.0 license and updated the Board technical security review and prioritized remediation package.
+
 v1.4.21: deployed
 * Required managed-access applicants to acknowledge versioned safety terms explaining that RID2Caltopo and R2C Tracker are supplemental tools, may be unavailable or incomplete, and are not the sole source for safety-critical or incident-command decisions.
 * Added automated seven-day, one-day, and expiration notices for trial and grace deadlines with organization-scoped CSV and flight-log archive instructions; deadline passage does not automatically archive or shut down a site.

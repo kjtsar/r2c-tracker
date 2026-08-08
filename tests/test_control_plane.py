@@ -412,6 +412,7 @@ class ControlPlaneStoreTest(unittest.TestCase):
         self.assertEqual("organization.unarchived", audit_events[0].event_type)
 
     def test_managed_access_requests_are_deduplicated_and_retain_phone(self):
+        self.assertEqual("2026-08-07", MANAGED_ACCESS_TERMS_VERSION)
         values = {
             "requester_name": "Jamie Responder",
             "requester_email": "jamie@example.org",
@@ -431,6 +432,19 @@ class ControlPlaneStoreTest(unittest.TestCase):
         self.assertEqual("+1 530 555 0100", requests[0].requester_phone)
         self.assertEqual(MANAGED_ACCESS_TERMS_VERSION, requests[0].terms_version)
         self.assertEqual(self.now, requests[0].terms_acknowledged_at)
+
+        with self.assertRaisesRegex(
+            InvalidOrganizationError,
+            "best-effort safety terms",
+        ):
+            asyncio.run(
+                self.store.create_managed_access_request(
+                    **{
+                        **values,
+                        "terms_version": "2026-08-06",
+                    }
+                )
+            )
 
     def test_replacement_administrator_activation_does_not_restart_trial(self):
         organization = self.create_organization(simulation=False)

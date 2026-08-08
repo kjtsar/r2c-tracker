@@ -1,5 +1,6 @@
 import pathlib
 import unittest
+from datetime import datetime
 from typing import Optional
 
 
@@ -10,6 +11,7 @@ def load_admin_batch_parser():
     end = source.index("\n\nTF = TimezoneFinder()")
     snippet = source[start:end]
     namespace = {
+        "datetime": datetime,
         "Optional": Optional,
     }
     exec(snippet, namespace)
