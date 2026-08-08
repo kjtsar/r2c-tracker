@@ -1,4 +1,4 @@
-v1.4.23: pending
+v1.4.23: deployed
 * Replaced named-team examples and interim ownership language with neutral mySAR or program-operator wording while preserving the separately directed Board review package.
 * Clarified throughout the public tracker interface that RID2Caltopo is an independent project, is not affiliated with or endorsed by CalTopo, uses the CalTopo Teams API, and appreciates the CalTopo team's product and API support.
 
