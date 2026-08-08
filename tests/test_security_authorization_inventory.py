@@ -186,6 +186,12 @@ class SecurityAuthorizationInventoryTest(unittest.TestCase):
         self.assertIn("sqlalchemy==", lock)
         self.assertIn("stripe==", lock)
 
+    def test_security_gate_accepts_python_from_path(self):
+        root = pathlib.Path(__file__).resolve().parents[1]
+        security_gate = (root / "scripts" / "security_checks.sh").read_text()
+        self.assertIn('command -v "${PYTHON}"', security_gate)
+        self.assertIn('PYTHON="${PYTHON_PATH}"', security_gate)
+
     def test_unconfigured_legacy_tracker_token_fails_closed(self):
         with patch.object(main, "TRACKER_API_KEY", ""):
             authenticated, credential = asyncio.run(

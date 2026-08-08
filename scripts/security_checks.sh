@@ -7,10 +7,12 @@ cd "${ROOT_DIR}"
 PYTHON="${PYTHON:-.venv/bin/python}"
 OUTPUT_DIR="${SECURITY_OUTPUT_DIR:-security-artifacts}"
 
-if [ ! -x "${PYTHON}" ]; then
+PYTHON_PATH="$(command -v "${PYTHON}" 2>/dev/null || true)"
+if [ -z "${PYTHON_PATH}" ] || [ ! -x "${PYTHON_PATH}" ]; then
   echo "Python runtime not found at ${PYTHON}." >&2
   exit 2
 fi
+PYTHON="${PYTHON_PATH}"
 
 for module in pip_audit bandit detect_secrets cyclonedx_py; do
   if ! "${PYTHON}" -c "import ${module}" >/dev/null 2>&1; then
