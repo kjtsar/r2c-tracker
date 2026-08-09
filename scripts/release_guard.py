@@ -130,6 +130,11 @@ def deployment_readiness(base_url: str, gate_key: str, *, storage_probe: bool = 
     return result
 
 
+def is_bootstrap_gate_unavailable(error: RuntimeError) -> bool:
+    message = str(error)
+    return "received 404" in message or "received 503" in message
+
+
 async def websocket_smoke(base_url: str, tracker_key: str) -> None:
     import websockets
 
@@ -212,7 +217,7 @@ def deploy_candidate(app_version_code: int, bootstrap: bool) -> None:
     except RuntimeError as exc:
         if not bootstrap:
             raise
-        if "HTTP 404" not in str(exc) and "HTTP 503" not in str(exc):
+        if not is_bootstrap_gate_unavailable(exc):
             raise
         print("Bootstrap acknowledged: the serving revision does not yet expose the deployment gate.")
     deploy_env = dict(os.environ)
@@ -255,7 +260,7 @@ def promote_candidate(*, bootstrap: bool) -> None:
     except RuntimeError as exc:
         if not bootstrap:
             raise
-        if "HTTP 404" not in str(exc) and "HTTP 503" not in str(exc):
+        if not is_bootstrap_gate_unavailable(exc):
             raise
         print("Bootstrap acknowledged: live activity was manually rechecked before promotion.")
     gcloud(

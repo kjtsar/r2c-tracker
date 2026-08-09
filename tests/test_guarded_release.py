@@ -1,4 +1,5 @@
 import pathlib
+import importlib.util
 import unittest
 
 
@@ -44,6 +45,23 @@ class GuardedReleaseTest(unittest.TestCase):
     def test_local_release_gate_checks_migration_rollback_compatibility(self):
         release_check = (self.root / "release_check.sh").read_text()
         self.assertIn("scripts/check_migration_compatibility.py", release_check)
+
+    def test_bootstrap_recognizes_old_revision_http_status_wording(self):
+        spec = importlib.util.spec_from_file_location(
+            "release_guard",
+            self.root / "scripts" / "release_guard.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertTrue(module.is_bootstrap_gate_unavailable(
+            RuntimeError("Expected HTTP 200 from URL; received 404: body")
+        ))
+        self.assertTrue(module.is_bootstrap_gate_unavailable(
+            RuntimeError("Expected HTTP 200 from URL; received 503: body")
+        ))
+        self.assertFalse(module.is_bootstrap_gate_unavailable(
+            RuntimeError("Deployment blocked by active use")
+        ))
 
 
 if __name__ == "__main__":
