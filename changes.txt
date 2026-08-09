@@ -1,3 +1,7 @@
+v1.4.25: deployed
+* Added a low-cost guarded Cloud Run release path that blocks deployment during active operational use, tests a zero-traffic candidate against cloud databases and public protocols, and separates explicit promotion from rollback.
+* Added liveness/readiness probes, a dedicated protected deployment gate, managed-video and coordination activity checks, and a release check that rejects rollback-incompatible destructive schema migrations.
+
 v1.4.24: deployed
 * Limited the public organization directory to tenants explicitly marked public; restricted organizations remain available only through their direct sign-in URLs and authenticated access.
 

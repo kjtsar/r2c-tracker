@@ -94,6 +94,7 @@ DB_PASS = os.environ.get("DB_PASS", "undefined")
 DB_NAME = os.environ.get("DB_NAME", "undefined")
 API_KEY_NAME = "X-SAR-Token"
 TRACKER_API_KEY = os.environ.get("TRACKER_API_KEY", "").strip()
+DEPLOYMENT_GATE_KEY = os.environ.get("DEPLOYMENT_GATE_KEY", "").strip()
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 TRACKER_ADMIN_USER = os.environ.get("TRACKER_ADMIN_USER", "admin")
 TRACKER_ADMIN_PASS = os.environ.get("TRACKER_ADMIN_PASS", "")
@@ -436,6 +437,9 @@ def resolve_tracker_version() -> str:
 TRACKER_VERSION = resolve_tracker_version()
 
 BASE_LOG_DIRECTORY = '/flightlogs-vol'
+FLIGHTLOGS_STORAGE_REQUIRED = os.environ.get(
+    "FLIGHTLOGS_STORAGE_REQUIRED", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
 faa_notam_proxy = FaaNotamProxy()
 R2C_HEARTBEAT_SEC = int(os.environ.get("R2C_HEARTBEAT_SEC", "15"))
 R2C_LEASE_SEC = int(os.environ.get("R2C_LEASE_SEC", "45"))
@@ -891,6 +895,9 @@ class ConnectionManager:
     async def broadcast(self, message: str):
         for connection in self.active_connections:
             await connection.send_text(message)
+
+    def connection_count(self) -> int:
+        return len(self.active_connections)
         
 manager = ConnectionManager()
 
@@ -927,6 +934,10 @@ class OrganizationStreamEventHub:
                 failed.append(websocket)
         for websocket in failed:
             await self.disconnect(organization_id, websocket)
+
+    async def connection_count(self) -> int:
+        async with self._lock:
+            return sum(len(connections) for connections in self._connections.values())
 
 
 organization_stream_event_hub = OrganizationStreamEventHub()
@@ -3152,6 +3163,10 @@ class R2CCoordinationHub:
                 "last_seen_age_ms": max(now_ms - int(conn.last_seen_ms or 0), 0),
             }
 
+    async def connection_count(self) -> int:
+        async with self._lock:
+            return len(self._connections)
+
 
 r2c_hub = R2CCoordinationHub()
 
@@ -4646,6 +4661,114 @@ async def version_history(request: Request):
             "versions": load_recent_versions(),
         },
     )
+
+
+@app.get("/livez")
+async def liveness(response: Response):
+    """Process-only probe; intentionally does not depend on external services."""
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Robots-Tag"] = "noindex, nofollow"
+    return {"status": "ok", "version": TRACKER_VERSION}
+
+
+@app.get("/readyz")
+async def readiness(response: Response):
+    """Confirm the revision can reach both persistent databases."""
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Robots-Tag"] = "noindex, nofollow"
+    checks = {"tracker_database": False, "control_plane_database": False}
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(select(1))
+        checks["tracker_database"] = True
+        if control_plane_store is None:
+            checks["control_plane_database"] = True
+        else:
+            await control_plane_store.ping()
+            checks["control_plane_database"] = True
+    except Exception:
+        logger.exception("Revision readiness check failed")
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "unavailable", "version": TRACKER_VERSION, "checks": checks}
+    return {"status": "ready", "version": TRACKER_VERSION, "checks": checks}
+
+
+def require_deployment_gate_key(request: Request) -> None:
+    if not DEPLOYMENT_GATE_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Deployment gate is not configured.",
+        )
+    authorization = request.headers.get("authorization", "")
+    prefix = "Bearer "
+    candidate = authorization[len(prefix):] if authorization.startswith(prefix) else ""
+    if not candidate or not secrets.compare_digest(candidate, DEPLOYMENT_GATE_KEY):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+
+def probe_flightlog_storage() -> None:
+    """Perform a bounded write/read/delete check against the mounted archive store."""
+    if not FLIGHTLOGS_STORAGE_REQUIRED:
+        return
+    if not os.path.isdir(BASE_LOG_DIRECTORY):
+        raise RuntimeError("Flight-log storage mount is unavailable.")
+    probe_path = os.path.join(
+        BASE_LOG_DIRECTORY,
+        f".r2c-release-probe-{secrets.token_hex(12)}",
+    )
+    payload = b"r2c-release-probe\n"
+    try:
+        with open(probe_path, "xb") as probe_file:
+            probe_file.write(payload)
+        with open(probe_path, "rb") as probe_file:
+            if probe_file.read() != payload:
+                raise RuntimeError("Flight-log storage probe read did not match its write.")
+    finally:
+        if os.path.exists(probe_path):
+            os.unlink(probe_path)
+
+
+@app.get("/deployment-readiness")
+async def deployment_readiness(
+        request: Request,
+        response: Response,
+        storage_probe: bool = Query(False)):
+    """Fail closed when operational activity makes a revision switch unsafe."""
+    require_deployment_gate_key(request)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Robots-Tag"] = "noindex, nofollow"
+    now = datetime.now(tz=UTC)
+    now_ms = int(now.timestamp() * 1000)
+    recent_zone_cutoff_ms = now_ms - (R2C_HEARTBEAT_SEC * 1000 * 2)
+    async with AsyncSessionLocal() as session:
+        active_zones = await session.scalar(
+            select(func.count(R2CZoneState.id)).where(
+                R2CZoneState.last_seen_ms >= recent_zone_cutoff_ms,
+                func.lower(R2CZoneState.connection_state).not_in(("idle", "disconnected")),
+            )
+        )
+    activity = {
+        "local_coordination_connections": await r2c_hub.connection_count(),
+        "recent_coordination_zones": int(active_zones or 0),
+        "dashboard_connections": manager.connection_count(),
+        "video_dashboard_connections": await organization_stream_event_hub.connection_count(),
+        "active_video_streams": 0,
+        "active_video_requests": 0,
+    }
+    if control_plane_store is not None:
+        activity.update(await control_plane_store.deployment_activity(now=now))
+    if storage_probe:
+        await asyncio.to_thread(probe_flightlog_storage)
+    reasons = [name for name, count in activity.items() if count > 0]
+    return {
+        "status": "idle" if not reasons else "active",
+        "safe_to_deploy": not reasons,
+        "version": TRACKER_VERSION,
+        "checked_at": now.isoformat(),
+        "activity": activity,
+        "storage_probe": "passed" if storage_probe else "not_requested",
+        "reasons": reasons,
+    }
 
 
 @app.get("/platform-admin/login", response_class=HTMLResponse)

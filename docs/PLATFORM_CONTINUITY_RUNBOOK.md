@@ -31,6 +31,18 @@ Never place secret values in this repository or the recovery checklist. Record s
 9. Have organization administrators verify their own records and capabilities. Record missing or stale data without silently reconstructing it.
 10. Close only after the incident commander and Board witness record elapsed time, backup age, unrecovered data, manual steps, and corrective actions.
 
+## Routine guarded releases
+
+Routine pilot releases do not require a second always-on service or an HA database:
+
+1. `./release_check.sh` must pass and the exact source must be committed and tagged.
+2. `./deploy_candidate.sh APP_VERSION_CODE` queries the protected production activity gate and stops when coordination, dashboard, or managed-video activity is present.
+3. The candidate is deployed to a tagged Cloud Run URL with zero production traffic. `./test_candidate.sh` exercises health, both cloud databases, public routes, authorization rejection, and the coordination WebSocket against that URL.
+4. `./promote_candidate.sh` repeats the cloud regression and activity gate, then atomically routes 100 percent to the recorded candidate revision.
+5. `./rollback_release.sh` is the explicit emergency command that returns 100 percent of traffic to the recorded prior revision and verifies that it responds.
+
+Percentage traffic splitting is not approved while coordination and browser connection state remain process-local and Cloud Run is intentionally limited to one instance. Database migrations in a routine release must be backward-compatible with the prior revision; destructive changes require a backup, a separate maintenance plan, and an expand/migrate/contract sequence.
+
 ## Backup separation and validation
 
 - A principal able to destroy the live environment must not be the only principal able to recover backups.

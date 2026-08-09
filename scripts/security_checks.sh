@@ -33,12 +33,14 @@ echo "==> Static security analysis"
 "${PYTHON}" -m bandit -q -ll -r \
   main.py control_plane.py enrollment.py faa_proxy.py \
   platform_admin.py platform_admin_auth.py platform_admin_identity.py \
-  stripe_checkout.py turn_credentials.py
+  stripe_checkout.py turn_credentials.py scripts/release_guard.py
 
 echo "==> Tracked-source secret scan"
-git ls-files -z | xargs -0 "${PYTHON}" -m detect_secrets.pre_commit_hook \
+git ls-files -z -- ':!.secrets.baseline' \
+  | xargs -0 "${PYTHON}" -m detect_secrets.pre_commit_hook \
   --baseline .secrets.baseline
-git ls-files -z | xargs -0 "${PYTHON}" -m detect_secrets scan \
+git ls-files -z -- ':!.secrets.baseline' \
+  | xargs -0 "${PYTHON}" -m detect_secrets scan \
   > "${OUTPUT_DIR}/detect-secrets.json"
 
 echo "==> CycloneDX SBOM"

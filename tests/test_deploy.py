@@ -47,6 +47,7 @@ class DeployScriptTest(unittest.TestCase):
         self.assertIn("DATABASE_URL=${DATABASE_URL_SECRET_NAME}:latest", script)
         self.assertIn("TRACKER_ADMIN_PASS=${TRACKER_ADMIN_PASS_SECRET_NAME}:latest", script)
         self.assertIn("TRACKER_API_KEY=${TRACKER_API_KEY_SECRET_NAME}:latest", script)
+        self.assertIn("DEPLOYMENT_GATE_KEY=${DEPLOYMENT_GATE_KEY_SECRET_NAME}:latest", script)
         self.assertIn(
             "CONTROL_PLANE_DATABASE_URL=${CONTROL_PLANE_DATABASE_URL_SECRET_NAME}:latest",
             script,

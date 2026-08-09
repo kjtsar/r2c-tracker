@@ -191,6 +191,7 @@ class SecurityAuthorizationInventoryTest(unittest.TestCase):
         security_gate = (root / "scripts" / "security_checks.sh").read_text()
         self.assertIn('command -v "${PYTHON}"', security_gate)
         self.assertIn('PYTHON="${PYTHON_PATH}"', security_gate)
+        self.assertIn("':!.secrets.baseline'", security_gate)
 
     def test_unconfigured_legacy_tracker_token_fails_closed(self):
         with patch.object(main, "TRACKER_API_KEY", ""):

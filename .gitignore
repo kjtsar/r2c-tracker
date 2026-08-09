@@ -8,6 +8,7 @@ test.db
 test
 trackerLog.txt
 security-artifacts/
+.release-state/
 
 # Local editor lock and backup files
 *~

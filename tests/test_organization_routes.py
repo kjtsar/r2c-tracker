@@ -1421,7 +1421,13 @@ class OrganizationRouteFlowTest(unittest.TestCase):
 
         self.assertEqual(200, streams_page.status_code)
         self.assertEqual("no-store", streams_page.headers["cache-control"])
-        self.assertLess(streams_page.text.index("10A"), streams_page.text.index("2B"))
+        # Match rendered table cells rather than arbitrary substrings. Random
+        # CSRF/session values can legitimately contain "2B" and made this
+        # ordering assertion intermittent.
+        self.assertLess(
+            streams_page.text.index("<td>10A</td>"),
+            streams_page.text.index("<td>2B</td>"),
+        )
         self.assertIn("Request video", streams_page.text)
         self.assertIn("Android video tablet", streams_page.text)
         self.assertIn("R2C instance", streams_page.text)

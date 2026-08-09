@@ -217,3 +217,29 @@ The release check uses an isolated temporary SQLite database, runs the full
 Python unit suite, starts a local tracker on `127.0.0.1:18080`, verifies `/`,
 `/r2c`, and `/versions`, then performs an authenticated `/ws/r2c` hello smoke
 test. Override `TRACKER_RELEASE_CHECK_PORT` if that port is already in use.
+
+### Guarded pilot deployment
+
+The pilot release path keeps production traffic on the current revision until
+the candidate passes tests against Google Cloud databases, storage mounting,
+HTTP routing, authentication rejection, and the coordination WebSocket.
+
+1. Run `./release_check.sh` and commit/tag the exact source being released.
+2. Run `./deploy_candidate.sh APP_VERSION_CODE`. This refuses to deploy when
+   the live service reports recent coordination, dashboard, or video activity.
+3. Re-run the cloud checks at any time with `./test_candidate.sh`.
+4. Run `./promote_candidate.sh` for an atomic 100-percent traffic switch after
+   another activity check.
+5. If the promoted release is unhealthy, run `./rollback_release.sh` to route
+   100 percent back to the recorded prior revision.
+
+The one-time first deployment of the gate itself requires
+`./deploy_candidate.sh APP_VERSION_CODE --bootstrap` after manually confirming
+the pilot is idle, followed by `./promote_candidate.sh --bootstrap` after a
+second manual idle check. Do not use `--bootstrap` after the serving revision
+exposes `/deployment-readiness`.
+
+Candidate deployments still start against the shared databases, so startup
+migrations must remain backward-compatible with the prior revision. The local
+release gate rejects table/column drops and renames; changes requiring those
+operations need a separately reviewed expand/migrate/contract maintenance plan.

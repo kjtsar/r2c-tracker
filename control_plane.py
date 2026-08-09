@@ -1285,6 +1285,43 @@ class ControlPlaneStore:
     async def dispose(self) -> None:
         await self.engine.dispose()
 
+    async def ping(self) -> None:
+        """Verify that the control-plane database can serve a simple query."""
+        async with self.sessions() as session:
+            await session.execute(select(1))
+
+    async def deployment_activity(
+        self,
+        *,
+        now: Optional[datetime] = None,
+    ) -> dict[str, int]:
+        """Return privacy-minimal counts used by the guarded release workflow."""
+        checked_at = now or utc_now()
+        active_request_states = (
+            "pending",
+            "probing",
+            "awaiting_approval",
+            "approved",
+            "streaming",
+        )
+        async with self.sessions() as session:
+            active_streams = await session.scalar(
+                select(func.count(ActiveVideoStream.id)).where(
+                    ActiveVideoStream.state == "active",
+                    ActiveVideoStream.expires_at >= checked_at,
+                )
+            )
+            active_requests = await session.scalar(
+                select(func.count(VideoStreamRequest.id)).where(
+                    VideoStreamRequest.state.in_(active_request_states),
+                    VideoStreamRequest.expires_at >= checked_at,
+                )
+            )
+        return {
+            "active_video_streams": int(active_streams or 0),
+            "active_video_requests": int(active_requests or 0),
+        }
+
     async def ensure_platform_admin(
         self,
         *,

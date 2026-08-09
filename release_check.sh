@@ -8,6 +8,7 @@ PYTHON="${PYTHON:-.venv/bin/python}"
 HOST="${TRACKER_RELEASE_CHECK_HOST:-127.0.0.1}"
 PORT="${TRACKER_RELEASE_CHECK_PORT:-18080}"
 API_KEY="${TRACKER_API_KEY:-release-check-token}"
+DEPLOYMENT_GATE_KEY="${DEPLOYMENT_GATE_KEY:-release-check-deployment-gate}"
 ADMIN_PASS="${TRACKER_ADMIN_PASS:-release-check-admin-pass}"
 TMP_ROOT="${TMPDIR:-/tmp}"
 TMP_DIR="${TMP_ROOT%/}/r2c-tracker-release-check.$$"
@@ -34,6 +35,7 @@ mkdir -p "${TMP_DIR}"
 
 export DATABASE_URL="sqlite+aiosqlite:///${DB_PATH}"
 export TRACKER_API_KEY="${API_KEY}"
+export DEPLOYMENT_GATE_KEY
 export TRACKER_ADMIN_USER="${TRACKER_ADMIN_USER:-admin}"
 export TRACKER_ADMIN_PASS="${ADMIN_PASS}"
 export SECRET_KEY="${SECRET_KEY:-release-check-secret}"
@@ -45,6 +47,9 @@ echo "==> Python syntax check"
 
 echo "==> Unit tests"
 "${PYTHON}" -m unittest discover -s tests -p "test_*.py"
+
+echo "==> Rollback-compatible database migrations"
+"${PYTHON}" scripts/check_migration_compatibility.py
 
 echo "==> Starting local tracker on http://${HOST}:${PORT}"
 "${PYTHON}" -m uvicorn main:app --host "${HOST}" --port "${PORT}" >"${SERVER_LOG}" 2>&1 &
@@ -74,6 +79,18 @@ echo "==> HTTP smoke tests"
 curl -fsS -o /dev/null "http://${HOST}:${PORT}/"
 curl -fsS -o /dev/null "http://${HOST}:${PORT}/r2c"
 curl -fsS -o /dev/null "http://${HOST}:${PORT}/versions"
+curl -fsS -o /dev/null "http://${HOST}:${PORT}/livez"
+curl -fsS -o /dev/null "http://${HOST}:${PORT}/readyz"
+DEPLOYMENT_UNAUTH_STATUS="$(curl -sS -o /dev/null -w '%{http_code}' \
+  "http://${HOST}:${PORT}/deployment-readiness")"
+if [ "${DEPLOYMENT_UNAUTH_STATUS}" != "403" ]; then
+  echo "Expected unauthenticated deployment readiness to return 403; received ${DEPLOYMENT_UNAUTH_STATUS}." >&2
+  exit 1
+fi
+curl -fsS \
+  -H "Authorization: Bearer ${DEPLOYMENT_GATE_KEY}" \
+  "http://${HOST}:${PORT}/deployment-readiness" \
+  | "${PYTHON}" -c 'import json, sys; data=json.load(sys.stdin); assert data["safe_to_deploy"] is True, data'
 FAA_UNAUTH_STATUS="$(curl -sS -o /dev/null -w '%{http_code}' \
   "http://${HOST}:${PORT}/faa/notams?latitude=39.1&longitude=-121.1&radius=2")"
 if [ "${FAA_UNAUTH_STATUS}" != "403" ]; then

@@ -15,10 +15,11 @@ The current service remains a controlled, best-effort pilot. This plan does not 
 | Workstream | Status | Evidence and remaining work |
 |---|---|---|
 | Database-host exposure | Partially remediated | Live controls now include deletion protection, removal of unused HTTP/HTTPS tags, a logged public-RDP deny, and an additive IAP SSH path. PostgreSQL 5433 remains subnet-limited. Public SSH remains temporarily until a brief restart repairs guest key/OS Login handling and proves IAP access; public-IP removal, Secure Boot evaluation, backup/restore evidence, and alerting remain open. |
-| Tenant authorization | Implemented and tested; independent review open | A documented authorization matrix and executable route inventory cover organization/platform routes and state-changing interfaces. The production-Python test gate passes 228 tests, including current cross-tenant and scoped-storage cases. The public directory now lists only organizations explicitly marked public; restricted organizations remain available only through their direct sign-in URLs and authenticated access. Archive restore now limits upload size, total entries, flight-log count, individual log size, and expanded bytes. Focused independent adversarial review and additional replay/race/resource-exhaustion testing remain required. |
+| Tenant authorization | Implemented and tested; independent review open | A documented authorization matrix and executable route inventory cover organization/platform routes and state-changing interfaces. The production-Python test gate passes 232 tests, including current cross-tenant and scoped-storage cases. The public directory now lists only organizations explicitly marked public; restricted organizations remain available only through their direct sign-in URLs and authenticated access. Archive restore now limits upload size, total entries, flight-log count, individual log size, and expanded bytes. Focused independent adversarial review and additional replay/race/resource-exhaustion testing remain required. |
 | Server and browser-edge assurance | Implemented and live-verified; independent review open | The retired global administrator is disabled by default, missing tracker API credentials fail closed, browser CORS is origin/method/header restricted, production HSTS is enabled, outbound weather requests are bounded, and billing table identifiers are validated. Live verification confirmed HSTS and rejection of an untrusted CORS preflight without an allow-origin header. Independent edge/header review and rate-limit/load testing remain open. |
 | Server software assurance | Implemented; cross-platform expansion open | The container installs an exact dependency lock and the repository now carries an Apache 2.0 license. CI runs the full tests, dependency audit, medium/high static analysis, tracked-source secret-baseline enforcement, and CycloneDX SBOM generation; Dependabot is configured. The latest audit reported no known dependency vulnerabilities. Hash pinning, container/history/license-policy scanning, protected release governance, and Android/Apple/website/bundled-media SBOMs remain open. |
 | Incident response and continuity | Drafted; institutional approval/exercises open | Interim `SECURITY.md`, incident-response, monitoring, platform-continuity, cloud-hardening, authorization, and public-safety review documents now exist. Board approval, NCSSAR-controlled contacts, two tested alert destinations, backup separation, tabletop, and independent reconstruction exercise remain open. |
+| Release continuity | Implemented locally; cloud qualification pending | A protected activity gate, zero-production-traffic candidate URL, cloud-backed HTTP/database/WebSocket regression, atomic promotion, explicit rollback, Cloud Run process probes, and rollback-compatibility migration check are implemented. The first guarded Cloud Run exercise and independent review remain open. HA Cloud SQL and multi-instance traffic splitting are intentionally deferred to avoid material pilot cost and because coordination state remains process-local. |
 | Public-safety acknowledgments | Published and source/test verified; field review open | Android and Apple build 125 source is tagged as 2.0.3, and managed-access acknowledgment tests passed. Both public RID2Caltopo domains render the versioned best-effort/as-is/as-available and independent-verification language. Public examples use `mySAR`; the apps, website, and tracker state that RID2Caltopo is independent, is not affiliated with or endorsed by CalTopo, and uses the CalTopo Teams API. Store-distributed physical-device review, degraded-state exercises, Board training language, and managed-video physical qualification remain open. |
 | External product name and API relationship | Disclosure published; direct review open | Public surfaces now disclose independence from CalTopo, use of its Teams API, and appreciation for the CalTopo product and API support. The developer plans to brief CalTopo founder Matt Jacobs and request direct review. Written confirmation of acceptable naming, API use, and any preferred attribution remains open and should be retained with the program records. |
 
@@ -115,7 +116,7 @@ Complete these items before a second external organization or any paying custome
 
 ### P1-1 Prove tenant boundaries
 
-Status: **Implemented and passing the current automated gate; independent review and remaining adversarial cases are open.** The route matrix and executable inventory are in `docs/SECURITY_AUTHORIZATION_MATRIX.md` and `tests/test_security_authorization_inventory.py`.
+Status: **Implemented and passing the current 232-test automated gate; independent review and remaining adversarial cases are open.** The route matrix and executable inventory are in `docs/SECURITY_AUTHORIZATION_MATRIX.md` and `tests/test_security_authorization_inventory.py`.
 
 Risk addressed: one organization reading, changing, deleting, restoring, or controlling another organization's data or devices.
 
@@ -175,6 +176,27 @@ Exit evidence:
 
 Owner: technical administrator plus Board witness.
 Priority: after P0 host hardening and P1 tenant-boundary work; not a routine organization support task.
+
+### P1-4 Guard routine cloud releases
+
+Status: **Implemented locally; first cloud exercise pending.** The release path now separates candidate deployment, cloud regression, production promotion, and rollback.
+
+Risk addressed: a release that passes local tests but fails against Google Cloud networking, database, storage, routing, secrets, or runtime behavior.
+
+Actions:
+
+1. Block candidate deployment and production promotion while recent coordination, dashboard, or managed-video activity is present.
+2. Deploy the candidate to a tagged Cloud Run URL with zero production traffic and run cloud-backed HTTP, database, authorization, and coordination-WebSocket checks against it.
+3. Promote with an atomic 100-percent traffic switch only after tests and a second activity check pass; retain an explicit command for immediate rollback to the recorded revision.
+4. Keep startup migrations backward-compatible with the prior revision and require a separate expand/migrate/contract maintenance plan for destructive schema work.
+5. Defer HA Cloud SQL and multi-instance traffic splitting until use and funding justify the cost and process-local coordination state has been replaced.
+
+Exit evidence:
+
+- A candidate revision fails without receiving production traffic when a cloud dependency or regression check is unhealthy.
+- An idle release is promoted and the public version is verified; a witnessed exercise successfully rolls traffic back to the recorded prior revision.
+
+Owner: primary developer plus independent release witness.
 
 ## Priority 2 — Software assurance before broad use
 
