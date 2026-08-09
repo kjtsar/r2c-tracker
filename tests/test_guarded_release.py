@@ -41,6 +41,7 @@ class GuardedReleaseTest(unittest.TestCase):
             "rollback_release.sh",
         ):
             self.assertTrue((self.root / name).exists())
+            self.assertIn(".venv/bin/python", (self.root / name).read_text())
 
     def test_local_release_gate_checks_migration_rollback_compatibility(self):
         release_check = (self.root / "release_check.sh").read_text()
