@@ -270,6 +270,39 @@
       </p>
       {% endif %}
       {% if "organization_owner" in organization_user.roles or "billing_admin" in organization_user.roles %}
+      <h3>Month-to-date platform cost</h3>
+      {% if organization_cost %}
+      <p>
+        <strong class="organization-cost-total">${{ "%.2f"|format(organization_cost.total) }}</strong>
+        allocated to {{ organization.designator }} for
+        {{ billing_snapshot.billing_period }}.
+      </p>
+      <div style="overflow-x:auto">
+        <table class="org-table organization-cost-breakdown">
+          <thead>
+            <tr><th>Category</th><th>Allocated cost</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Compute</td><td>${{ "%.2f"|format(organization_cost.compute) }}</td></tr>
+            <tr><td>Network / TURN</td><td>${{ "%.2f"|format(organization_cost.network) }}</td></tr>
+            <tr><td>Storage</td><td>${{ "%.2f"|format(organization_cost.storage) }}</td></tr>
+            <tr><td>Database</td><td>${{ "%.2f"|format(organization_cost.database) }}</td></tr>
+            <tr><td>Shared / unmetered</td><td>${{ "%.2f"|format(organization_cost.other) }}</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Google Cloud billing data through
+        {{ billing_snapshot.billing_data_through.strftime("%d %b %Y %H:%M UTC") }}.
+        This is a shadow allocation for transparency, not a charge, and it does
+        not consume prepaid credit.
+      </p>
+      {% elif billing_snapshot %}
+      <p>
+        Current platform-cost allocation is unavailable.
+        {{ billing_snapshot.source_message }}
+      </p>
+      {% endif %}
       <h3>Add prepaid funding</h3>
       {% if stripe_checkout_enabled %}
       <p>

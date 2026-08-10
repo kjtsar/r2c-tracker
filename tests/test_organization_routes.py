@@ -446,6 +446,29 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn("User: Primary Administrator", admin_page.text)
         self.assertIn('href="/ncssar/admin"', admin_page.text)
         self.assertIn('href="/ncssar/admin/flights"', admin_page.text)
+        billing_snapshot = SimpleNamespace(
+            source_status="ready",
+            source_message="Live billing data.",
+            billing_period="2026-08",
+            billing_data_through=datetime(2026, 8, 10, 12, 0),
+            actual_cost_breakdown_mtd=main.CostBreakdown(
+                compute=Decimal("0.08"),
+                storage=Decimal("0.25"),
+                database=Decimal("1.07"),
+            ),
+        )
+        with patch.object(
+            main,
+            "load_platform_billing_snapshot",
+            return_value=billing_snapshot,
+        ):
+            billing_report = self.client.get("/ncssar/admin")
+        self.assertIn("Month-to-date platform cost", billing_report.text)
+        self.assertIn(">$1.40<", billing_report.text)
+        self.assertIn("<td>Compute</td><td>$0.08</td>", billing_report.text)
+        self.assertIn("<td>Storage</td><td>$0.25</td>", billing_report.text)
+        self.assertIn("<td>Database</td><td>$1.07</td>", billing_report.text)
+        self.assertIn("shadow allocation for transparency", billing_report.text)
         fake_checkout = SimpleNamespace(
             is_configured=True,
             create_checkout=Mock(

@@ -3,6 +3,8 @@ v1.4.26: pending review
 * Enforced server-derived organization scope throughout R2C coordination: websocket groups, zone presence, owner leases, confirmation replay, standalone proximity grouping, recent sightings, persistence queries, cleanup, and public legacy snapshots no longer combine tenants that use the same map or Remote ID.
 * Added an additive database migration that assigns existing coordination rows to the legacy namespace, stores authenticated organization IDs on new rows, and creates composite organization/map lookup indexes.
 * Added regression coverage proving same-map and same-Remote-ID isolation across organizations and verifying migration of existing coordination tables.
+* Added month-to-date shadow platform-cost reporting for organization owners and billing administrators, with category totals, billing-data freshness, and clear non-charge labeling.
+* Ensured tagged candidate and public version pages render the complete pending release notes throughout the guarded publication workflow.
 
 v1.4.25: deployed
 * Added a low-cost guarded Cloud Run release path that blocks deployment during active operational use, tests a zero-traffic candidate against cloud databases and public protocols, and separates explicit promotion from rollback.

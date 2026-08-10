@@ -414,6 +414,44 @@ def load_platform_billing_snapshot():
             source_status="error",
         )
 
+
+def platform_allocation_inputs(records, usage_aggregates):
+    """Build privacy-safe allocation weights for eligible organizations."""
+    return {
+        record.id: AggregateUsage(
+            requests=(
+                usage_aggregates[record.id].faa_proxy_requests
+                if record.id in usage_aggregates else 0
+            ),
+            network_bytes=(
+                usage_aggregates[record.id].network_bytes
+                if record.id in usage_aggregates else 0
+            ),
+            storage_byte_days=(
+                usage_aggregates[record.id].storage_byte_days
+                if record.id in usage_aggregates else 0
+            ),
+            compute_units=(
+                usage_aggregates[record.id].compute_units
+                if record.id in usage_aggregates else Decimal("0")
+            ),
+            database_units=(
+                usage_aggregates[record.id].database_units
+                if record.id in usage_aggregates else Decimal("0")
+            ),
+            turn_relay_bytes=(
+                usage_aggregates[record.id].turn_relay_bytes
+                if record.id in usage_aggregates else 0
+            ),
+        )
+        for record in records
+        if (
+            record.lifecycle_state != "archived"
+            and record.provisioning_state == "ready"
+        )
+    }
+
+
 def resolve_tracker_version() -> str:
     override = os.environ.get("TRACKER_VERSION")
     if override:
@@ -5223,39 +5261,7 @@ async def platform_admin_organizations(
             control_plane_store.list_managed_access_requests(),
             control_plane_store.collected_month_to_date(),
         )
-        allocation_inputs = {
-            record.id: AggregateUsage(
-                requests=(
-                    usage_aggregates[record.id].faa_proxy_requests
-                    if record.id in usage_aggregates else 0
-                ),
-                network_bytes=(
-                    usage_aggregates[record.id].network_bytes
-                    if record.id in usage_aggregates else 0
-                ),
-                storage_byte_days=(
-                    usage_aggregates[record.id].storage_byte_days
-                    if record.id in usage_aggregates else 0
-                ),
-                compute_units=(
-                    usage_aggregates[record.id].compute_units
-                    if record.id in usage_aggregates else Decimal("0")
-                ),
-                database_units=(
-                    usage_aggregates[record.id].database_units
-                    if record.id in usage_aggregates else Decimal("0")
-                ),
-                turn_relay_bytes=(
-                    usage_aggregates[record.id].turn_relay_bytes
-                    if record.id in usage_aggregates else 0
-                ),
-            )
-            for record in records
-            if (
-                record.lifecycle_state != "archived"
-                and record.provisioning_state == "ready"
-            )
-        }
+        allocation_inputs = platform_allocation_inputs(records, usage_aggregates)
         allocated_costs, allocation_unallocated = allocate_platform_costs(
             snapshot.actual_cost_breakdown_mtd,
             allocation_inputs if snapshot.source_status == "ready" else {},
@@ -6303,6 +6309,20 @@ async def organization_admin(request: Request, designator: str):
         control_plane_store.list_enrollment_campaigns(organization.id),
         control_plane_store.list_ledger(organization.id),
     )
+    organization_cost = None
+    billing_snapshot = None
+    if {"organization_owner", "billing_admin"}.intersection(user.roles):
+        billing_snapshot, records, usage_aggregates = await asyncio.gather(
+            asyncio.to_thread(load_platform_billing_snapshot),
+            control_plane_store.list_organizations(),
+            control_plane_store.month_to_date_usage_aggregates(),
+        )
+        allocation_inputs = platform_allocation_inputs(records, usage_aggregates)
+        allocated_costs, _unallocated = allocate_platform_costs(
+            billing_snapshot.actual_cost_breakdown_mtd,
+            allocation_inputs if billing_snapshot.source_status == "ready" else {},
+        )
+        organization_cost = allocated_costs.get(organization.id)
     return templates.TemplateResponse(
         request=request,
         name="organization_admin.html",
@@ -6316,6 +6336,8 @@ async def organization_admin(request: Request, designator: str):
             "organization_users": users,
             "enrollment_campaigns": campaigns,
             "ledger_entries": ledger_entries,
+            "organization_cost": organization_cost,
+            "billing_snapshot": billing_snapshot,
             "csrf_token": csrf_token(request, "organization_admin"),
             "simulation": CONTROL_PLANE_SIMULATION,
             "invitation_url": invitation_url,

@@ -181,8 +181,13 @@ try:
             active_tag = clean_line.removesuffix(": deployed")
             documented[active_tag] = []
             continue
+        if clean_line.startswith("v") and clean_line.endswith(": pending review"):
+            active_tag = clean_line.removesuffix(": pending review")
+            documented[active_tag] = []
+            continue
         if raw_line.startswith("v") and raw_line.rstrip().endswith(":"):
-            active_tag = None
+            active_tag = clean_line.removesuffix(":")
+            documented[active_tag] = []
             continue
         if active_tag and raw_line.lstrip().startswith("*"):
             documented[active_tag].append(raw_line.strip())

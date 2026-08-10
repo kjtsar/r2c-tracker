@@ -88,6 +88,8 @@ class DeployScriptTest(unittest.TestCase):
         self.assertIn("mount-path=/flightlogs-vol", script)
         self.assertIn('--no-traffic', script)
         self.assertIn('--tag "${REVISION_TAG}"', script)
+        self.assertIn('clean_line.endswith(": pending review")', script)
+        self.assertIn('clean_line.removesuffix(": pending review")', script)
 
     def test_container_includes_runtime_modules(self):
         repo = pathlib.Path(__file__).resolve().parents[1]
