@@ -23,8 +23,8 @@ class ReleaseCheckScriptTest(unittest.TestCase):
             / "scripts"
             / "release_guard.py"
         ).read_text()
-        self.assertIn("r2c-release-device-token", guard)
-        self.assertIn("/{designator}/ws/r2c", guard)
+        self.assertNotIn("r2c-release-device-token", guard)
+        self.assertNotIn("websocket_smoke", guard)
         self.assertNotIn("TRACKER_API_KEY", guard)
 
 

@@ -21,21 +21,12 @@ The release owner needs:
 - push and tag permission for this repository;
 - the `r2c-tracker-pilot` Google Cloud configuration and permission to deploy
   the `r2c-tracker-pilot` service in `us-west1`;
-- read access to the deployment-gate secret and the dedicated, organization-
-  scoped release-device token secret used by the regression suite; and
+- read access to the deployment-gate secret; and
 - a working project virtual environment installed from `requirements.lock`.
 
 Use individual Google Cloud identities and repository accounts. Do not share
 credentials or copy Secret Manager values into tickets, chat, shell history, or
 the repository.
-
-The cloud regression defaults to organization designator `RELEASECHECK` and
-Secret Manager secret `r2c-release-device-token`. Provision that organization
-through the normal control plane, enroll a dedicated non-operational test
-device, and add its token to the secret via standard input. Override the names
-only with `R2C_RELEASE_TEST_DESIGNATOR` and
-`R2C_RELEASE_DEVICE_TOKEN_SECRET_NAME`; the credential and URL designator must
-always match.
 
 ## 1. Prepare the release
 
@@ -115,8 +106,9 @@ release preparation.
 activity gate reports operational use, deploys the candidate with zero
 production traffic, and immediately runs cloud regression tests. The tests
 exercise both databases, mounted-storage write/read/delete, public routes,
-authorization rejection, version reporting, and an authenticated R2C
-WebSocket.
+authorization rejection, and version reporting. The local release gate covers
+the authenticated organization-scoped R2C WebSocket without creating synthetic
+records in the hosted control plane.
 
 The command records the candidate and previous production revision in the
 ignored `.release-state/pilot.json`. That file contains no application secret,

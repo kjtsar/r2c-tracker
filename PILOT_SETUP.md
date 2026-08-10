@@ -39,8 +39,6 @@ Generated secrets:
 - `r2c-tracker-database-url`
 - `r2c-tracker-admin-password`
 - `r2c-deployment-gate-key`
-- `r2c-release-device-token` (dedicated credential for the `RELEASECHECK`
-  organization; read by the release workstation, not mounted in Cloud Run)
 - `r2c-tracker-secret-key`
 - `r2c-super-admin-identity` (email and display name only; dynamically read)
 - `r2c-control-plane-database-url`
@@ -88,12 +86,9 @@ set +a
 
 ## Deploy the pilot
 
-Do not deploy until both FAA secrets, `r2c-super-admin-identity`, and the
-dedicated `r2c-release-device-token` have an enabled version. The latter must
-contain an active device credential enrolled to the `RELEASECHECK`
-organization; the release guard uses it only against
-`/releasecheck/ws/r2c`. Configure or rotate the administrator without
-restarting the service:
+Do not deploy until both FAA secrets and `r2c-super-admin-identity` have enabled
+versions. Configure or rotate the administrator without restarting the
+service:
 
 ```bash
 ./set_super_admin.sh kjtsar@kjt.us "R2C Platform Administrator"
@@ -112,10 +107,11 @@ guarded candidate workflow:
 The candidate command refuses a dirty or untagged worktree, blocks while the
 live service reports operational activity, and deploys the new revision with
 zero production traffic. Cloud regression checks both databases, the mounted
-bucket, public routes, authorization rejection, and the R2C WebSocket before
-promotion is allowed. Promotion repeats the checks and activity gate before an
-atomic 100-percent traffic switch. Use `./rollback_release.sh` to restore the
-recorded prior revision.
+bucket, public routes, authorization rejection, and version reporting before
+promotion is allowed; the local gate covers the authenticated organization-
+scoped R2C WebSocket. Promotion repeats the cloud checks and activity gate
+before an atomic 100-percent traffic switch. Use `./rollback_release.sh` to
+restore the recorded prior revision.
 
 The underlying pilot wrapper pins the project, region, service, dedicated VPC
 network and subnet, bucket, service account, and Secret Manager names. It
