@@ -113,6 +113,14 @@ class OrganizationRouteFlowTest(unittest.TestCase):
     def test_scoped_upload_route_is_registered(self):
         paths = {route.path for route in main.app.routes}
         self.assertIn("/{designator}/upload", paths)
+        self.assertIn("/{designator}/ws/r2c", paths)
+        self.assertNotIn("/upload", paths)
+        self.assertNotIn("/ws/r2c", paths)
+        self.assertNotIn("/ws", paths)
+        self.assertNotIn("/r2c", paths)
+        self.assertNotIn("/docs", paths)
+        self.assertNotIn("/redoc", paths)
+        self.assertNotIn("/openapi.json", paths)
 
     def test_scoped_upload_rejects_cross_organization_credential(self):
         credential = DeviceCredentialRecord(
@@ -479,13 +487,6 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertNotIn('href="/flightlogs/list"', page.text)
         self.assertNotIn('href="/export"', page.text)
         self.assertNotIn('href="/docs"', page.text)
-
-        legacy_page = self.client.get("/r2c")
-        self.assertEqual(200, legacy_page.status_code)
-        self.assertNotIn('href="/admin"', legacy_page.text)
-        self.assertNotIn('href="/flightlogs/list"', legacy_page.text)
-        self.assertNotIn('href="/export"', legacy_page.text)
-        self.assertNotIn('href="/docs"', legacy_page.text)
 
         retired_admin = self.client.get("/admin", follow_redirects=False)
         self.assertEqual(303, retired_admin.status_code)
@@ -1491,7 +1492,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertFalse(offer_response.json()["delivered"])
 
         with self.client.websocket_connect(
-            "/ws/r2c",
+            "/ncssar/ws/r2c",
             headers={"X-SAR-Token": device.token},
         ) as replay_websocket:
             replay_websocket.send_json(

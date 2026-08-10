@@ -7,12 +7,13 @@ cd "${ROOT_DIR}"
 PYTHON="${PYTHON:-.venv/bin/python}"
 HOST="${TRACKER_RELEASE_CHECK_HOST:-127.0.0.1}"
 PORT="${TRACKER_RELEASE_CHECK_PORT:-18080}"
-API_KEY="${TRACKER_API_KEY:-release-check-token}"
+RELEASE_CHECK_DESIGNATOR="${R2C_RELEASE_TEST_DESIGNATOR:-releasecheck}"
 DEPLOYMENT_GATE_KEY="${DEPLOYMENT_GATE_KEY:-release-check-deployment-gate}"
 ADMIN_PASS="${TRACKER_ADMIN_PASS:-release-check-admin-pass}"
 TMP_ROOT="${TMPDIR:-/tmp}"
 TMP_DIR="${TMP_ROOT%/}/r2c-tracker-release-check.$$"
 DB_PATH="${TMP_DIR}/test.db"
+CONTROL_PLANE_DB_PATH="${TMP_DIR}/control-plane.db"
 SERVER_LOG="${TMP_DIR}/uvicorn.log"
 SERVER_PID=""
 
@@ -34,7 +35,6 @@ fi
 mkdir -p "${TMP_DIR}"
 
 export DATABASE_URL="sqlite+aiosqlite:///${DB_PATH}"
-export TRACKER_API_KEY="${API_KEY}"
 export DEPLOYMENT_GATE_KEY
 export TRACKER_ADMIN_USER="${TRACKER_ADMIN_USER:-admin}"
 export TRACKER_ADMIN_PASS="${ADMIN_PASS}"
@@ -43,13 +43,19 @@ export TRACKER_PORT="${PORT}"
 export PORT="${PORT}"
 
 echo "==> Python syntax check"
-"${PYTHON}" -m py_compile main.py faa_proxy.py platform_admin_identity.py platform_admin_auth.py
+"${PYTHON}" -m py_compile main.py faa_proxy.py platform_admin_identity.py \
+  platform_admin_auth.py scripts/create_release_check_credential.py \
+  scripts/release_guard.py
 
 echo "==> Unit tests"
 "${PYTHON}" -m unittest discover -s tests -p "test_*.py"
 
 echo "==> Rollback-compatible database migrations"
 "${PYTHON}" scripts/check_migration_compatibility.py
+
+export CONTROL_PLANE_DATABASE_URL="sqlite+aiosqlite:///${CONTROL_PLANE_DB_PATH}"
+API_KEY="$("${PYTHON}" scripts/create_release_check_credential.py \
+  "${CONTROL_PLANE_DATABASE_URL}" "${RELEASE_CHECK_DESIGNATOR}")"
 
 echo "==> Starting local tracker on http://${HOST}:${PORT}"
 "${PYTHON}" -m uvicorn main:app --host "${HOST}" --port "${PORT}" >"${SERVER_LOG}" 2>&1 &
@@ -77,7 +83,6 @@ fi
 
 echo "==> HTTP smoke tests"
 curl -fsS -o /dev/null "http://${HOST}:${PORT}/"
-curl -fsS -o /dev/null "http://${HOST}:${PORT}/r2c"
 curl -fsS -o /dev/null "http://${HOST}:${PORT}/versions"
 curl -fsS -o /dev/null "http://${HOST}:${PORT}/livez"
 curl -fsS -o /dev/null "http://${HOST}:${PORT}/readyz"
@@ -98,20 +103,20 @@ if [ "${FAA_UNAUTH_STATUS}" != "403" ]; then
   exit 1
 fi
 
-echo "==> /ws/r2c protocol smoke test"
-"${PYTHON}" - "${HOST}" "${PORT}" "${API_KEY}" <<'PY'
+echo "==> Organization-scoped coordination protocol smoke test"
+"${PYTHON}" - "${HOST}" "${PORT}" "${RELEASE_CHECK_DESIGNATOR}" "${API_KEY}" <<'PY'
 import asyncio
 import json
 import sys
 
 import websockets
 
-host, port, api_key = sys.argv[1:4]
+host, port, designator, api_key = sys.argv[1:5]
 
 
 async def main():
     async with websockets.connect(
-        f"ws://{host}:{port}/ws/r2c",
+        f"ws://{host}:{port}/{designator.lower()}/ws/r2c",
         additional_headers={
             "X-SAR-Token": api_key,
             "User-Agent": "RID2Caltopo/release-check",

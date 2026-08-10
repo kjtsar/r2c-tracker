@@ -93,7 +93,6 @@ DB_USER = os.environ.get("DB_USER", "undefined")
 DB_PASS = os.environ.get("DB_PASS", "undefined")
 DB_NAME = os.environ.get("DB_NAME", "undefined")
 API_KEY_NAME = "X-SAR-Token"
-TRACKER_API_KEY = os.environ.get("TRACKER_API_KEY", "").strip()
 DEPLOYMENT_GATE_KEY = os.environ.get("DEPLOYMENT_GATE_KEY", "").strip()
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 TRACKER_ADMIN_USER = os.environ.get("TRACKER_ADMIN_USER", "admin")
@@ -572,6 +571,9 @@ def getconn():
 # Base.metadata.create_all(bind=engine)
 
 Base = declarative_base()
+LEGACY_COORDINATION_ORGANIZATION_ID = "legacy"
+
+
 class Flight(Base):
     __tablename__ = "flights"
     id = Column(Integer, primary_key=True)
@@ -602,6 +604,12 @@ class Flight(Base):
 class R2CZoneState(Base):
     __tablename__ = "r2c_zone_state"
     id = Column(Integer, primary_key=True)
+    organization_id = Column(
+        String(36),
+        index=True,
+        nullable=False,
+        default=LEGACY_COORDINATION_ORGANIZATION_ID,
+    )
     map_id = Column(String, index=True, nullable=False)
     reported_map_id = Column(String, default="")
     coordination_mode = Column(String, default=R2C_COORDINATION_MODE_MAP)
@@ -621,6 +629,12 @@ class R2CZoneState(Base):
 class R2CDroneOwnerState(Base):
     __tablename__ = "r2c_drone_owner_state"
     id = Column(Integer, primary_key=True)
+    organization_id = Column(
+        String(36),
+        index=True,
+        nullable=False,
+        default=LEGACY_COORDINATION_ORGANIZATION_ID,
+    )
     map_id = Column(String, index=True, nullable=False)
     remote_id = Column(String, index=True, nullable=False)
     owner_guid = Column(String, default="")
@@ -636,6 +650,12 @@ class R2CDroneOwnerState(Base):
 class R2CDroneConfirmationState(Base):
     __tablename__ = "r2c_drone_confirmation_state"
     id = Column(Integer, primary_key=True)
+    organization_id = Column(
+        String(36),
+        index=True,
+        nullable=False,
+        default=LEGACY_COORDINATION_ORGANIZATION_ID,
+    )
     map_id = Column(String, index=True, nullable=False)
     remote_id = Column(String, index=True, nullable=False)
     zone_id = Column(String, default="")
@@ -652,6 +672,12 @@ class R2CDroneConfirmationState(Base):
 class R2CRecentSighting(Base):
     __tablename__ = "r2c_recent_sighting"
     id = Column(Integer, primary_key=True)
+    organization_id = Column(
+        String(36),
+        index=True,
+        nullable=False,
+        default=LEGACY_COORDINATION_ORGANIZATION_ID,
+    )
     map_id = Column(String, index=True, nullable=False)
     remote_id = Column(String, index=True, nullable=False)
     zone_id = Column(String, default="")
@@ -679,6 +705,18 @@ async def migrate_r2c_coordination_schema():
     ]
     async with engine.begin() as conn:
         dialect = conn.dialect.name
+        coordination_tables = (
+            "r2c_zone_state",
+            "r2c_drone_owner_state",
+            "r2c_drone_confirmation_state",
+            "r2c_recent_sighting",
+        )
+        coordination_scope_indexes = {
+            "r2c_zone_state": "organization_id, map_id, zone_id",
+            "r2c_drone_owner_state": "organization_id, map_id, remote_id",
+            "r2c_drone_confirmation_state": "organization_id, map_id, remote_id",
+            "r2c_recent_sighting": "organization_id, map_id, remote_id",
+        }
         if dialect == "postgresql":
             for table_name, column_name in timestamp_columns:
                 result = await conn.execute(text("""
@@ -706,6 +744,27 @@ async def migrate_r2c_coordination_schema():
             # SQLite INTEGER is already 64-bit and does not need migration here.
             pass
         if dialect == "postgresql":
+            for table_name in coordination_tables:
+                result = await conn.execute(text("""
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = :table_name
+                """), {"table_name": table_name})
+                table_columns = {row[0] for row in result.fetchall()}
+                if "organization_id" not in table_columns:
+                    await conn.execute(text(
+                        f"ALTER TABLE {table_name} ADD COLUMN organization_id "
+                        f"VARCHAR(36) NOT NULL DEFAULT '{LEGACY_COORDINATION_ORGANIZATION_ID}'"
+                    ))
+                await conn.execute(text(
+                    f"CREATE INDEX IF NOT EXISTS idx_{table_name}_organization_id "
+                    f"ON {table_name} (organization_id)"
+                ))
+                await conn.execute(text(
+                    f"CREATE INDEX IF NOT EXISTS idx_{table_name}_scope "
+                    f"ON {table_name} ({coordination_scope_indexes[table_name]})"
+                ))
             result = await conn.execute(text("""
                 SELECT column_name
                 FROM information_schema.columns
@@ -726,6 +785,22 @@ async def migrate_r2c_coordination_schema():
             if "app_version_code" not in columns:
                 await conn.execute(text("ALTER TABLE r2c_zone_state ADD COLUMN app_version_code INTEGER DEFAULT 0"))
         elif dialect == "sqlite":
+            for table_name in coordination_tables:
+                result = await conn.execute(text(f"PRAGMA table_info({table_name})"))
+                table_columns = {row[1] for row in result.fetchall()}
+                if "organization_id" not in table_columns:
+                    await conn.execute(text(
+                        f"ALTER TABLE {table_name} ADD COLUMN organization_id "
+                        f"TEXT NOT NULL DEFAULT '{LEGACY_COORDINATION_ORGANIZATION_ID}'"
+                    ))
+                await conn.execute(text(
+                    f"CREATE INDEX IF NOT EXISTS idx_{table_name}_organization_id "
+                    f"ON {table_name} (organization_id)"
+                ))
+                await conn.execute(text(
+                    f"CREATE INDEX IF NOT EXISTS idx_{table_name}_scope "
+                    f"ON {table_name} ({coordination_scope_indexes[table_name]})"
+                ))
             result = await conn.execute(text("PRAGMA table_info(r2c_zone_state)"))
             columns = {row[1] for row in result.fetchall()}
             if "reported_map_id" not in columns:
@@ -824,7 +899,12 @@ async def lifespan(app: FastAPI):
         await control_plane_store.dispose()
     await engine.dispose()
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 app.add_middleware(
     SessionMiddleware,
     secret_key=SECRET_KEY,
@@ -878,30 +958,6 @@ async def protect_control_plane_pages(request: Request, call_next):
     return response
 
 
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: list[WebSocket] = []
-
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
-        logger.info("live refresh websocket connected: active_connections=%s", len(self.active_connections))
-
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
-        logger.info("live refresh websocket disconnected: active_connections=%s", len(self.active_connections))
-
-    async def broadcast(self, message: str):
-        for connection in self.active_connections:
-            await connection.send_text(message)
-
-    def connection_count(self) -> int:
-        return len(self.active_connections)
-        
-manager = ConnectionManager()
-
-
 class OrganizationStreamEventHub:
     """Fan out privacy-minimal stream lifecycle changes by organization."""
 
@@ -948,9 +1004,11 @@ class R2CZoneConnection:
         self,
         websocket: Optional[WebSocket],
         device_credential: Optional[object] = None,
+        organization_id: str = LEGACY_COORDINATION_ORGANIZATION_ID,
     ):
         self.websocket = websocket
         self.device_credential = device_credential
+        self.organization_id = organization_id
         self.map_id: Optional[str] = None
         self.reported_map_id: str = ""
         self.coordination_mode: str = "map"
@@ -982,11 +1040,11 @@ class R2CCoordinationHub:
         self._connections_by_device_credential_id: dict[
             str, R2CZoneConnection
         ] = {}
-        self._zones_by_map: dict[str, dict[str, R2CZoneConnection]] = {}
-        self._owners: dict[tuple[str, str], dict] = {}
-        self._confirmed_drones_by_map: dict[str, dict[str, dict]] = {}
+        self._zones_by_map: dict[tuple[str, str], dict[str, R2CZoneConnection]] = {}
+        self._owners: dict[tuple[str, str, str], dict] = {}
+        self._confirmed_drones_by_map: dict[tuple[str, str], dict[str, dict]] = {}
         self._confirmation_event_seq: int = 0
-        self._last_heartbeat_zone_update_ms_by_map: dict[str, int] = {}
+        self._last_heartbeat_zone_update_ms_by_map: dict[tuple[str, str], int] = {}
         self._sweep_task: Optional[asyncio.Task] = None
         self._load_task: Optional[asyncio.Task] = None
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -1222,7 +1280,11 @@ class R2CCoordinationHub:
     def _standalone_map_id_for_zone(cls, zone_id: str, guid: str) -> str:
         return f"{cls.STANDALONE_PREFIX}{cls._sanitize_standalone_key(zone_id or guid)}"
 
-    def _resolve_coordination_map_id(self, reported_map_id: str, zone_id: str, guid: str,
+    @staticmethod
+    def _scope_key(organization_id: str, map_id: str) -> tuple[str, str]:
+        return organization_id, map_id
+
+    def _resolve_coordination_map_id(self, organization_id: str, reported_map_id: str, zone_id: str, guid: str,
                                      lat: float, lng: float) -> tuple[str, str]:
         normalized = (reported_map_id or "").strip()
         if not self._is_standalone_reported_map_id(normalized):
@@ -1233,7 +1295,9 @@ class R2CCoordinationHub:
 
         nearby_mapped: list[tuple[float, str]] = []
         nearby_standalone: list[tuple[float, str]] = []
-        for map_id, zones in self._zones_by_map.items():
+        for (candidate_organization_id, map_id), zones in self._zones_by_map.items():
+            if candidate_organization_id != organization_id:
+                continue
             for zone in zones.values():
                 if zone.zone_id == zone_id:
                     continue
@@ -1264,6 +1328,7 @@ class R2CCoordinationHub:
 
     async def _resolve_persisted_mapped_coordination_map_id(
             self,
+            organization_id: str,
             zone_id: str,
             lat: float,
             lng: float,
@@ -1275,6 +1340,7 @@ class R2CCoordinationHub:
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(R2CZoneState).where(
+                    R2CZoneState.organization_id == organization_id,
                     R2CZoneState.last_seen_ms >= recent_cutoff_ms,
                     R2CZoneState.map_id.not_like(f"{self.STANDALONE_PREFIX}%"),
                 )
@@ -1294,44 +1360,53 @@ class R2CCoordinationHub:
         candidates.sort(key=lambda row: (row[0], row[1]))
         return candidates[0][1]
 
-    def _message_context(self, websocket: WebSocket, payload: dict) -> tuple[str, str, str]:
+    def _message_context(self, websocket: WebSocket, payload: dict) -> tuple[str, str, str, str]:
         conn = self._connections.get(websocket)
         payload_zone_id = payload.get("zoneId", "") or payload.get("guid", "")
         if conn is not None:
             return (
+                conn.organization_id,
                 conn.map_id or payload.get("mapId", ""),
                 conn.zone_id or payload_zone_id,
                 conn.guid or payload.get("guid", payload_zone_id),
             )
-        return payload.get("mapId", ""), payload_zone_id, payload.get("guid", payload_zone_id)
+        return (
+            LEGACY_COORDINATION_ORGANIZATION_ID,
+            payload.get("mapId", ""),
+            payload_zone_id,
+            payload.get("guid", payload_zone_id),
+        )
 
     def _prune_confirmed_drones_locked(self, now_ms: int):
         cutoff_ms = now_ms - self.CONFIRMATION_RETENTION_MS
-        for map_id in list(self._confirmed_drones_by_map.keys()):
-            confirmations = self._confirmed_drones_by_map.get(map_id, {})
+        for scope_key in list(self._confirmed_drones_by_map.keys()):
+            confirmations = self._confirmed_drones_by_map.get(scope_key, {})
             for remote_id in list(confirmations.keys()):
                 if int(confirmations[remote_id].get("confirmedAtMs", 0) or 0) < cutoff_ms:
                     confirmations.pop(remote_id, None)
             if not confirmations:
-                self._confirmed_drones_by_map.pop(map_id, None)
+                self._confirmed_drones_by_map.pop(scope_key, None)
 
-    def _remember_drone_confirmation_locked(self, map_id: str, event: dict, now_ms: int):
+    def _remember_drone_confirmation_locked(self, organization_id: str, map_id: str, event: dict, now_ms: int):
         if not map_id or not event.get("remoteId"):
             return
         self._prune_confirmed_drones_locked(now_ms)
         stored = dict(event)
         stored["mapId"] = map_id
         stored["confirmedAtMs"] = now_ms
-        self._confirmed_drones_by_map.setdefault(map_id, {})[str(event["remoteId"])] = stored
+        scope_key = self._scope_key(organization_id, map_id)
+        self._confirmed_drones_by_map.setdefault(scope_key, {})[str(event["remoteId"])] = stored
 
-    def _merge_drone_confirmations_locked(self, old_map_id: Optional[str], new_map_id: str, now_ms: int) -> list[dict]:
+    def _merge_drone_confirmations_locked(self, organization_id: str, old_map_id: Optional[str], new_map_id: str, now_ms: int) -> list[dict]:
         if not old_map_id or not new_map_id or old_map_id == new_map_id:
             return []
         self._prune_confirmed_drones_locked(now_ms)
-        old_confirmations = self._confirmed_drones_by_map.get(old_map_id, {})
+        old_scope_key = self._scope_key(organization_id, old_map_id)
+        new_scope_key = self._scope_key(organization_id, new_map_id)
+        old_confirmations = self._confirmed_drones_by_map.get(old_scope_key, {})
         if not old_confirmations:
             return []
-        new_confirmations = self._confirmed_drones_by_map.setdefault(new_map_id, {})
+        new_confirmations = self._confirmed_drones_by_map.setdefault(new_scope_key, {})
         merged: list[dict] = []
         for remote_id, event in old_confirmations.items():
             copied = dict(event)
@@ -1342,32 +1417,34 @@ class R2CCoordinationHub:
                 merged.append(copied)
         return merged
 
-    def _recent_drone_confirmations_locked(self, map_id: str, now_ms: int) -> list[dict]:
+    def _recent_drone_confirmations_locked(self, organization_id: str, map_id: str, now_ms: int) -> list[dict]:
         self._prune_confirmed_drones_locked(now_ms)
         return [
             dict(event)
-            for event in self._confirmed_drones_by_map.get(map_id, {}).values()
+            for event in self._confirmed_drones_by_map.get(self._scope_key(organization_id, map_id), {}).values()
         ]
 
-    def _forget_drone_confirmation_locked(self, map_id: str, remote_id: str):
+    def _forget_drone_confirmation_locked(self, organization_id: str, map_id: str, remote_id: str):
         if not map_id or not remote_id:
             return
-        confirmations = self._confirmed_drones_by_map.get(map_id, {})
+        scope_key = self._scope_key(organization_id, map_id)
+        confirmations = self._confirmed_drones_by_map.get(scope_key, {})
         confirmations.pop(remote_id, None)
         if not confirmations:
-            self._confirmed_drones_by_map.pop(map_id, None)
+            self._confirmed_drones_by_map.pop(scope_key, None)
 
-    def _forget_drone_confirmations_for_zone_locked(self, map_id: str, guid: str, zone_id: str):
+    def _forget_drone_confirmations_for_zone_locked(self, organization_id: str, map_id: str, guid: str, zone_id: str):
         if not map_id:
             return
-        confirmations = self._confirmed_drones_by_map.get(map_id, {})
+        scope_key = self._scope_key(organization_id, map_id)
+        confirmations = self._confirmed_drones_by_map.get(scope_key, {})
         for remote_id, event in list(confirmations.items()):
             confirmed_by_guid = str(event.get("confirmedByGuid", "") or event.get("guid", "") or "")
             event_zone_id = str(event.get("zoneId", "") or "")
             if (guid and confirmed_by_guid == guid) or (zone_id and event_zone_id == zone_id):
                 confirmations.pop(remote_id, None)
         if not confirmations:
-            self._confirmed_drones_by_map.pop(map_id, None)
+            self._confirmed_drones_by_map.pop(scope_key, None)
 
     def _dedupe_confirmation_events(self, events: list[dict]) -> list[dict]:
         by_remote_id: dict[str, dict] = {}
@@ -1391,17 +1468,17 @@ class R2CCoordinationHub:
         except Exception as e:
             logger.warning("drone_confirmed send failed for %s/%s: %s", event.get("mapId", ""), zone.zone_id, e)
 
-    async def _broadcast_drone_confirmation(self, map_id: str, event: dict):
+    async def _broadcast_drone_confirmation(self, organization_id: str, map_id: str, event: dict):
         async with self._lock:
-            recipients = [zone for zone in self._zones_by_map.get(map_id, {}).values() if zone.websocket is not None]
+            recipients = [zone for zone in self._zones_by_map.get(self._scope_key(organization_id, map_id), {}).values() if zone.websocket is not None]
         for zone in recipients:
             await self._send_drone_confirmation_to_zone(zone, event)
 
-    async def _send_recent_drone_confirmations(self, websocket: WebSocket, map_id: str, now_ms: int):
+    async def _send_recent_drone_confirmations(self, websocket: WebSocket, organization_id: str, map_id: str, now_ms: int):
         async with self._lock:
             zone = self._connections.get(websocket)
-            events = self._recent_drone_confirmations_locked(map_id, now_ms)
-        events.extend(await self._load_recent_confirmation_events(map_id, now_ms))
+            events = self._recent_drone_confirmations_locked(organization_id, map_id, now_ms)
+        events.extend(await self._load_recent_confirmation_events(organization_id, map_id, now_ms))
         events = self._dedupe_confirmation_events(events)
         if zone is None:
             return
@@ -1415,8 +1492,12 @@ class R2CCoordinationHub:
     ):
         await websocket.accept()
         now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
+        organization_id = str(
+            getattr(device_credential, "organization_id", "")
+            or LEGACY_COORDINATION_ORGANIZATION_ID
+        )
         async with self._lock:
-            conn = R2CZoneConnection(websocket, device_credential)
+            conn = R2CZoneConnection(websocket, device_credential, organization_id)
             conn.connected_at_ms = now_ms
             self._connections[websocket] = conn
             if device_credential is not None:
@@ -1453,7 +1534,7 @@ class R2CCoordinationHub:
         return matches
 
     async def disconnect(self, websocket: WebSocket):
-        confirmed_owner_expirations: list[tuple[str, str, str]] = []
+        confirmed_owner_expirations: list[tuple[str, str, str, str]] = []
         async with self._lock:
             conn = self._connections.pop(websocket, None)
             if conn is None:
@@ -1476,6 +1557,8 @@ class R2CCoordinationHub:
                         conn.device_credential.id
                     ] = replacements[0]
             map_id = conn.map_id
+            organization_id = conn.organization_id
+            scope_key = self._scope_key(organization_id, map_id or "")
             zone_guid = conn.guid or ""
             zone_id = conn.zone_id or ""
             name = conn.name
@@ -1490,22 +1573,22 @@ class R2CCoordinationHub:
             last_seen_ms = conn.last_seen_ms
             should_mark_zone_offline = False
             if map_id and zone_id:
-                zones = self._zones_by_map.get(map_id, {})
+                zones = self._zones_by_map.get(scope_key, {})
                 tracked = zones.get(zone_id)
                 if tracked is conn:
                     conn.websocket = None
                     should_mark_zone_offline = True
             if should_mark_zone_offline:
-                self._forget_drone_confirmations_for_zone_locked(map_id, zone_guid, zone_id)
-                for (owner_map_id, remote_id), owner in list(self._owners.items()):
-                    if owner_map_id != map_id or owner.get("source") != "confirmation":
+                self._forget_drone_confirmations_for_zone_locked(organization_id, map_id, zone_guid, zone_id)
+                for (owner_organization_id, owner_map_id, remote_id), owner in list(self._owners.items()):
+                    if owner_organization_id != organization_id or owner_map_id != map_id or owner.get("source") != "confirmation":
                         continue
                     owner_guid = str(owner.get("owner_guid", "") or "")
                     owner_zone_id = str(owner.get("owner_zone_id", "") or "")
                     if (zone_guid and owner_guid == zone_guid) or (zone_id and owner_zone_id == zone_id):
-                        self._owners.pop((owner_map_id, remote_id), None)
-                        self._forget_drone_confirmation_locked(owner_map_id, remote_id)
-                        confirmed_owner_expirations.append((owner_map_id, remote_id, owner_guid))
+                        self._owners.pop((owner_organization_id, owner_map_id, remote_id), None)
+                        self._forget_drone_confirmation_locked(owner_organization_id, owner_map_id, remote_id)
+                        confirmed_owner_expirations.append((owner_organization_id, owner_map_id, remote_id, owner_guid))
             reported_map_id = conn.reported_map_id
             coordination_mode = conn.coordination_mode
         now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
@@ -1520,6 +1603,7 @@ class R2CCoordinationHub:
                 max(now_ms - int(last_seen_ms or 0), 0),
             )
             await self._upsert_zone_state(
+                organization_id,
                 map_id,
                 zone_id,
                 zone_guid or zone_id,
@@ -1535,17 +1619,18 @@ class R2CCoordinationHub:
                 app_version,
                 app_version_code,
             )
-            await self._delete_confirmation_state_for_zone(map_id, zone_guid, zone_id)
-        for owner_map_id, remote_id, owner_guid in confirmed_owner_expirations:
+            await self._delete_confirmation_state_for_zone(organization_id, map_id, zone_guid, zone_id)
+        for owner_organization_id, owner_map_id, remote_id, owner_guid in confirmed_owner_expirations:
             logger.info(
                 "r2c owner_expired: map=%s remote_id=%s reason=confirming_zone_disconnect prev_owner_guid=%s",
                 owner_map_id,
                 remote_id,
                 owner_guid,
             )
-            await self._delete_owner_state(owner_map_id, remote_id)
-            await self._delete_confirmation_state(owner_map_id, remote_id)
+            await self._delete_owner_state(owner_organization_id, owner_map_id, remote_id)
+            await self._delete_confirmation_state(owner_organization_id, owner_map_id, remote_id)
             await self.broadcast(
+                owner_organization_id,
                 owner_map_id,
                 {
                     "type": "owner_expired",
@@ -1554,7 +1639,7 @@ class R2CCoordinationHub:
                 }
             )
         if map_id:
-            await self.broadcast_zone_update(map_id)
+            await self.broadcast_zone_update(organization_id, map_id)
 
     async def handle_message(self, websocket: WebSocket, payload: dict):
         mtype = payload.get("type", "")
@@ -2140,9 +2225,11 @@ class R2CCoordinationHub:
         now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
         async with self._lock:
             conn = self._connections[websocket]
+            organization_id = conn.organization_id
             lat = float(payload.get("lat", 0.0) or 0.0)
             lng = float(payload.get("lng", 0.0) or 0.0)
             map_id, coordination_mode = self._resolve_coordination_map_id(
+                organization_id,
                 reported_map_id,
                 zone_id,
                 payload.get("guid", zone_id),
@@ -2152,11 +2239,12 @@ class R2CCoordinationHub:
             old_map_id = conn.map_id
             old_zone_id = conn.zone_id
             if old_map_id and old_zone_id:
-                old_zones = self._zones_by_map.get(old_map_id, {})
+                old_scope_key = self._scope_key(organization_id, old_map_id)
+                old_zones = self._zones_by_map.get(old_scope_key, {})
                 if old_zones.get(old_zone_id) is conn:
                     old_zones.pop(old_zone_id, None)
                 if not old_zones:
-                    self._zones_by_map.pop(old_map_id, None)
+                    self._zones_by_map.pop(old_scope_key, None)
             conn.map_id = map_id
             conn.reported_map_id = reported_map_id
             conn.coordination_mode = coordination_mode
@@ -2171,7 +2259,7 @@ class R2CCoordinationHub:
             conn.connection_state = "online"
             conn.hello_received_at_ms = now_ms
             conn.last_seen_ms = now_ms
-            zones = self._zones_by_map.setdefault(map_id, {})
+            zones = self._zones_by_map.setdefault(self._scope_key(organization_id, map_id), {})
             zones[zone_id] = conn
         logger.info(
             "r2c hello received: map=%s reported_map=%s coordination_mode=%s zone=%s guid=%s handshake_age_ms=%s",
@@ -2183,6 +2271,7 @@ class R2CCoordinationHub:
             max(now_ms - int(conn.connected_at_ms or now_ms), 0),
         )
         await self._upsert_zone_state(
+            organization_id,
             map_id,
             zone_id,
             conn.guid or zone_id,
@@ -2220,8 +2309,8 @@ class R2CCoordinationHub:
         if update_url:
             hello_ack["updateUrl"] = update_url
         await websocket.send_text(json.dumps(hello_ack))
-        await self.broadcast_zone_update(map_id)
-        await self._send_recent_drone_confirmations(websocket, map_id, now_ms)
+        await self.broadcast_zone_update(organization_id, map_id)
+        await self._send_recent_drone_confirmations(websocket, organization_id, map_id, now_ms)
 
     async def _handle_idle(self, websocket: WebSocket, payload: dict):
         now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
@@ -2229,13 +2318,14 @@ class R2CCoordinationHub:
             conn = self._connections.get(websocket)
             if conn is None:
                 return
-            map_id, zone_id, guid = self._message_context(websocket, payload)
+            organization_id, map_id, zone_id, guid = self._message_context(websocket, payload)
             if not map_id or not zone_id:
                 return
             active_owner_remote_ids = [
                 remote_id
-                for (owner_map_id, remote_id), owner in self._owners.items()
-                if owner_map_id == map_id
+                for (owner_organization_id, owner_map_id, remote_id), owner in self._owners.items()
+                if owner_organization_id == organization_id
+                and owner_map_id == map_id
                 and int(owner.get("lease_expire_ms", 0) or 0) >= now_ms
                 and (
                     (guid and owner.get("owner_guid") == guid)
@@ -2268,6 +2358,7 @@ class R2CCoordinationHub:
             guid,
         )
         await self._upsert_zone_state(
+            organization_id,
             map_id,
             zone_id,
             guid or zone_id,
@@ -2283,12 +2374,12 @@ class R2CCoordinationHub:
             app_version,
             app_version_code,
         )
-        await self.broadcast_zone_update(map_id)
+        await self.broadcast_zone_update(organization_id, map_id)
 
     async def _handle_heartbeat(self, websocket: WebSocket, payload: dict):
         now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
-        owner_updates: list[tuple[str, str, dict]] = []
-        owner_deletes: list[tuple[str, str]] = []
+        owner_updates: list[tuple[str, str, str, dict]] = []
+        owner_deletes: list[tuple[str, str, str]] = []
         confirmation_replays: list[dict] = []
         owner_lease_expire_ms = 0
         old_map_id_for_update: Optional[str] = None
@@ -2296,6 +2387,7 @@ class R2CCoordinationHub:
             conn = self._connections.get(websocket)
             if conn is None:
                 return
+            organization_id = conn.organization_id
             conn.lat = float(payload.get("lat", conn.lat) or 0.0)
             conn.lng = float(payload.get("lng", conn.lng) or 0.0)
             incoming_rtt_ms = self._parse_caltopo_rtt_ms(payload.get("caltopoRttMs"))
@@ -2304,6 +2396,7 @@ class R2CCoordinationHub:
             conn.last_seen_ms = now_ms
             if conn.coordination_mode == self.COORDINATION_MODE_STANDALONE:
                 resolved_map_id, resolved_mode = self._resolve_coordination_map_id(
+                    organization_id,
                     conn.reported_map_id,
                     conn.zone_id or "",
                     conn.guid or "",
@@ -2312,6 +2405,7 @@ class R2CCoordinationHub:
                 )
                 if resolved_map_id.startswith(self.STANDALONE_PREFIX):
                     persisted_map_id = await self._resolve_persisted_mapped_coordination_map_id(
+                        organization_id,
                         conn.zone_id or "",
                         conn.lat,
                         conn.lng,
@@ -2324,15 +2418,16 @@ class R2CCoordinationHub:
                     old_map_id_for_update = conn.map_id
                     old_zone_id = conn.zone_id
                     if old_map_id_for_update and old_zone_id:
-                        old_zones = self._zones_by_map.get(old_map_id_for_update, {})
+                        old_scope_key = self._scope_key(organization_id, old_map_id_for_update)
+                        old_zones = self._zones_by_map.get(old_scope_key, {})
                         if old_zones.get(old_zone_id) is conn:
                             old_zones.pop(old_zone_id, None)
                         if not old_zones:
-                            self._zones_by_map.pop(old_map_id_for_update, None)
+                            self._zones_by_map.pop(old_scope_key, None)
                     conn.map_id = resolved_map_id
                     conn.coordination_mode = resolved_mode
                     if old_zone_id:
-                        self._zones_by_map.setdefault(resolved_map_id, {})[old_zone_id] = conn
+                        self._zones_by_map.setdefault(self._scope_key(organization_id, resolved_map_id), {})[old_zone_id] = conn
                     logger.info(
                         "r2c standalone rehomed: old_map=%s new_map=%s zone=%s guid=%s",
                         old_map_id_for_update,
@@ -2341,29 +2436,29 @@ class R2CCoordinationHub:
                         conn.guid or old_zone_id,
                     )
                     confirmation_replays.extend(
-                        self._merge_drone_confirmations_locked(old_map_id_for_update, resolved_map_id, now_ms)
+                        self._merge_drone_confirmations_locked(organization_id, old_map_id_for_update, resolved_map_id, now_ms)
                     )
                     confirmation_replays.extend(
-                        self._recent_drone_confirmations_locked(resolved_map_id, now_ms)
+                        self._recent_drone_confirmations_locked(organization_id, resolved_map_id, now_ms)
                     )
                     confirmation_replays = list({
                         str(event.get("remoteId", "")): event
                         for event in confirmation_replays
                         if event.get("remoteId")
                     }.values())
-                    for (owner_map_id, remote_id), owner in list(self._owners.items()):
-                        if owner_map_id != old_map_id_for_update or owner.get("owner_guid") != conn.guid:
+                    for (owner_organization_id, owner_map_id, remote_id), owner in list(self._owners.items()):
+                        if owner_organization_id != organization_id or owner_map_id != old_map_id_for_update or owner.get("owner_guid") != conn.guid:
                             continue
-                        self._owners.pop((owner_map_id, remote_id), None)
-                        existing = self._owners.get((resolved_map_id, remote_id))
+                        self._owners.pop((owner_organization_id, owner_map_id, remote_id), None)
+                        existing = self._owners.get((organization_id, resolved_map_id, remote_id))
                         if existing is None:
-                            self._owners[(resolved_map_id, remote_id)] = owner
-                            owner_updates.append((resolved_map_id, remote_id, dict(owner)))
+                            self._owners[(organization_id, resolved_map_id, remote_id)] = owner
+                            owner_updates.append((organization_id, resolved_map_id, remote_id, dict(owner)))
                         else:
                             chosen_owner = self._pick_owner(existing, owner)
-                            self._owners[(resolved_map_id, remote_id)] = chosen_owner
-                            owner_updates.append((resolved_map_id, remote_id, dict(chosen_owner)))
-                        owner_deletes.append((owner_map_id, remote_id))
+                            self._owners[(organization_id, resolved_map_id, remote_id)] = chosen_owner
+                            owner_updates.append((organization_id, resolved_map_id, remote_id, dict(chosen_owner)))
+                        owner_deletes.append((organization_id, owner_map_id, remote_id))
             map_id = conn.map_id
             zone_id = conn.zone_id
             guid = conn.guid
@@ -2376,13 +2471,14 @@ class R2CCoordinationHub:
             reported_map_id = conn.reported_map_id
             coordination_mode = conn.coordination_mode
             if guid:
-                for (owner_map_id, remote_id), owner in self._owners.items():
-                    if owner.get("owner_guid") == guid:
+                for (owner_organization_id, owner_map_id, remote_id), owner in self._owners.items():
+                    if owner_organization_id == organization_id and owner.get("owner_guid") == guid:
                         owner["lease_expire_ms"] = now_ms + (R2C_LEASE_SEC * 1000)
                         owner_lease_expire_ms = max(owner_lease_expire_ms, int(owner["lease_expire_ms"]))
-                        owner_updates.append((owner_map_id, remote_id, dict(owner)))
+                        owner_updates.append((organization_id, owner_map_id, remote_id, dict(owner)))
         if map_id and zone_id:
             await self._upsert_zone_state(
+                organization_id,
                 map_id,
                 zone_id,
                 guid or zone_id,
@@ -2399,11 +2495,11 @@ class R2CCoordinationHub:
                 app_version_code,
             )
         if old_map_id_for_update and zone_id:
-            await self._delete_zone_state(old_map_id_for_update, zone_id)
-        for owner_map_id, remote_id, owner in owner_updates:
-            await self._upsert_owner_state(owner_map_id, remote_id, owner)
-        for owner_map_id, remote_id in owner_deletes:
-            await self._delete_owner_state(owner_map_id, remote_id)
+            await self._delete_zone_state(organization_id, old_map_id_for_update, zone_id)
+        for owner_organization_id, owner_map_id, remote_id, owner in owner_updates:
+            await self._upsert_owner_state(owner_organization_id, owner_map_id, remote_id, owner)
+        for owner_organization_id, owner_map_id, remote_id in owner_deletes:
+            await self._delete_owner_state(owner_organization_id, owner_map_id, remote_id)
         logger.debug(
             "r2c heartbeat_ack: map=%s zone=%s guid=%s client_seq=%s owner_lease_expire_ts=%s",
             map_id,
@@ -2423,22 +2519,22 @@ class R2CCoordinationHub:
             "clientSeq": payload.get("seq"),
         }))
         if map_id:
-            await self.broadcast_zone_update(map_id, force=False)
+            await self.broadcast_zone_update(organization_id, map_id, force=False)
         if old_map_id_for_update and old_map_id_for_update != map_id:
-            await self.broadcast_zone_update(old_map_id_for_update)
+            await self.broadcast_zone_update(organization_id, old_map_id_for_update)
         for event in confirmation_replays:
             if map_id:
-                await self._broadcast_drone_confirmation(map_id, event)
+                await self._broadcast_drone_confirmation(organization_id, map_id, event)
 
     async def _handle_first_sighting(self, websocket: WebSocket, payload: dict):
         remote_id = payload.get("remoteId", "")
         should_persist_owner = True
         async with self._lock:
-            map_id, zone_id, guid = self._message_context(websocket, payload)
+            organization_id, map_id, zone_id, guid = self._message_context(websocket, payload)
             if not map_id or not remote_id or not zone_id:
                 return
             now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
-            existing = self._owners.get((map_id, remote_id))
+            existing = self._owners.get((organization_id, map_id, remote_id))
             candidate = {
                 "owner_guid": guid,
                 "owner_zone_id": zone_id,
@@ -2466,7 +2562,7 @@ class R2CCoordinationHub:
                     candidate["lease_seq"] = int(existing.get("lease_seq", 0)) + 1
             if should_persist_owner:
                 owner["lease_expire_ms"] = now_ms + (R2C_LEASE_SEC * 1000)
-                self._owners[(map_id, remote_id)] = owner
+                self._owners[(organization_id, map_id, remote_id)] = owner
         logger.info(
             "r2c owner_decision: map=%s remote_id=%s reason=%s prev_owner_guid=%s prev_zone_id=%s "
             "prev_drone_ts=%s prev_distance_m=%s prev_mapped_id=%s candidate_guid=%s candidate_zone_id=%s "
@@ -2491,8 +2587,9 @@ class R2CCoordinationHub:
             owner.get("lease_expire_ms", 0),
         )
         if should_persist_owner:
-            await self._upsert_owner_state(map_id, remote_id, owner)
+            await self._upsert_owner_state(organization_id, map_id, remote_id, owner)
             await self.broadcast(
+                organization_id,
                 map_id,
                 {
                     "type": "owner_assigned",
@@ -2506,19 +2603,19 @@ class R2CCoordinationHub:
 
     async def _handle_sighting(self, websocket: WebSocket, payload: dict):
         remote_id = payload.get("remoteId", "")
-        owner_refresh: Optional[tuple[str, str, dict]] = None
+        owner_refresh: Optional[tuple[str, str, str, dict]] = None
         async with self._lock:
-            map_id, from_zone_id, guid = self._message_context(websocket, payload)
+            organization_id, map_id, from_zone_id, guid = self._message_context(websocket, payload)
             if not map_id or not remote_id:
                 return
-            owner = self._owners.get((map_id, remote_id))
+            owner = self._owners.get((organization_id, map_id, remote_id))
             if owner is None:
                 return
             owner_zone_id = owner.get("owner_zone_id", "")
             if from_zone_id and owner_zone_id == from_zone_id:
                 now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
                 owner["lease_expire_ms"] = now_ms + (R2C_LEASE_SEC * 1000)
-                owner_refresh = (map_id, remote_id, dict(owner))
+                owner_refresh = (organization_id, map_id, remote_id, dict(owner))
                 logger.info(
                     "r2c owner_sighting_refresh: map=%s remote_id=%s owner_zone_id=%s lease_expire_ts=%s",
                     map_id,
@@ -2528,11 +2625,11 @@ class R2CCoordinationHub:
                 )
                 target = None
             else:
-                zones = self._zones_by_map.get(map_id, {})
+                zones = self._zones_by_map.get(self._scope_key(organization_id, map_id), {})
                 target = zones.get(owner_zone_id)
         if owner_refresh is not None:
-            owner_map_id, owner_remote_id, owner_state = owner_refresh
-            await self._upsert_owner_state(owner_map_id, owner_remote_id, owner_state)
+            owner_organization_id, owner_map_id, owner_remote_id, owner_state = owner_refresh
+            await self._upsert_owner_state(owner_organization_id, owner_map_id, owner_remote_id, owner_state)
             return
         if target is None or target.websocket is None:
             logger.warning(
@@ -2547,6 +2644,7 @@ class R2CCoordinationHub:
         relay["mapId"] = map_id
         relay["fromZoneId"] = from_zone_id
         await self._record_sighting(
+            organization_id,
             map_id,
             remote_id,
             relay.get("fromZoneId", ""),
@@ -2568,7 +2666,7 @@ class R2CCoordinationHub:
             conn = self._connections.get(websocket)
             if conn is None:
                 return
-            map_id, zone_id, guid = self._message_context(websocket, payload)
+            organization_id, map_id, zone_id, guid = self._message_context(websocket, payload)
             if not map_id or not remote_id:
                 return
             self._confirmation_event_seq += 1
@@ -2587,7 +2685,7 @@ class R2CCoordinationHub:
                 "confirmedAtMs": now_ms,
                 "confirmationEventId": self._confirmation_event_seq,
             }
-            existing_owner = self._owners.get((map_id, remote_id))
+            existing_owner = self._owners.get((organization_id, map_id, remote_id))
             owner = {
                 "owner_guid": event.get("confirmedByGuid", "") or event.get("guid", ""),
                 "owner_zone_id": zone_id,
@@ -2598,10 +2696,10 @@ class R2CCoordinationHub:
                 "lease_expire_ms": now_ms + (R2C_LEASE_SEC * 1000),
                 "source": "confirmation",
             }
-            self._remember_drone_confirmation_locked(map_id, event, now_ms)
-            self._owners[(map_id, remote_id)] = owner
-        await self._upsert_confirmation_state(map_id, event, now_ms)
-        await self._upsert_owner_state(map_id, remote_id, owner)
+            self._remember_drone_confirmation_locked(organization_id, map_id, event, now_ms)
+            self._owners[(organization_id, map_id, remote_id)] = owner
+        await self._upsert_confirmation_state(organization_id, map_id, event, now_ms)
+        await self._upsert_owner_state(organization_id, map_id, remote_id, owner)
         logger.info(
             "r2c drone_confirmed: map=%s remote_id=%s confirmed_by=%s mapped_id=%s",
             map_id,
@@ -2609,8 +2707,9 @@ class R2CCoordinationHub:
             event["confirmedByGuid"],
             event["mappedId"],
         )
-        await self._broadcast_drone_confirmation(map_id, event)
+        await self._broadcast_drone_confirmation(organization_id, map_id, event)
         await self.broadcast(
+            organization_id,
             map_id,
             {
                 "type": "owner_assigned",
@@ -2626,13 +2725,13 @@ class R2CCoordinationHub:
         remote_id = payload.get("remoteId", "")
         expired = False
         async with self._lock:
-            map_id, zone_id, guid = self._message_context(websocket, payload)
+            organization_id, map_id, zone_id, guid = self._message_context(websocket, payload)
             if not map_id or not remote_id:
                 return
-            owner = self._owners.get((map_id, remote_id))
+            owner = self._owners.get((organization_id, map_id, remote_id))
             if owner and owner.get("owner_zone_id") == zone_id:
-                self._owners.pop((map_id, remote_id), None)
-                self._forget_drone_confirmation_locked(map_id, remote_id)
+                self._owners.pop((organization_id, map_id, remote_id), None)
+                self._forget_drone_confirmation_locked(organization_id, map_id, remote_id)
                 expired = True
         if expired:
             logger.info(
@@ -2642,9 +2741,10 @@ class R2CCoordinationHub:
                 guid,
                 zone_id,
             )
-            await self._delete_owner_state(map_id, remote_id)
-            await self._delete_confirmation_state(map_id, remote_id)
+            await self._delete_owner_state(organization_id, map_id, remote_id)
+            await self._delete_confirmation_state(organization_id, map_id, remote_id)
             await self.broadcast(
+                organization_id,
                 map_id,
                 {
                     "type": "owner_expired",
@@ -2653,19 +2753,21 @@ class R2CCoordinationHub:
                 }
             )
 
-    async def broadcast_zone_update(self, map_id: str, force: bool = True):
+    async def broadcast_zone_update(self, organization_id: str, map_id: str, force: bool = True):
         now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
+        scope_key = self._scope_key(organization_id, map_id)
         async with self._lock:
             if not force:
                 if R2C_HEARTBEAT_ZONE_UPDATE_SEC <= 0:
                     return
-                last_update_ms = self._last_heartbeat_zone_update_ms_by_map.get(map_id, 0)
+                last_update_ms = self._last_heartbeat_zone_update_ms_by_map.get(scope_key, 0)
                 min_gap_ms = R2C_HEARTBEAT_ZONE_UPDATE_SEC * 1000
                 if last_update_ms > 0 and now_ms - last_update_ms < min_gap_ms:
                     return
-                self._last_heartbeat_zone_update_ms_by_map[map_id] = now_ms
-            zones = list(self._zones_by_map.get(map_id, {}).values())
+                self._last_heartbeat_zone_update_ms_by_map[scope_key] = now_ms
+            zones = list(self._zones_by_map.get(scope_key, {}).values())
         await self.broadcast(
+            organization_id,
             map_id,
             {
                 "type": "zone_update",
@@ -2688,10 +2790,10 @@ class R2CCoordinationHub:
             }
         )
 
-    async def broadcast(self, map_id: str, payload: dict):
+    async def broadcast(self, organization_id: str, map_id: str, payload: dict):
         text = json.dumps(payload)
         async with self._lock:
-            recipients = [zone for zone in self._zones_by_map.get(map_id, {}).values() if zone.websocket is not None]
+            recipients = [zone for zone in self._zones_by_map.get(self._scope_key(organization_id, map_id), {}).values() if zone.websocket is not None]
         for zone in recipients:
             try:
                 await zone.websocket.send_text(text)
@@ -2712,7 +2814,11 @@ class R2CCoordinationHub:
         async with self._lock:
             self._zones_by_map.clear()
             for zone in zones:
-                conn = R2CZoneConnection(None)
+                organization_id = (
+                    getattr(zone, "organization_id", "")
+                    or LEGACY_COORDINATION_ORGANIZATION_ID
+                )
+                conn = R2CZoneConnection(None, organization_id=organization_id)
                 conn.map_id = zone.map_id
                 conn.reported_map_id = getattr(zone, "reported_map_id", "") or ""
                 conn.coordination_mode = getattr(zone, "coordination_mode", "") or self.COORDINATION_MODE_MAP
@@ -2726,9 +2832,14 @@ class R2CCoordinationHub:
                 conn.caltopo_rtt_ms = zone.caltopo_rtt_ms
                 conn.connection_state = getattr(zone, "connection_state", "") or "disconnected"
                 conn.last_seen_ms = zone.last_seen_ms
-                self._zones_by_map.setdefault(zone.map_id, {})[zone.zone_id] = conn
+                self._zones_by_map.setdefault(self._scope_key(organization_id, zone.map_id), {})[zone.zone_id] = conn
             self._owners = {
-                (owner.map_id, owner.remote_id): {
+                (
+                    getattr(owner, "organization_id", "")
+                    or LEGACY_COORDINATION_ORGANIZATION_ID,
+                    owner.map_id,
+                    owner.remote_id,
+                ): {
                     "owner_guid": owner.owner_guid,
                     "owner_zone_id": owner.owner_zone_id,
                     "drone_ts": owner.first_drone_ts,
@@ -2827,36 +2938,37 @@ class R2CCoordinationHub:
     async def expire_stale_entries(self):
         now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
         stale_cutoff_ms = now_ms - (R2C_LEASE_SEC * 1000)
-        expired_maps: set[str] = set()
-        expired_owners: list[tuple[str, str, str]] = []
+        expired_maps: set[tuple[str, str]] = set()
+        expired_owners: list[tuple[str, str, str, str]] = []
         async with self._lock:
-            for map_id, zones in list(self._zones_by_map.items()):
+            for scope_key, zones in list(self._zones_by_map.items()):
                 for zone_id, zone in list(zones.items()):
                     if zone.websocket is not None:
                         continue
                     if zone.last_seen_ms < stale_cutoff_ms:
                         zones.pop(zone_id, None)
-                        expired_maps.add(map_id)
+                        expired_maps.add(scope_key)
                 if not zones:
-                    self._zones_by_map.pop(map_id, None)
-            for (map_id, remote_id), owner in list(self._owners.items()):
+                    self._zones_by_map.pop(scope_key, None)
+            for (organization_id, map_id, remote_id), owner in list(self._owners.items()):
                 if int(owner.get("lease_expire_ms", 0) or 0) < now_ms:
-                    expired_owners.append((map_id, remote_id, owner.get("owner_guid", "")))
-                    self._owners.pop((map_id, remote_id), None)
-                    self._forget_drone_confirmation_locked(map_id, remote_id)
-        for map_id in expired_maps:
-            await self._delete_stale_zones(map_id, stale_cutoff_ms)
-            await self.broadcast_zone_update(map_id)
-        for map_id, remote_id, owner_guid in expired_owners:
+                    expired_owners.append((organization_id, map_id, remote_id, owner.get("owner_guid", "")))
+                    self._owners.pop((organization_id, map_id, remote_id), None)
+                    self._forget_drone_confirmation_locked(organization_id, map_id, remote_id)
+        for organization_id, map_id in expired_maps:
+            await self._delete_stale_zones(organization_id, map_id, stale_cutoff_ms)
+            await self.broadcast_zone_update(organization_id, map_id)
+        for organization_id, map_id, remote_id, owner_guid in expired_owners:
             logger.info(
                 "r2c owner_expired: map=%s remote_id=%s reason=lease_timeout prev_owner_guid=%s",
                 map_id,
                 remote_id,
                 owner_guid,
             )
-            await self._delete_owner_state(map_id, remote_id)
-            await self._delete_confirmation_state(map_id, remote_id)
+            await self._delete_owner_state(organization_id, map_id, remote_id)
+            await self._delete_confirmation_state(organization_id, map_id, remote_id)
             await self.broadcast(
+                organization_id,
                 map_id,
                 {
                     "type": "owner_expired",
@@ -2865,7 +2977,7 @@ class R2CCoordinationHub:
                 }
             )
 
-    async def _upsert_zone_state(self, map_id: str, zone_id: str, guid: str, name: str,
+    async def _upsert_zone_state(self, organization_id: str, map_id: str, zone_id: str, guid: str, name: str,
                                  lat: float, lng: float, caltopo_rtt_ms: int,
                                  online: bool, last_seen_ms: int,
                                  reported_map_id: str = "",
@@ -2876,13 +2988,14 @@ class R2CCoordinationHub:
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(R2CZoneState).where(
+                    R2CZoneState.organization_id == organization_id,
                     R2CZoneState.map_id == map_id,
                     R2CZoneState.zone_id == zone_id
                 )
             )
             state = result.scalar_one_or_none()
             if state is None:
-                state = R2CZoneState(map_id=map_id, zone_id=zone_id)
+                state = R2CZoneState(organization_id=organization_id, map_id=map_id, zone_id=zone_id)
                 session.add(state)
             state.reported_map_id = reported_map_id
             state.coordination_mode = coordination_mode
@@ -2898,10 +3011,11 @@ class R2CCoordinationHub:
             state.last_seen_ms = last_seen_ms
             await session.commit()
 
-    async def _delete_zone_state(self, map_id: str, zone_id: str):
+    async def _delete_zone_state(self, organization_id: str, map_id: str, zone_id: str):
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(R2CZoneState).where(
+                    R2CZoneState.organization_id == organization_id,
                     R2CZoneState.map_id == map_id,
                     R2CZoneState.zone_id == zone_id
                 )
@@ -2911,10 +3025,11 @@ class R2CCoordinationHub:
                 await session.delete(state)
                 await session.commit()
 
-    async def _delete_stale_zones(self, map_id: str, cutoff_ms: int):
+    async def _delete_stale_zones(self, organization_id: str, map_id: str, cutoff_ms: int):
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(R2CZoneState).where(
+                    R2CZoneState.organization_id == organization_id,
                     R2CZoneState.map_id == map_id,
                     R2CZoneState.last_seen_ms < cutoff_ms
                 )
@@ -2923,17 +3038,18 @@ class R2CCoordinationHub:
                 await session.delete(state)
             await session.commit()
 
-    async def _upsert_owner_state(self, map_id: str, remote_id: str, owner: dict):
+    async def _upsert_owner_state(self, organization_id: str, map_id: str, remote_id: str, owner: dict):
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(R2CDroneOwnerState).where(
+                    R2CDroneOwnerState.organization_id == organization_id,
                     R2CDroneOwnerState.map_id == map_id,
                     R2CDroneOwnerState.remote_id == remote_id
                 )
             )
             state = result.scalar_one_or_none()
             if state is None:
-                state = R2CDroneOwnerState(map_id=map_id, remote_id=remote_id)
+                state = R2CDroneOwnerState(organization_id=organization_id, map_id=map_id, remote_id=remote_id)
                 session.add(state)
             state.owner_guid = owner.get("owner_guid", "")
             state.owner_zone_id = owner.get("owner_zone_id", "")
@@ -2945,10 +3061,11 @@ class R2CCoordinationHub:
             state.updated_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
             await session.commit()
 
-    async def _delete_owner_state(self, map_id: str, remote_id: str):
+    async def _delete_owner_state(self, organization_id: str, map_id: str, remote_id: str):
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(R2CDroneOwnerState).where(
+                    R2CDroneOwnerState.organization_id == organization_id,
                     R2CDroneOwnerState.map_id == map_id,
                     R2CDroneOwnerState.remote_id == remote_id
                 )
@@ -2958,20 +3075,21 @@ class R2CCoordinationHub:
                 await session.delete(state)
                 await session.commit()
 
-    async def _upsert_confirmation_state(self, map_id: str, event: dict, confirmed_at_ms: int):
+    async def _upsert_confirmation_state(self, organization_id: str, map_id: str, event: dict, confirmed_at_ms: int):
         remote_id = str(event.get("remoteId", "") or "")
         if not map_id or not remote_id:
             return
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(R2CDroneConfirmationState).where(
+                    R2CDroneConfirmationState.organization_id == organization_id,
                     R2CDroneConfirmationState.map_id == map_id,
                     R2CDroneConfirmationState.remote_id == remote_id
                 )
             )
             state = result.scalar_one_or_none()
             if state is None:
-                state = R2CDroneConfirmationState(map_id=map_id, remote_id=remote_id)
+                state = R2CDroneConfirmationState(organization_id=organization_id, map_id=map_id, remote_id=remote_id)
                 session.add(state)
             state.zone_id = event.get("zoneId", "") or ""
             state.guid = event.get("guid", "") or ""
@@ -2992,12 +3110,13 @@ class R2CCoordinationHub:
                 await session.delete(stale)
             await session.commit()
 
-    async def _delete_confirmation_state(self, map_id: str, remote_id: str):
+    async def _delete_confirmation_state(self, organization_id: str, map_id: str, remote_id: str):
         if not map_id or not remote_id:
             return
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(R2CDroneConfirmationState).where(
+                    R2CDroneConfirmationState.organization_id == organization_id,
                     R2CDroneConfirmationState.map_id == map_id,
                     R2CDroneConfirmationState.remote_id == remote_id
                 )
@@ -3015,11 +3134,14 @@ class R2CCoordinationHub:
                 deleted_count,
             )
 
-    async def _delete_confirmation_state_for_zone(self, map_id: str, guid: str, zone_id: str):
+    async def _delete_confirmation_state_for_zone(self, organization_id: str, map_id: str, guid: str, zone_id: str):
         if not map_id or (not guid and not zone_id):
             return
         async with AsyncSessionLocal() as session:
-            conditions = [R2CDroneConfirmationState.map_id == map_id]
+            conditions = [
+                R2CDroneConfirmationState.organization_id == organization_id,
+                R2CDroneConfirmationState.map_id == map_id,
+            ]
             zone_conditions = []
             if guid:
                 zone_conditions.append(R2CDroneConfirmationState.confirmed_by_guid == guid)
@@ -3043,18 +3165,20 @@ class R2CCoordinationHub:
                 deleted_count,
             )
 
-    async def _load_recent_confirmation_events(self, map_id: str, now_ms: int) -> list[dict]:
+    async def _load_recent_confirmation_events(self, organization_id: str, map_id: str, now_ms: int) -> list[dict]:
         cutoff_ms = now_ms - self.CONFIRMATION_RETENTION_MS
         recent_zone_cutoff_ms = now_ms - (R2C_LEASE_SEC * 1000)
         async with AsyncSessionLocal() as session:
             confirmation_result = await session.execute(
                 select(R2CDroneConfirmationState).where(
+                    R2CDroneConfirmationState.organization_id == organization_id,
                     R2CDroneConfirmationState.map_id == map_id,
                     R2CDroneConfirmationState.confirmed_at_ms >= cutoff_ms
                 )
             )
             zone_result = await session.execute(
                 select(R2CZoneState).where(
+                    R2CZoneState.organization_id == organization_id,
                     R2CZoneState.map_id == map_id,
                     R2CZoneState.online == True,
                     R2CZoneState.last_seen_ms >= recent_zone_cutoff_ms,
@@ -3095,11 +3219,12 @@ class R2CCoordinationHub:
                 await session.commit()
             return events
 
-    async def _record_sighting(self, map_id: str, remote_id: str, zone_id: str, guid: str,
+    async def _record_sighting(self, organization_id: str, map_id: str, remote_id: str, zone_id: str, guid: str,
                                drone_ts: int, lat: float, lng: float, alt_m: float):
         now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
         async with AsyncSessionLocal() as session:
             session.add(R2CRecentSighting(
+                organization_id=organization_id,
                 map_id=map_id,
                 remote_id=remote_id,
                 zone_id=zone_id,
@@ -3603,8 +3728,6 @@ async def authenticate_tracker_session(
     token: Optional[str],
 ) -> tuple[bool, Optional[DeviceCredentialRecord]]:
     normalized = _normalize_tracker_token(token)
-    if TRACKER_API_KEY and normalized == _normalize_tracker_token(TRACKER_API_KEY):
-        return True, None
     if control_plane_store is None or not normalized.startswith("r2c_dev_"):
         return False, None
     credential = await control_plane_store.authenticate_device_token(normalized)
@@ -4011,120 +4134,6 @@ def export_url(start_date: Optional[date] = None, end_date: Optional[date] = Non
     return f"/export?{urlencode(params)}" if params else "/export"
 
 
-def format_elapsed_ms(elapsed_ms: Optional[int]) -> str:
-    if elapsed_ms is None:
-        return "unknown"
-    elapsed_ms = max(int(elapsed_ms), 0)
-    total_seconds = elapsed_ms // 1000
-    if total_seconds < 60:
-        return f"{total_seconds}s"
-    if total_seconds < 3600:
-        minutes, seconds = divmod(total_seconds, 60)
-        return f"{minutes}m {seconds:02d}s"
-    hours, rem = divmod(total_seconds, 3600)
-    minutes = rem // 60
-    return f"{hours}h {minutes:02d}m"
-
-
-def build_r2c_snapshot(zones, owners, now_ms: int):
-    owner_rows_by_zone = {}
-    for owner in owners:
-        owner_rows_by_zone.setdefault((owner.map_id, owner.owner_zone_id), []).append({
-            "remote_id": owner.remote_id,
-            "mapped_id": owner.mapped_id,
-            "lease_seq": owner.lease_seq,
-            "lease_expire_ms": owner.lease_expire_ms,
-            "lease_remaining_ms": max(int(owner.lease_expire_ms or 0) - now_ms, 0),
-            "lease_remaining_label": format_elapsed_ms(int(owner.lease_expire_ms or 0) - now_ms),
-            "first_drone_ts": owner.first_drone_ts,
-            "first_distance_m": owner.first_distance_m,
-        })
-
-    maps = {}
-    for zone in zones:
-        elapsed_ms = max(now_ms - int(zone.last_seen_ms or 0), 0)
-        is_online = bool(getattr(zone, "online", True))
-        connection_state = (getattr(zone, "connection_state", "") or "").strip().lower()
-        if connection_state == "idle":
-            zone_status = "idle"
-            is_online = False
-        elif connection_state == "disconnected" or not is_online:
-            zone_status = "disconnected"
-        elif elapsed_ms <= (R2C_HEARTBEAT_SEC * 1000 * 2):
-            zone_status = "online"
-        else:
-            zone_status = "quiet"
-        owned_drones = sorted(
-            owner_rows_by_zone.get((zone.map_id, zone.zone_id), []),
-            key=lambda row: (
-                0 if row["mapped_id"] else 1,
-                row["mapped_id"] or row["remote_id"],
-                row["remote_id"],
-            ),
-        )
-        zone_entry = {
-            "map_id": zone.map_id,
-            "reported_map_id": getattr(zone, "reported_map_id", "") or "",
-            "coordination_mode": getattr(zone, "coordination_mode", "map") or "map",
-            "zone_id": zone.zone_id,
-            "guid": zone.guid,
-            "name": zone.name or zone.zone_id,
-            "app_version": getattr(zone, "app_version", "") or "",
-            "app_version_code": int(getattr(zone, "app_version_code", 0) or 0),
-            "lat": zone.lat,
-            "lng": zone.lng,
-            "caltopo_rtt_ms": zone.caltopo_rtt_ms,
-            "online": is_online,
-            "connection_state": connection_state or zone_status,
-            "last_seen_ms": zone.last_seen_ms,
-            "last_seen_age_ms": elapsed_ms,
-            "last_seen_age_label": format_elapsed_ms(elapsed_ms),
-            "status": zone_status,
-            "owned_drones": owned_drones,
-            "owned_drone_count": len(owned_drones),
-        }
-        if R2C_RECOMMENDED_APP_VERSION_CODE > 0:
-            if zone_entry["app_version_code"] <= 0:
-                zone_entry["app_version_status"] = "unknown"
-            elif zone_entry["app_version_code"] < R2C_RECOMMENDED_APP_VERSION_CODE:
-                zone_entry["app_version_status"] = "stale"
-            else:
-                zone_entry["app_version_status"] = "ok"
-        else:
-            zone_entry["app_version_status"] = "unknown" if zone_entry["app_version_code"] <= 0 else "ok"
-        maps.setdefault(zone.map_id, []).append(zone_entry)
-
-    snapshot_maps = []
-    for map_id in sorted(maps.keys()):
-        zone_entries = sorted(
-            maps[map_id],
-            key=lambda row: (
-                row["status"] != "online",
-                row["name"].lower(),
-                row["zone_id"].lower(),
-            ),
-        )
-        snapshot_maps.append({
-            "map_id": map_id,
-            "coordination_mode": "standalone" if map_id.startswith("Standalone_") else "map",
-            "zones": zone_entries,
-            "zone_count": len(zone_entries),
-            "active_zone_count": sum(
-                zone["status"] == "online" for zone in zone_entries
-            ),
-            "owned_drone_count": sum(zone["owned_drone_count"] for zone in zone_entries),
-        })
-
-    return {
-        "maps": snapshot_maps,
-        "map_count": len(snapshot_maps),
-        "zone_count": sum(entry["zone_count"] for entry in snapshot_maps),
-        "active_zone_count": sum(
-            entry["active_zone_count"] for entry in snapshot_maps
-        ),
-        "owned_drone_count": sum(entry["owned_drone_count"] for entry in snapshot_maps),
-    }
-
 FILTER_TIMEZONE = ZoneInfo("America/Los_Angeles")
 
 def local_date_bounds_to_utc(start_date: Optional[date] = None, end_date: Optional[date] = None):
@@ -4382,15 +4391,13 @@ def require_scoped_upload_credential(
     return credential
 
 
-@app.put("/upload")
 @app.put("/{designator}/upload")
 async def upload(
         request: Request,
-        designator: Optional[str] = None,
+        designator: str,
         db: AsyncSession = Depends(get_db),
         credential: Optional[DeviceCredentialRecord] = Depends(get_api_key)):
-    if designator is not None:
-        credential = require_scoped_upload_credential(designator, credential)
+    credential = require_scoped_upload_credential(designator, credential)
     raw_body = await request.body()
     try:
         data = await request.json()
@@ -4418,7 +4425,6 @@ async def upload(
         )
         await db.commit()
 
-    await manager.broadcast("refresh") # Tell everyone to reload
     archive_size = os.path.getsize(archive_path) if os.path.exists(archive_path) else 0
     await meter_organization_usage(
         credential,
@@ -4599,57 +4605,6 @@ async def render_public_dashboard(
     )
 
 
-@app.get("/r2c", response_class=HTMLResponse)
-async def public_r2c_snapshot(
-        request: Request,
-        response: Response,
-        db: AsyncSession = Depends(get_db)):
-    response.headers["X-Robots-Tag"] = "noindex, nofollow"
-
-    now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
-    recent_zone_cutoff_ms = now_ms - (R2C_HEARTBEAT_SEC * 1000 * 2)
-    zone_stmt = select(R2CZoneState).where(
-        or_(
-            R2CZoneState.online == True,
-            R2CZoneState.last_seen_ms >= recent_zone_cutoff_ms,
-            R2CZoneState.connection_state == "idle",
-        )
-    ).order_by(R2CZoneState.map_id, R2CZoneState.name, R2CZoneState.zone_id)
-    owner_stmt = select(R2CDroneOwnerState).where(R2CDroneOwnerState.lease_expire_ms >= now_ms)
-
-    zone_result = await db.execute(zone_stmt)
-    owner_result = await db.execute(owner_stmt)
-
-    zones = zone_result.scalars().all()
-    owners = owner_result.scalars().all()
-    for zone in zones:
-        connection_state = (getattr(zone, "connection_state", "") or "").strip().lower()
-        if connection_state not in {"idle", "disconnected"} and int(zone.last_seen_ms or 0) >= recent_zone_cutoff_ms:
-            zone.online = True
-    snapshot = build_r2c_snapshot(zones, owners, now_ms)
-    logger.info(
-        "r2c snapshot rendered: maps=%s zones=%s owners=%s recent_cutoff_ms=%s",
-        snapshot["map_count"],
-        snapshot["zone_count"],
-        snapshot["owned_drone_count"],
-        recent_zone_cutoff_ms,
-    )
-
-    return templates.TemplateResponse(
-        request=request,
-        name="r2c_snapshot.html",
-        context={
-            "request": request,
-            "enable_live_refresh": False,
-            "snapshot": snapshot,
-            "generated_at": datetime.now(tz=UTC),
-            "generated_at_ms": now_ms,
-            "heartbeat_sec": R2C_HEARTBEAT_SEC,
-            "lease_sec": R2C_LEASE_SEC,
-        },
-    )
-
-
 @app.get("/versions", response_class=HTMLResponse)
 async def version_history(request: Request):
     return templates.TemplateResponse(
@@ -4750,7 +4705,6 @@ async def deployment_readiness(
     activity = {
         "local_coordination_connections": await r2c_hub.connection_count(),
         "recent_coordination_zones": int(active_zones or 0),
-        "dashboard_connections": manager.connection_count(),
         "video_dashboard_connections": await organization_stream_event_hub.connection_count(),
         "active_video_streams": 0,
         "active_video_requests": 0,
@@ -8593,27 +8547,6 @@ async def download_current_year_flight_logs_archive(
 
     
         
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    client_host = websocket.client.host if websocket.client else "unknown"
-    await manager.connect(websocket)
-    logger.info(
-        "live refresh websocket open: client=%s user_agent=%s",
-        client_host,
-        websocket.headers.get("user-agent", ""),
-    )
-    try:
-        while True:
-            await websocket.receive_text() # Keep connection alive
-    except WebSocketDisconnect:
-        logger.info(
-            "live refresh websocket closed: client=%s user_agent=%s",
-            client_host,
-            websocket.headers.get("user-agent", ""),
-        )
-        manager.disconnect(websocket)
-
-
 @app.websocket("/{designator}/streams/events")
 async def organization_stream_events(websocket: WebSocket, designator: str):
     """Notify an authenticated viewer only when stream lifecycle state changes."""
@@ -8696,16 +8629,13 @@ async def organization_stream_events(websocket: WebSocket, designator: str):
 
 async def serve_r2c_websocket(
         websocket: WebSocket,
-        organization_designator: Optional[str] = None):
+        organization_designator: str):
     token = websocket.headers.get(API_KEY_NAME)
     authenticated, device_credential = await authenticate_tracker_session(token)
     organization_mismatch = (
-        organization_designator is not None
-        and (
-            device_credential is None
-            or device_credential.designator.lower()
-            != organization_designator.strip().lower()
-        )
+        device_credential is None
+        or device_credential.designator.lower()
+        != organization_designator.strip().lower()
     )
     if not authenticated or organization_mismatch:
         client_host = websocket.client.host if websocket.client else "unknown"
@@ -8713,9 +8643,9 @@ async def serve_r2c_websocket(
             "r2c websocket auth rejected: client=%s organization=%s "
             "user_agent=%s %s",
             client_host,
-            organization_designator or "legacy",
+            organization_designator,
             websocket.headers.get("user-agent", ""),
-            _describe_tracker_token_mismatch(token, TRACKER_API_KEY),
+            _describe_tracker_token_mismatch(token, ""),
         )
         await websocket.close(
             code=1008,
@@ -8782,12 +8712,6 @@ async def organization_r2c_websocket_endpoint(
         designator: str):
     """Serve organization-bound R2C clients on the managed tracker path."""
     await serve_r2c_websocket(websocket, designator)
-
-
-@app.websocket("/ws/r2c")
-async def r2c_websocket_endpoint(websocket: WebSocket):
-    """Retain the unscoped endpoint for previously configured clients."""
-    await serve_r2c_websocket(websocket)
 
 
 @app.get("/{designator}", response_class=HTMLResponse)

@@ -45,7 +45,7 @@ def load_current_year_archive_endpoint():
     main_path = pathlib.Path(__file__).resolve().parents[1] / "main.py"
     source = main_path.read_text()
     start = source.index('@app.get("/flightlogs/archive/current-year"')
-    end = source.index('\n@app.websocket("/ws")', start)
+    end = source.index('\n@app.websocket("/{designator}/streams/events")', start)
     snippet = source[start:end]
     namespace = {
         "app": FakeApp(),

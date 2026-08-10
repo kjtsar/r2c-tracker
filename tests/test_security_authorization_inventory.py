@@ -193,11 +193,10 @@ class SecurityAuthorizationInventoryTest(unittest.TestCase):
         self.assertIn('PYTHON="${PYTHON_PATH}"', security_gate)
         self.assertIn("':!.secrets.baseline'", security_gate)
 
-    def test_unconfigured_legacy_tracker_token_fails_closed(self):
-        with patch.object(main, "TRACKER_API_KEY", ""):
-            authenticated, credential = asyncio.run(
-                main.authenticate_tracker_session(None)
-            )
+    def test_missing_organization_device_token_fails_closed(self):
+        authenticated, credential = asyncio.run(
+            main.authenticate_tracker_session(None)
+        )
 
         self.assertFalse(authenticated)
         self.assertIsNone(credential)

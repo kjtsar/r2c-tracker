@@ -24,7 +24,12 @@ REGION = os.environ.get("REGION", "us-west1")
 SERVICE = os.environ.get("SERVICE_NAME", "r2c-tracker-pilot")
 PUBLIC_URL = os.environ.get("CONTROL_PLANE_PUBLIC_URL", "https://r2c-tracker.com").rstrip("/")
 GATE_SECRET = os.environ.get("DEPLOYMENT_GATE_KEY_SECRET_NAME", "r2c-deployment-gate-key")
-TRACKER_SECRET = os.environ.get("TRACKER_API_KEY_SECRET_NAME", "r2c-tracker-api-key")
+RELEASE_DEVICE_SECRET = os.environ.get(
+    "R2C_RELEASE_DEVICE_TOKEN_SECRET_NAME", "r2c-release-device-token"
+)
+RELEASE_TEST_DESIGNATOR = os.environ.get(
+    "R2C_RELEASE_TEST_DESIGNATOR", "releasecheck"
+).strip().lower()
 CONFIG = os.environ.get("CLOUDSDK_ACTIVE_CONFIG_NAME", "r2c-tracker-pilot")
 
 
@@ -135,11 +140,11 @@ def is_bootstrap_gate_unavailable(error: RuntimeError) -> bool:
     return "received 404" in message or "received 503" in message
 
 
-async def websocket_smoke(base_url: str, tracker_key: str) -> None:
+async def websocket_smoke(base_url: str, designator: str, tracker_key: str) -> None:
     import websockets
 
     parsed = urlparse(base_url)
-    websocket_url = f"wss://{parsed.netloc}/ws/r2c"
+    websocket_url = f"wss://{parsed.netloc}/{designator}/ws/r2c"
     async with websockets.connect(
         websocket_url,
         additional_headers={
@@ -165,7 +170,7 @@ async def websocket_smoke(base_url: str, tracker_key: str) -> None:
 
 def regression(base_url: str, expected_version: str = "") -> None:
     gate_key = secret_value(GATE_SECRET)
-    tracker_key = secret_value(TRACKER_SECRET)
+    tracker_key = secret_value(RELEASE_DEVICE_SECRET)
     request(f"{base_url}/deployment-readiness", expected=403)
     _, live_body = request(f"{base_url}/livez")
     _, ready_body = request(f"{base_url}/readyz")
@@ -178,13 +183,13 @@ def regression(base_url: str, expected_version: str = "") -> None:
             f"Candidate reports {live.get('version')!r}; expected {expected_version!r}."
         )
     deployment_readiness(base_url, gate_key, storage_probe=True)
-    for path in ("/", "/r2c", "/versions"):
+    for path in ("/", "/versions"):
         request(f"{base_url}{path}")
     request(
         f"{base_url}/faa/notams?latitude=39.1&longitude=-121.1&radius=2",
         expected=403,
     )
-    asyncio.run(websocket_smoke(base_url, tracker_key))
+    asyncio.run(websocket_smoke(base_url, RELEASE_TEST_DESIGNATOR, tracker_key))
     print(f"Cloud regression passed against {base_url}.")
 
 

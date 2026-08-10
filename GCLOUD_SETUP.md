@@ -16,7 +16,7 @@ unchanged.
 - a Google Cloud project
 - a signed-in `gcloud` account with permission to deploy Cloud Run services
 - a SQL database reachable by SQLAlchemy via `DATABASE_URL`
-- a shared tracker token for uploads and `/ws/r2c`
+- a separate control-plane database for organizations and device enrollment
 - an admin password for the tracker web UI
 - FAA NMS OAuth credentials held by the tracker for `/faa/notams`
 
@@ -27,12 +27,12 @@ The repo currently deploys:
 - FastAPI app from this repo
 - Cloud Run service named `r2c-tracker` by default
 - Secret Manager secret for the session `SECRET_KEY`
-- externally supplied env vars for `DATABASE_URL`, `TRACKER_ADMIN_PASS`, and
-  `TRACKER_API_KEY`
+- externally supplied env vars for `DATABASE_URL`, `CONTROL_PLANE_DATABASE_URL`,
+  and `TRACKER_ADMIN_PASS`
 
 `deploy.sh` handles the Cloud Run deployment and the Secret Manager bootstrap.
 It also supports optional Secret Manager mappings for `DATABASE_URL`,
-`TRACKER_ADMIN_PASS`, and `TRACKER_API_KEY`, a Cloud SQL attachment, and a
+`TRACKER_ADMIN_PASS`, a Cloud SQL attachment, and a
 Cloud Storage volume mounted at `/flightlogs-vol`.
 
 ## 1. Create or choose a Google Cloud project
@@ -78,12 +78,12 @@ name before deploying.
 
 ## 3. Choose organization secrets
 
-You need three values before deployment:
+You need the database and service secrets before deployment:
 
 ```bash
 export DATABASE_URL='postgresql+asyncpg://...'
 export TRACKER_ADMIN_PASS='choose-a-strong-admin-password'
-export TRACKER_API_KEY='choose-a-shared-r2c-token'
+export CONTROL_PLANE_DATABASE_URL='postgresql+asyncpg://...'
 export FAA_NOTAM_CLIENT_ID='your-faa-client-id'
 export FAA_NOTAM_CLIENT_SECRET='your-faa-client-secret'
 ```
@@ -92,7 +92,8 @@ What they do:
 
 - `DATABASE_URL`: application database connection
 - `TRACKER_ADMIN_PASS`: password for `/admin`
-- `TRACKER_API_KEY`: required for uploads and `/ws/r2c` via `X-SAR-Token`
+- `CONTROL_PLANE_DATABASE_URL`: organization, user, enrollment, and device
+  credential database; it must be separate from `DATABASE_URL`
 - `FAA_NOTAM_CLIENT_ID` and `FAA_NOTAM_CLIENT_SECRET`: stored in Secret Manager
   and used only by the tracker FAA proxy; required for initial secret creation
 
@@ -123,10 +124,11 @@ What the script does:
 
 ## 5. Point RID2Caltopo zones at the tracker
 
-Each RID2Caltopo instance should be configured with:
+Enroll each RID2Caltopo instance through its organization's enrollment QR. The
+resulting configuration contains:
 
 - the tracker base URL
-- the shared tracker token
+- a revocable per-device organization credential
 - a stable `zoneId`
 - a stable `guid`
 - the target `mapId`
@@ -134,13 +136,13 @@ Each RID2Caltopo instance should be configured with:
 The coordination websocket endpoint is:
 
 ```text
-wss://YOUR_TRACKER_HOST/ws/r2c
+wss://YOUR_TRACKER_HOST/ORGANIZATION_DESIGNATOR/ws/r2c
 ```
 
 Required header:
 
 ```http
-X-SAR-Token: <TRACKER_API_KEY>
+X-SAR-Token: <organization device credential>
 ```
 
 ## 6. Verify a fresh org deployment
@@ -163,7 +165,7 @@ For another team to reproduce this setup cleanly, give them:
 
 - the repo revision or release tag
 - the exact Cloud Run service URL
-- their own `TRACKER_API_KEY`
+- an organization enrollment QR for each device
 - naming rules for `zoneId` and `guid`
 - the target Caltopo map IDs they are allowed to coordinate on
 - a short operator note that the tracker assigns only one owner per

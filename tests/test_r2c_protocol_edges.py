@@ -40,6 +40,7 @@ def load_coordination_classes():
         "UTC": UTC,
         "datetime": datetime,
         "WebSocket": type("WebSocket", (), {}),
+        "LEGACY_COORDINATION_ORGANIZATION_ID": "legacy",
         "logger": logger,
         "manager": manager,
         "R2C_HEARTBEAT_SEC": 15,
@@ -71,9 +72,23 @@ class FakeWebSocket:
         self.sent_texts.append(text)
 
 
+class LegacyScopedDict(dict):
+    def _key(self, key):
+        if isinstance(key, tuple) and len(key) == 2:
+            return ("legacy", *key)
+        return key
+
+    def __getitem__(self, key):
+        return super().__getitem__(self._key(key))
+
+    def __contains__(self, key):
+        return super().__contains__(self._key(key))
+
+
 class TestHub(BaseHub):
     def __init__(self):
         super().__init__()
+        self._owners = LegacyScopedDict()
         self.owner_state_updates = []
         self.owner_state_deletes = []
         self.recorded_sightings = []
@@ -96,11 +111,11 @@ class TestHub(BaseHub):
         return
 
     async def _upsert_owner_state(self, *args, **kwargs):
-        self.owner_state_updates.append((args, kwargs))
+        self.owner_state_updates.append((args[1:], kwargs))
         return
 
     async def _delete_owner_state(self, *args, **kwargs):
-        self.owner_state_deletes.append((args, kwargs))
+        self.owner_state_deletes.append((args[1:], kwargs))
         return
 
     async def _upsert_confirmation_state(self, *args, **kwargs):
@@ -116,7 +131,7 @@ class TestHub(BaseHub):
         return []
 
     async def _record_sighting(self, *args, **kwargs):
-        self.recorded_sightings.append((args, kwargs))
+        self.recorded_sightings.append((args[1:], kwargs))
         return
 
 

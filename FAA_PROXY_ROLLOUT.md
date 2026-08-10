@@ -28,11 +28,11 @@ secret explicitly.
 
 ## 2. Verify the deployed proxy
 
-Use a known test coordinate and the tracker token:
+Use a known test coordinate and an enrolled organization device credential:
 
 ```bash
 curl --fail-with-body \
-  -H "X-SAR-Token: ${TRACKER_API_KEY}" \
+  -H "X-SAR-Token: ${TRACKER_DEVICE_TOKEN}" \
   "${TRACKER_URL}/faa/notams?latitude=39.153&longitude=-121.133&radius=2"
 ```
 

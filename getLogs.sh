@@ -24,7 +24,7 @@ fi
 
 REQUEST_FILTER=$(cat <<EOF
 ${TIME_FILTER}
-httpRequest.requestUrl:"/ws/r2c"
+httpRequest.requestUrl=~"/[^/]+/ws/r2c"
 EOF
 )
 

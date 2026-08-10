@@ -1,8 +1,9 @@
 # R2C Control Plane Setup
 
-The control plane is deliberately separate from each tenant tracker database.
-It stores commercial metadata, organization administrators, aggregate daily
-usage, subscription state, provisioning jobs, enrollment campaigns, and an
+The control plane is deliberately separate from the operational flight and R2C
+coordination database. It stores organization/service metadata, members and
+roles, aggregate daily usage, subscription state, provisioning jobs,
+enrollment and device state, managed-video state, audit events, and an
 append-only billing ledger. It must not be pointed at `DATABASE_URL`.
 
 ## Local simulation
@@ -39,9 +40,9 @@ than 30 seconds. It does not poll while idle. Unit tests use an injected fake
 provider and do not require a cloud secret.
 
 Start the tracker and visit `/platform-admin/login`. Simulation mode creates
-commercial records, activation links, organization sessions, and QR campaigns
-but does not send email, collect payments, or create tenant resources. Device
-credential issuance may be enabled independently for the shared pilot.
+organization records, activation links, organization sessions, and QR campaigns
+but does not send email, collect payments, or provision external infrastructure.
+Device credential issuance may be enabled independently for the shared pilot.
 
 ## Billing export
 
@@ -145,16 +146,12 @@ an exact match with the current infrastructure identity. The authenticated
 platform-account setup action additionally requests `gmail.send` and stores the
 offline credential directly in Secret Manager. The runtime cannot read Gmail.
 
-For the guarded pilot, deploy the simulation-mode setup revision, sign in at
-`/platform-admin/account`, and select **Connect Gmail sender**. After consent,
-deploy live mode with the resulting secret mapped read-only:
-
-```bash
-CONTROL_PLANE_MODE=live \
-PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_SECRET_NAME=r2c-platform-email-gmail-refresh-token \
-PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_TARGET= \
-./deploy_pilot.sh APP_VERSION_CODE
-```
+When provisioning a new environment, first use an isolated setup revision,
+sign in at `/platform-admin/account`, and select **Connect Gmail sender**. After
+consent, map the resulting Secret Manager version read-only into the runtime.
+Commit and tag the live-mode configuration, then deploy it through the guarded
+candidate workflow documented below; do not route a setup revision directly to
+production.
 
 The optional STARTTLS SMTP fallback for self-hosted deployments uses:
 
@@ -180,22 +177,26 @@ The script prompts without echo, writes a new Secret Manager version, grants
 only the pilot runtime service account access, and prints the live deployment
 command. The hosted pilot uses Gmail API OAuth instead.
 
-Use a tagged, zero-traffic canary before promoting a revision:
+Use the guarded, zero-traffic candidate workflow before promoting a revision:
 
 ```bash
-ACTIVATE_LATEST_REVISION=0 \
-REVISION_TAG=admin-candidate \
-./deploy_pilot.sh 98
+./release_check.sh
+# Commit and tag the exact source.
+./deploy_candidate.sh APP_VERSION_CODE
+./test_candidate.sh
+./promote_candidate.sh
 ```
 
-Verify the tagged URL, including one authenticated FAA request, before assigning
-production traffic. Keep the prior ready revision name so rollback is an
-explicit traffic update rather than another build.
+The workflow checks live operational activity, leaves the candidate at zero
+production traffic, exercises Google Cloud dependencies and application
+protocols at the tagged URL, and records the prior revision for
+`./rollback_release.sh`.
 
-## Future test and production split
+## Future dedicated test and production split
 
-The shared pilot is temporary. Before enabling email, payments, tenant resource
-creation, or real device credentials, split the environments:
+The shared pilot already supports email and tenant-scoped device credentials.
+Before broad public use, live payments, or committed service expectations,
+split the environments:
 
 Pending organization members can activate immediately with a verified Google
 account whose email exactly matches their membership record. An activation
@@ -206,9 +207,9 @@ administration page states this explicitly.
 | --- | --- | --- |
 | Google Cloud project | dedicated test project | dedicated production project |
 | Public entry point | `test.r2c-tracker.com` | `r2c-tracker.com` |
-| Organization routing | test-only path or test subdomain | organization subdomain |
+| Organization routing | test-only designator paths | production designator paths |
 | Control-plane database | test-only PostgreSQL | production-only PostgreSQL |
-| Tenant databases/storage | synthetic data only | organization-isolated resources |
+| Operational database/storage | synthetic organization-scoped data only | production organization-scoped data and namespaced storage |
 | Signing/session keys | test-only secrets | production-only secrets |
 | Email and payments | sandbox providers | live providers |
 | QR enrollment | test credentials only | production tenant credentials |

@@ -47,6 +47,7 @@ def load_coordination_classes():
         "UTC": UTC,
         "datetime": datetime,
         "WebSocket": type("WebSocket", (), {}),
+        "LEGACY_COORDINATION_ORGANIZATION_ID": "legacy",
         "logger": logger,
         "manager": manager,
         "video_ice_server_provider": FakeVideoIceServerProvider(),
@@ -96,9 +97,34 @@ class FakeWebSocket:
         self.sent_texts.append(text)
 
 
+class LegacyScopedDict(dict):
+    def __init__(self, key_kind):
+        super().__init__()
+        self.key_kind = key_kind
+
+    def _key(self, key):
+        if self.key_kind == "map" and isinstance(key, str):
+            return ("legacy", key)
+        if self.key_kind == "owner" and isinstance(key, tuple) and len(key) == 2:
+            return ("legacy", *key)
+        return key
+
+    def __getitem__(self, key):
+        return super().__getitem__(self._key(key))
+
+    def get(self, key, default=None):
+        return super().get(self._key(key), default)
+
+    def __contains__(self, key):
+        return super().__contains__(self._key(key))
+
+
 class TestHub(BaseHub):
     def __init__(self, confirmation_store=None, zone_store=None):
         super().__init__()
+        self._zones_by_map = LegacyScopedDict("map")
+        self._owners = LegacyScopedDict("owner")
+        self._confirmed_drones_by_map = LegacyScopedDict("map")
         self.zone_state_updates = []
         self.zone_state_deletes = []
         self.owner_state_updates = []
@@ -111,12 +137,12 @@ class TestHub(BaseHub):
         return
 
     async def _upsert_zone_state(self, *args, **kwargs):
-        self.zone_state_updates.append((args, kwargs))
-        if len(args) >= 11:
-            map_id, zone_id, guid, name, lat, lng, caltopo_rtt_ms, online, last_seen_ms, reported_map_id, coordination_mode = args[:11]
-            connection_state = args[11] if len(args) >= 12 else ("online" if online else "disconnected")
-            app_version = args[12] if len(args) >= 13 else ""
-            app_version_code = args[13] if len(args) >= 14 else 0
+        self.zone_state_updates.append((args[1:], kwargs))
+        if len(args) >= 12:
+            _, map_id, zone_id, guid, name, lat, lng, caltopo_rtt_ms, online, last_seen_ms, reported_map_id, coordination_mode = args[:12]
+            connection_state = args[12] if len(args) >= 13 else ("online" if online else "disconnected")
+            app_version = args[13] if len(args) >= 14 else ""
+            app_version_code = args[14] if len(args) >= 15 else 0
             self.zone_store[(map_id, zone_id)] = {
                 "mapId": map_id,
                 "zoneId": zone_id,
@@ -136,38 +162,38 @@ class TestHub(BaseHub):
         return
 
     async def _delete_zone_state(self, *args, **kwargs):
-        self.zone_state_deletes.append((args, kwargs))
-        if len(args) >= 2:
-            self.zone_store.pop((args[0], args[1]), None)
+        self.zone_state_deletes.append((args[1:], kwargs))
+        if len(args) >= 3:
+            self.zone_store.pop((args[1], args[2]), None)
         return
 
     async def _delete_stale_zones(self, *args, **kwargs):
         return
 
     async def _upsert_owner_state(self, *args, **kwargs):
-        self.owner_state_updates.append((args, kwargs))
+        self.owner_state_updates.append((args[1:], kwargs))
         return
 
     async def _delete_owner_state(self, *args, **kwargs):
-        self.owner_state_deletes.append((args, kwargs))
+        self.owner_state_deletes.append((args[1:], kwargs))
         return
 
-    async def _upsert_confirmation_state(self, map_id, event, confirmed_at_ms):
+    async def _upsert_confirmation_state(self, organization_id, map_id, event, confirmed_at_ms):
         stored = dict(event)
         stored["confirmedAtMs"] = confirmed_at_ms
         self.confirmation_store[(map_id, event["remoteId"])] = stored
 
-    async def _delete_confirmation_state(self, map_id, remote_id):
+    async def _delete_confirmation_state(self, organization_id, map_id, remote_id):
         self.confirmation_store.pop((map_id, remote_id), None)
 
-    async def _delete_confirmation_state_for_zone(self, map_id, guid, zone_id):
+    async def _delete_confirmation_state_for_zone(self, organization_id, map_id, guid, zone_id):
         for (stored_map_id, remote_id), event in list(self.confirmation_store.items()):
             confirmed_by_guid = event.get("confirmedByGuid") or event.get("guid") or ""
             event_zone_id = event.get("zoneId") or ""
             if stored_map_id == map_id and ((guid and confirmed_by_guid == guid) or (zone_id and event_zone_id == zone_id)):
                 self.confirmation_store.pop((stored_map_id, remote_id), None)
 
-    async def _load_recent_confirmation_events(self, map_id, now_ms):
+    async def _load_recent_confirmation_events(self, organization_id, map_id, now_ms):
         cutoff_ms = now_ms - self.CONFIRMATION_RETENTION_MS
         recent_zone_cutoff_ms = now_ms - (R2C_LEASE_SEC * 1000)
         active_zone_keys = set()
@@ -272,6 +298,88 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
                 "device-1"
             ].websocket,
         )
+
+    async def test_same_map_and_remote_id_are_isolated_by_organization(self):
+        hub = TestHub()
+        org_a_socket = FakeWebSocket()
+        org_b_socket = FakeWebSocket()
+        await hub.connect(
+            org_a_socket,
+            types.SimpleNamespace(id="device-a", organization_id="org-a"),
+        )
+        await hub.connect(
+            org_b_socket,
+            types.SimpleNamespace(id="device-b", organization_id="org-b"),
+        )
+        for websocket, zone_id in (
+            (org_a_socket, "zone-a"),
+            (org_b_socket, "zone-b"),
+        ):
+            await hub.handle_message(websocket, {
+                "type": "hello",
+                "mapId": "SHARED-MAP",
+                "zoneId": zone_id,
+                "guid": zone_id,
+                "name": zone_id,
+                "lat": 39.1,
+                "lng": -121.1,
+            })
+
+        org_a_socket.sent_texts.clear()
+        org_b_socket.sent_texts.clear()
+        await hub.broadcast_zone_update("org-a", "SHARED-MAP")
+        await hub.broadcast_zone_update("org-b", "SHARED-MAP")
+        org_a_zones = json.loads(org_a_socket.sent_texts[-1])["zones"]
+        org_b_zones = json.loads(org_b_socket.sent_texts[-1])["zones"]
+        self.assertEqual(["zone-a"], [zone["zoneId"] for zone in org_a_zones])
+        self.assertEqual(["zone-b"], [zone["zoneId"] for zone in org_b_zones])
+
+        for websocket, zone_id, drone_ts in (
+            (org_a_socket, "zone-a", 2000),
+            (org_b_socket, "zone-b", 1000),
+        ):
+            await hub.handle_message(websocket, {
+                "type": "first_sighting",
+                "mapId": "SHARED-MAP",
+                "remoteId": "SHARED-RID",
+                "zoneId": zone_id,
+                "guid": zone_id,
+                "droneTs": drone_ts,
+                "distanceFromZoneM": 10.0,
+            })
+        self.assertEqual(
+            "zone-a",
+            hub._owners[("org-a", "SHARED-MAP", "SHARED-RID")]["owner_guid"],
+        )
+        self.assertEqual(
+            "zone-b",
+            hub._owners[("org-b", "SHARED-MAP", "SHARED-RID")]["owner_guid"],
+        )
+
+    async def test_standalone_proximity_does_not_cross_organizations(self):
+        hub = TestHub()
+        sockets = []
+        for organization_id, zone_id in (("org-a", "zone-a"), ("org-b", "zone-b")):
+            websocket = FakeWebSocket()
+            sockets.append(websocket)
+            await hub.connect(
+                websocket,
+                types.SimpleNamespace(
+                    id=f"device-{zone_id}",
+                    organization_id=organization_id,
+                ),
+            )
+            await hub.handle_message(websocket, {
+                "type": "hello",
+                "mapId": "",
+                "zoneId": zone_id,
+                "guid": zone_id,
+                "lat": 39.15306,
+                "lng": -121.13296,
+            })
+
+        self.assertEqual("Standalone_zone-a", hub._connections[sockets[0]].map_id)
+        self.assertEqual("Standalone_zone-b", hub._connections[sockets[1]].map_id)
 
     async def test_video_delivery_finds_orphaned_live_device_connection(self):
         credential = types.SimpleNamespace(id="device-1")

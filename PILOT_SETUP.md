@@ -21,7 +21,7 @@ does not stop resources or cap spending.
 
 ## Provisioned data resources
 
-The pilot uses separate empty `r2c_pilot_tracker` and
+The pilot uses separate `r2c_pilot_tracker` and
 `r2c_pilot_control_plane` databases and a dedicated least-privilege role on the
 existing PostgreSQL VM. The production databases used by `tracker.kjt.us` are
 not shared with the pilot. Cloud Run reaches the VM's private address through
@@ -38,11 +38,19 @@ Generated secrets:
 
 - `r2c-tracker-database-url`
 - `r2c-tracker-admin-password`
-- `r2c-tracker-api-key`
+- `r2c-deployment-gate-key`
+- `r2c-release-device-token` (dedicated credential for the `RELEASECHECK`
+  organization; read by the release workstation, not mounted in Cloud Run)
 - `r2c-tracker-secret-key`
 - `r2c-super-admin-identity` (email and display name only; dynamically read)
+- `r2c-control-plane-database-url`
+- `r2c-control-plane-signing-key`
+- `r2c-managed-request-ingest-key`
 - `r2c-google-oauth-client-id`
 - `r2c-google-oauth-client-secret`
+- `r2c-platform-email-gmail-refresh-token`
+- `r2c-cloudflare-turn-key-id`
+- `r2c-cloudflare-turn-api-token`
 
 FAA proxy secrets, created during the FAA credential migration:
 
@@ -80,24 +88,41 @@ set +a
 
 ## Deploy the pilot
 
-Do not deploy until both FAA secrets and `r2c-super-admin-identity` have an
-enabled version. Configure or rotate the administrator without restarting the
-service:
+Do not deploy until both FAA secrets, `r2c-super-admin-identity`, and the
+dedicated `r2c-release-device-token` have an enabled version. The latter must
+contain an active device credential enrolled to the `RELEASECHECK`
+organization; the release guard uses it only against
+`/releasecheck/ws/r2c`. Configure or rotate the administrator without
+restarting the service:
 
 ```bash
 ./set_super_admin.sh kjtsar@kjt.us "R2C Platform Administrator"
 ```
 
-Then run:
+Run the local release gate, commit and tag the exact source, then use the
+guarded candidate workflow:
 
 ```bash
-./deploy_pilot.sh R2C_RECOMMENDED_APP_VERSION_CODE
+./release_check.sh
+./deploy_candidate.sh R2C_RECOMMENDED_APP_VERSION_CODE
+./test_candidate.sh
+./promote_candidate.sh
 ```
 
-The wrapper pins the project, region, service, dedicated VPC network and subnet,
-bucket, service account, and Secret Manager names. It explicitly clears any
-Cloud SQL attachment and refuses to deploy if the project or service name is
-changed away from the pilot identifiers.
+The candidate command refuses a dirty or untagged worktree, blocks while the
+live service reports operational activity, and deploys the new revision with
+zero production traffic. Cloud regression checks both databases, the mounted
+bucket, public routes, authorization rejection, and the R2C WebSocket before
+promotion is allowed. Promotion repeats the checks and activity gate before an
+atomic 100-percent traffic switch. Use `./rollback_release.sh` to restore the
+recorded prior revision.
+
+The underlying pilot wrapper pins the project, region, service, dedicated VPC
+network and subnet, bucket, service account, and Secret Manager names. It
+explicitly clears any Cloud SQL attachment and refuses to deploy if the project
+or service name is changed away from the pilot identifiers. Do not invoke
+`deploy_pilot.sh` or `deploy.sh` directly for a routine hosted release because
+that bypasses the activity and candidate-regression workflow.
 
 The pilot also defaults to the FAA staging API and token endpoints used by the
 currently qualified RID2Caltopo configuration. Production FAA endpoints remain

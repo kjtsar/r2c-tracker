@@ -1,3 +1,9 @@
+v1.4.26: pending review
+* Removed the retired unscoped `/ws/r2c`, `/upload`, `/r2c`, and `/ws` surfaces plus unused public API-documentation routes; device coordination, uploads, and release regression now require organization-scoped enrollment credentials and URLs.
+* Enforced server-derived organization scope throughout R2C coordination: websocket groups, zone presence, owner leases, confirmation replay, standalone proximity grouping, recent sightings, persistence queries, cleanup, and public legacy snapshots no longer combine tenants that use the same map or Remote ID.
+* Added an additive database migration that assigns existing coordination rows to the legacy namespace, stores authenticated organization IDs on new rows, and creates composite organization/map lookup indexes.
+* Added regression coverage proving same-map and same-Remote-ID isolation across organizations and verifying migration of existing coordination tables.
+
 v1.4.25: deployed
 * Added a low-cost guarded Cloud Run release path that blocks deployment during active operational use, tests a zero-traffic candidate against cloud databases and public protocols, and separates explicit promotion from rollback.
 * Added liveness/readiness probes, a dedicated protected deployment gate, managed-video and coordination activity checks, and a release check that rejects rollback-incompatible destructive schema migrations.

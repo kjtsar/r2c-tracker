@@ -46,7 +46,7 @@ class DeployScriptTest(unittest.TestCase):
         self.assertIn("has no enabled version", script)
         self.assertIn("DATABASE_URL=${DATABASE_URL_SECRET_NAME}:latest", script)
         self.assertIn("TRACKER_ADMIN_PASS=${TRACKER_ADMIN_PASS_SECRET_NAME}:latest", script)
-        self.assertIn("TRACKER_API_KEY=${TRACKER_API_KEY_SECRET_NAME}:latest", script)
+        self.assertNotIn("TRACKER_API_KEY", script)
         self.assertIn("DEPLOYMENT_GATE_KEY=${DEPLOYMENT_GATE_KEY_SECRET_NAME}:latest", script)
         self.assertIn(
             "CONTROL_PLANE_DATABASE_URL=${CONTROL_PLANE_DATABASE_URL_SECRET_NAME}:latest",
@@ -79,7 +79,6 @@ class DeployScriptTest(unittest.TestCase):
         self.assertIn("roles/secretmanager.secretVersionAdder", script)
         self.assertIn('not os.environ.get("DATABASE_URL_SECRET_NAME")', script)
         self.assertIn('not os.environ.get("TRACKER_ADMIN_PASS_SECRET_NAME")', script)
-        self.assertIn('not os.environ.get("TRACKER_API_KEY_SECRET_NAME")', script)
         self.assertIn("--set-cloudsql-instances", script)
         self.assertIn("--clear-cloudsql-instances", script)
         self.assertIn('--network "${CLOUD_RUN_NETWORK}"', script)

@@ -22,7 +22,7 @@ This matrix records the intended trust boundary for tenant and platform interfac
 | `/{designator}/admin` and settings/members/enrollments | `require_organization_user`; route-specific role; CSRF on mutations | Organization returned by the authenticated designator/session match |
 | `/{designator}/admin/flights/**` | `require_organization_records_admin`; CSRF on mutations | Database queries include `Flight.organization_id`; archive paths require `organizations/{designator}/` confinement |
 | `/{designator}/upload` | Device credential plus `require_scoped_upload_credential` | URL designator must match credential designator; created record receives credential organization ID |
-| `/{designator}/ws/r2c` | Device credential resolved by `authenticate_tracker_session` | Credential designator must match URL designator before socket acceptance |
+| `/{designator}/ws/r2c` | Device credential resolved by `authenticate_tracker_session` | Credential designator must match URL designator before socket acceptance; the resolved organization ID namespaces all runtime groups, broadcasts, ownership/confirmation keys, standalone proximity matching, and persisted coordination queries |
 | `/{designator}/streams/events` | Active organization session, matching organization ID/designator, `video_requester` role | Event hub and status queries keyed by organization ID and requester ID |
 | `/{designator}/streams/requests/**` | Organization session, `video_requester`, CSRF on mutations | Store methods require organization ID and requester user ID to match the request |
 | `/api/v1/device-enrollment/redeem` | Signed locator, active bounded campaign, redemption checks | Returns a new credential bound to the campaign organization |
@@ -44,4 +44,4 @@ Activation, login, password reset, Google authorization start/callback, and enro
 
 ## Evidence status
 
-Current tests cover organization-scoped flight listing/export/deletion/import, namespaced archive restoration, cross-tenant log denial, organization archive/unarchive behavior, device credential scoping, and video request ownership checks. The route-inventory test is structural regression evidence; it does not replace adversarial review or a penetration test.
+Current tests cover organization-scoped flight listing/export/deletion/import, namespaced archive restoration, cross-tenant log denial, organization archive/unarchive behavior, device credential scoping, coordination isolation for identical map and Remote IDs, coordination-schema migration, and video request ownership checks. The route-inventory test is structural regression evidence; it does not replace adversarial review or a penetration test.

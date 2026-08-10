@@ -3,10 +3,9 @@
 This document is the authoritative protocol guide for RID2Caltopo instances
 coordinating through `r2c-tracker`.
 
-There is only one R2C instance coordination protocol: the authenticated
-websocket at `/ws/r2c`. The separate `/ws` websocket is the web dashboard
-live-refresh channel; it is not used by RID2Caltopo clients for drone ownership,
-relay, or confirmation coordination.
+There is only one R2C instance coordination protocol: the authenticated,
+organization-scoped websocket at `/<designator>/ws/r2c`. There is no unscoped
+coordination or dashboard-refresh websocket.
 
 The current implementation defaults to:
 
@@ -30,11 +29,14 @@ The release-critical flow is:
 
 ## Scope and assumptions
 
-- A "zone" is one RID2Caltopo client instance connected to `/ws/r2c`.
+- A "zone" is one RID2Caltopo client instance connected to
+  `/<designator>/ws/r2c`.
 - A zone should present a stable `guid` for its lifetime. Using the same value
   as `zoneId` is acceptable and is the common case.
-- Ownership is isolated by the effective coordination key. For mapped clients,
-  this is the real CalTopo `mapId`. For standalone clients, the tracker either
+- Ownership is isolated by the server-derived organization ID plus the effective
+  coordination key. The organization ID comes only from the authenticated device
+  credential and is never accepted from a client payload. For mapped clients,
+  the effective key is the real CalTopo `mapId`. For standalone clients, the tracker either
   adopts a nearby group or assigns a `Standalone_<key>` group.
 - Standalone grouping is proximity-based. It ignores incident, op-period,
   profile, and other local RID2Caltopo configuration metadata.
@@ -47,13 +49,14 @@ The release-critical flow is:
 
 ## Authentication
 
-`/ws/r2c` requires the `X-SAR-Token` header. The value must match the server's
-`TRACKER_API_KEY`.
+`/<designator>/ws/r2c` requires the `X-SAR-Token` header. The value must be an
+active per-device credential issued through that organization, and its
+organization must match the URL designator.
 
 Example request headers:
 
 ```http
-X-SAR-Token: <shared tracker token>
+X-SAR-Token: <organization device credential>
 User-Agent: RID2Caltopo/coordination
 ```
 
@@ -178,7 +181,7 @@ Before closing an idle websocket, newer clients may send:
 Effects:
 
 - the tracker records the zone as `idle` instead of `online`
-- `/r2c` can show an `IDLE` badge while the parked zone state remains recent
+- the tracker retains the parked zone state as `idle` while it remains recent
 - the client may then close the websocket to let Cloud Run stop servicing an
   active request
 
@@ -215,7 +218,9 @@ Server broadcasts when ownership is assigned or changed:
 }
 ```
 
-Ownership is determined independently for each effective `mapId + remoteId`.
+Ownership is determined independently for each authenticated
+`organizationId + effective mapId + remoteId`. The organization ID is an
+internal server boundary and is not added to client protocol messages.
 
 When multiple zones claim the same drone, the tracker chooses the better owner
 using this ordering:
@@ -390,7 +395,9 @@ This is the server's current view of map membership, not a durable audit log.
 
 ## Persistence model
 
-The tracker mirrors live coordination state into SQL:
+The tracker mirrors live coordination state into SQL. Every table includes the
+server-derived `organization_id`; every replay, update, and delete query uses it
+with the effective map key:
 
 - `r2c_zone_state`: active/recent zone presence, reported map, and coordination
   mode
@@ -399,9 +406,12 @@ The tracker mirrors live coordination state into SQL:
   replay and restart continuity
 - `r2c_recent_sighting`: recent relayed sightings for debugging
 
+Existing rows created before organization scoping migrate to a dedicated legacy
+namespace for controlled data migration. No public coordination endpoint can
+read or write that namespace.
+
 Live routing still happens in memory. Persisted state exists so a process
-restart does not fully erase recent coordination context and so `/r2c` can show
-recent state.
+restart does not fully erase recent coordination context.
 
 ## Robustness test matrix
 
@@ -416,6 +426,7 @@ Verify that owner assignment is stable across:
 - equal timestamp and distance but only one zone has `mappedId`
 - full ties resolved by lexical `guid`
 - same `remoteId` claimed on different maps
+- the same `mapId` and `remoteId` used by different organizations
 - active confirmation-sourced owner resisting a later `first_sighting`
 
 ### 2. Lease continuity

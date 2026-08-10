@@ -61,7 +61,6 @@ secret_has_enabled_version() {
 }
 
 tracker_admin_pass="$(pilot_gcloud secrets versions access latest --secret=r2c-tracker-admin-password --project="${PROJECT}")"
-tracker_api_key="$(pilot_gcloud secrets versions access latest --secret=r2c-tracker-api-key --project="${PROJECT}")"
 secret_key="$(pilot_gcloud secrets versions access latest --secret=r2c-tracker-secret-key --project="${PROJECT}")"
 control_plane_signing_key=""
 if secret_has_enabled_version r2c-control-plane-signing-key; then
@@ -83,7 +82,6 @@ umask 077
 {
   printf 'DATABASE_URL=%s\n' "${local_database_url}"
   printf 'TRACKER_ADMIN_PASS=%s\n' "${tracker_admin_pass}"
-  printf 'TRACKER_API_KEY=%s\n' "${tracker_api_key}"
   printf 'SECRET_KEY=%s\n' "${secret_key}"
   if [ -n "${local_control_plane_database_url}" ]; then
     printf 'CONTROL_PLANE_DATABASE_URL=%s\n' "${local_control_plane_database_url}"

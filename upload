@@ -1,11 +1,16 @@
 #!/bin/sh
 
+if [ -z "${TRACKER_URL:-}" ] || [ -z "${TRACKER_DESIGNATOR:-}" ] \
+  || [ -z "${TRACKER_DEVICE_TOKEN:-}" ]; then
+    echo "Set TRACKER_URL, TRACKER_DESIGNATOR, and TRACKER_DEVICE_TOKEN." >&2
+    exit 2
+fi
+
 for arg in "$@"; do
-    echo "\nUploading ${arg} to ${TRACKER_URL}..."
-    curl -X PUT "${TRACKER_URL}/upload" \
-	 -H "X-SAR-Token: $TRACKER_API_KEY" \
+    echo "\nUploading ${arg} to ${TRACKER_URL}/${TRACKER_DESIGNATOR}/upload..."
+    curl -X PUT "${TRACKER_URL}/${TRACKER_DESIGNATOR}/upload" \
+	 -H "X-SAR-Token: $TRACKER_DEVICE_TOKEN" \
 	 -H "Content-Type: application/json" \
 	 -d @"$arg"
     echo "\n\n"
 done
-

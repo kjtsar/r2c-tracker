@@ -1,245 +1,319 @@
-# R2C-Tracker
+# R2C Tracker
 
-A FastAPI-based flight log aggregator for SAR operations.
+R2C Tracker is the shared, multi-organization companion service for the
+RID2Caltopo Android and Apple applications. It provides organization-scoped
+flight records, device enrollment, multi-tablet Remote ID coordination, FAA
+NOTAM proxying, and consent-controlled managed-video signaling.
 
-## Setup
-1. `python3 -m venv .venv`
-2. `.venv/bin/python -m pip install -r requirements.txt`
-3. `source .env`
-4. `.venv/bin/python -m uvicorn main:app --reload --host 127.0.0.1 --port $TRACKER_PORT`
+RID2Caltopo and R2C Tracker are independent open-source projects. They are not
+affiliated with or endorsed by CalTopo. RID2Caltopo uses the CalTopo Teams API,
+and the project appreciates the CalTopo team's product and API support.
 
-## Environment Variables
-- `TRACKER_PORT`: unrestricted port number (i.e. 8080)
-- `TRACKER_API_KEY`: Key required for /upload
-- `TRACKER_ADMIN_PASS`: Password for the /admin portal
-- `PLATFORM_BILLING_SOURCE`: `illustrative` (default) or `bigquery`. The live
-  mode reads aggregate cost only and never queries tenant operational data.
-- `PLATFORM_BILLING_PROJECT`: Project containing the billing export dataset
-- `STRIPE_SECRET_KEY`: Stripe test or live secret key used only by the server.
-- `STRIPE_WEBHOOK_SECRET`: Signing secret for the public
-  `/billing/stripe/webhook` endpoint. Both Stripe values must be configured
-  together. Until then, organization administrators see payments as pending
-  setup and no Checkout session can be created.
-  (default `r2c-tracker-platform`).
-- `PLATFORM_BILLING_DATASET`: Billing export dataset ID (default
-  `r2c_billing_export`).
-- `PLATFORM_BILLING_INCLUDED_PROJECTS`: Required comma-separated allowlist of
-  R2C Google Cloud project IDs when live billing is enabled. Costs from other
-  projects on the billing account are excluded.
-- `CONTROL_PLANE_DATABASE_URL`: Separate SQLAlchemy async database URL for
-  commercial records, organization administrators, aggregate usage, and the
-  append-only billing ledger. Organization administration is disabled when
-  unset. For local simulation use a separate SQLite file, never `DATABASE_URL`.
-- `CONTROL_PLANE_MODE`: `simulation` (default) or `live`. Simulation stores
-  reviewable onboarding state but does not create tenant infrastructure, send
-  email, collect payments, or issue app credentials.
-- `CONTROL_PLANE_SIGNING_KEY`: At least 32 random characters used to sign
-  administrator activation and device-enrollment capabilities. Keep it in
-  Secret Manager in production.
-- `CONTROL_PLANE_PUBLIC_URL`: HTTPS base URL used in activation and enrollment
-  links (default `https://r2c-tracker.com`).
-- `DEVICE_CREDENTIAL_ISSUANCE_ENABLED`: Enables one-time QR redemption into
-  revocable, per-device tracker credentials.
-- `CONTROL_PLANE_TRACKER_BASE_URL`: Tracker URL returned to enrolled apps.
-- `SECRET_KEY`: Session-cookie signing key. It is required before organization
-  login routes are enabled.
-- `SESSION_COOKIE_HTTPS_ONLY`: Set to `true` for deployment. Live
-  organization administration remains disabled unless session cookies are
-  HTTPS-only; local simulation may leave it `false`.
-- `DATABASE_URL`: URL for the postgres database - omit to use local SQLite instead (`sqlite+aiosqlite:///./test.db`).
-- `FAA_NOTAM_CLIENT_ID`: FAA NMS OAuth client ID, used to create the tracker-side secret initially.
-- `FAA_NOTAM_CLIENT_SECRET`: FAA NMS OAuth client secret, used to create the tracker-side secret initially.
-- `FAA_NOTAM_API_BASE_URL`: Optional FAA NMS API override.
-- `FAA_NOTAM_TOKEN_URL`: Optional FAA OAuth token URL override.
-- `FAA_PROXY_CACHE_TTL_SEC`: Fresh cache lifetime for full geographic queries (default `90`).
-- `FAA_PROXY_CACHE_MAX_ENTRIES`: Per-process geographic cache bound (default `512`).
-- `FAA_PROXY_CACHE_MAX_BYTES`: Per-process cache memory bound (default `67108864`).
-- `FAA_PROXY_CACHE_MAX_ITEM_BYTES`: Largest response eligible for caching (default `8388608`).
-- `FAA_PROXY_CACHE_GRID_DEGREES`: Geographic cache cell size (default `0.002` degrees).
-- `FAA_PROXY_MAX_CONCURRENT_UPSTREAM`: Concurrent FAA request bound (default `8`).
-- define everything in .env file and pull into shell via .env prior to start.
+The hosted service is a best-effort public-safety pilot. It is provided as-is
+and as-available without a committed service level or guarantees of accuracy,
+availability, reliability, completeness, or fitness for a particular purpose.
+Operators must independently verify safety-critical information and decisions.
 
-## Features
-- GeoJSON upload parsing w/overlap detection for data integrity.
-- Weather stats during flight via archive-open-meteo
-- Day/Night calculation via Suncalc
-- Automated Leaderboard & recent flights.
-- Basic Admin and CSV Export
-- Optional RID2Caltopo multi-zone coordination hub on `/ws/r2c`
-- Authenticated FAA NOTAM proxy on `/faa/notams`; FAA credentials remain server-side.
-- Separate platform super-admin onboarding and billing control plane.
-- Organization-owned administrator roles, privacy/retention policies, and
-  signed, expiring, revocable drone-team enrollment QR campaigns.
+## Current service model
 
-## Organization administration
+One Cloud Run service supports multiple agencies. Each organization has a
+permanent designator, such as `MYSAR`, and a tenant path rooted at
+`/<designator>`.
 
-The super-admin route `/platform-admin/organizations` cannot query tenant
-flight records or logs. Its sole authorized email and display name come from
-the `latest` version of the `r2c-super-admin-identity` Secret Manager secret,
-never an application environment variable. There is no refresh timer. A login
-or privileged request reads Secret Manager only when the on-demand cache is at
-least 30 seconds old; an idle tracker performs no identity reads. Changing the
-identity invalidates the former administrator's sessions and password without
-a restart.
+Organization boundaries are enforced in several layers:
 
-Google OAuth uses the authorization-code flow with state, a one-time nonce,
-PKCE, audience/signature verification, and verified-email comparison against
-the current infrastructure identity. It stores no Google access or refresh
-token. The fallback password email contains a single-use token that expires
-after five minutes. Only its SHA-256 hash is stored. The token is carried in a
-URL fragment so it is not sent in HTTP request URLs or Cloud Run access logs.
-Existing passwords are stored as salted scrypt hashes, and the password forms
-support browser password managers. When
-the separate
-control-plane database and signing key are configured, it can create
-organization accounts in simulation mode and produce an administrator
-activation link.
+- Flight, account, enrollment, billing, audit, and managed-video queries are
+  scoped by organization ID.
+- Raw flight logs are stored below
+  `organizations/<designator>/<year>/<month>/`.
+- Android and Apple redeem a signed enrollment locator once for a revocable,
+  per-device credential bound to one organization. Long-lived administrator,
+  FAA, and unrestricted tracker secrets are not placed in enrollment QR codes.
+- Organization-bound upload and coordination routes reject a credential issued
+  for another designator.
+- The platform administrator manages organization lifecycle and service
+  metadata but has no route for reading tenant flight records or raw logs.
+- The retired global `/admin` interface is disabled by default. It exists only
+  for deliberately enabled legacy installations whose records have no
+  organization ID.
 
-Organization administrators use `/<designator>/admin`. The first
-owner may delegate billing, user, records, viewing, and video-request roles.
-Enrollment QR codes contain only a signed organization/campaign locator.
-They never embed FAA credentials, administrator passwords, or a long-lived
-tracker upload secret. When device credential issuance is enabled, Android and
-iOS exchange that locator once for a revocable per-device credential. The
-server stores only the credential hash.
+The operational database stores flights and R2C coordination state. A separate
+control-plane database stores organizations, members and roles, enrollment and
+device state, service lifecycle, aggregate usage, billing ledger entries,
+managed-video state, and security audit events. These databases must never use
+the same URL.
 
-See [CONTROL_PLANE_SETUP.md](CONTROL_PLANE_SETUP.md) for local simulation,
-BigQuery configuration, and the production safety checklist.
+## Organization privacy and lifecycle
 
-GCI maintainers rotate the authoritative identity with:
+Organization owners choose whether their flight dashboard is:
+
+- `restricted`: accessible only to signed-in members with a records role; or
+- `public`: listed in the public directory and viewable without signing in.
+
+Restricted organizations are not disclosed in the public directory, but their
+direct login route remains available. Archiving an organization reserves its
+designator and disables its site and device access without deleting its data.
+Restoration is a platform lifecycle action.
+
+When outbound email is configured, trials and grace periods generate advance
+and expiration notifications with organization archive instructions. Reaching
+a deadline does not automatically archive or shut down an organization. The
+platform administrator must make contact with an organization administrator
+before manually archiving a site.
+
+## Roles
+
+The first administrator receives every organization role and can delegate a
+smaller set to other active members.
+
+| Role | Scope |
+| --- | --- |
+| `organization_owner` | Organization settings, member and enrollment administration, records, billing, and delegated ownership actions |
+| `billing_admin` | Service status, balance, and optional funding actions |
+| `user_admin` | Members, invitations, and enrollment campaigns |
+| `records_admin` | View, export, import, delete, and restore that organization's flight records and logs |
+| `records_viewer` | View a restricted organization dashboard |
+| `video_requester` | View advertised streams and manage only the member's organization-scoped video requests |
+
+See [the authorization matrix](docs/SECURITY_AUTHORIZATION_MATRIX.md) for the
+route-by-route enforcement contract and negative-test expectations.
+
+## Main interfaces
+
+| Route | Purpose |
+| --- | --- |
+| `/` | Public directory containing only organizations that selected public records visibility |
+| `/<designator>` | Public or authenticated organization flight dashboard, according to organization policy |
+| `/<designator>/login` | Organization member sign-in |
+| `/<designator>/admin` | Organization service status, settings, members, roles, and enrollments |
+| `/<designator>/admin/flights` | Organization-scoped records export, import, deletion, archive, and restore tools |
+| `/<designator>/streams` | Consent-controlled managed-video request interface |
+| `/<designator>/upload` | Organization-bound device flight upload |
+| `/<designator>/ws/r2c` | Organization-bound coordination and managed-video signaling socket |
+| `/api/v1/device-enrollment/redeem` | One-time app enrollment exchange |
+| `/faa/notams` | Authenticated FAA NOTAM proxy; FAA credentials remain server-side |
+| `/platform-admin/organizations` | Platform organization lifecycle and service administration |
+| `/versions` | Deployed release history |
+| `/livez`, `/readyz` | Process and database health checks |
+
+Activation, login, recovery, Google OAuth, and enrollment landing routes are
+public bootstrap surfaces but remain transaction-scoped. Browser mutations use
+CSRF protection, and authorization tests inventory all organization and
+platform route families.
+
+## Capabilities
+
+- Parse RID2Caltopo GeoJSON flight submissions with duplicate/overlap checks.
+- Compute flight duration, distance, day/night classification, and bounded
+  weather summaries.
+- Render recent flights and pilot leaderboards within the selected tenant.
+- Export/import CSV metadata and bounded `.tgz`, `.tar.gz`, or `.tar` flight-log
+  archives without involving the platform administrator.
+- Coordinate Remote ID ownership, confirmations, and multi-tablet handoff over
+  authenticated WebSockets.
+- Proxy FAA NOTAM GeoJSON through a bounded, short-lived geographic cache while
+  keeping FAA credentials off mobile devices.
+- Create signed, expiring, revocable organization enrollment campaigns and
+  per-device app credentials.
+- Support password and verified Google organization login, single-use password
+  reset, and separately authenticated platform administration.
+- Advertise organization streams and coordinate request, consent, preflight,
+  signaling, stop, and aggregate-metrics state. The tracker does not ingest,
+  transcode, or record media; media follows the selected direct or TURN path.
+- Track aggregate attributed platform usage, trials, grace periods, prepaid
+  credits, and an append-only ledger. Stripe remains optional and unavailable
+  unless both server-side Stripe secrets are configured.
+
+Managed video remains separately qualified by platform and network path. See
+[the managed-video architecture](VIDEO_STREAMING_ARCHITECTURE.md) for the exact
+implemented and field-qualification boundaries.
+
+## Local verification
+
+Create the project environment:
 
 ```bash
-./set_super_admin.sh new-admin@example.org "Administrator Name"
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.lock
 ```
 
-Google client ID and secret values are mapped from the
-`r2c-google-oauth-client-id` and `r2c-google-oauth-client-secret` secrets.
-Hosted outbound mail uses the Gmail API with the send-only OAuth scope. The
-offline credential is mapped from Secret Manager; R2C Tracker stores no Google
-password and cannot read the mailbox. STARTTLS SMTP remains an optional fallback
-for self-hosted installations.
-Pending organization members can instead activate with a verified Google
-account whose email exactly matches the pending membership record.
+The quickest complete local verification is:
 
-The hosted evaluation at `r2c-tracker.com` uses live organization onboarding:
-activation invitations are delivered by the Gmail API, and an
-organization's 30-day trial starts when its primary administrator activates the
-account through a configured OAuth identity provider or creates an optional R2C
-password. Password users can request a non-enumerating, single-use reset link;
-OAuth users never need an R2C password. Billing remains shadow accounting; live
-onboarding does not collect a payment or imply production service guarantees.
-
-## FAA NOTAM Proxy
-
-RID2Caltopo calls:
-
-```text
-GET /faa/notams?latitude=39.153&longitude=-121.133&radius=2
-X-SAR-Token: <TRACKER_API_KEY>
+```bash
+./release_check.sh
 ```
 
-The response body preserves the FAA GeoJSON response shape used by Android and
-Apple. Full queries are cached briefly in small geographic cells. The upstream
-radius is expanded to cover the entire cell so a nearby cache hit cannot omit a
-notice at the requested-radius boundary. Requests containing `lastUpdatedDate`
-bypass the cache.
+It creates isolated temporary SQLite data, runs the full unit suite, starts a
+localhost server, checks public and health routes, verifies that the deployment
+gate and FAA proxy reject unauthenticated requests, and exercises the R2C
+WebSocket hello/heartbeat protocol.
 
-The cache is deliberately local, short-lived, and bounded. It works equally for
-California or nationwide users because entries are keyed by geographic cell;
-it is not a single region-wide result. Proxy failures are returned as failures,
-not stale HTTP 200 responses, so clients retain their last known results while
-showing the lookup as unavailable.
+For pilot-connected development, prepare the named Google Cloud configuration
+and a private, ignored local environment file:
 
-See [FAA_PROXY_ROLLOUT.md](FAA_PROXY_ROLLOUT.md) for deployment order, verification,
-field qualification, and legacy-client compatibility.
+```bash
+./setup_pilot_local.sh
+set -a
+. ./.env.pilot.local
+set +a
+.venv/bin/python -m uvicorn main:app \
+  --host 127.0.0.1 --port "${TRACKER_PORT}"
+```
 
-The isolated `r2c-tracker.com` pilot project, local named `gcloud`
-configuration, Cloud SQL proxy workflow, and guarded pilot deploy command are
-documented in [PILOT_SETUP.md](PILOT_SETUP.md).
+This local process uses separate SQLite tracker and control-plane databases; it
+does not reproduce Google Cloud networking, mounted Cloud Storage, PostgreSQL,
+Secret Manager injection, or Cloud Run routing. Use synthetic organizations and
+records locally. See [control-plane setup](CONTROL_PLANE_SETUP.md) for a generic
+self-hosted simulation.
 
-## Coordination Docs
-- [R2C protocol and robustness guide](/Users/kjt/Projects/r2c-tracker/R2C_PROTOCOL.md)
-- [Google Cloud reproduction/setup guide](/Users/kjt/Projects/r2c-tracker/GCLOUD_SETUP.md)
+## Important runtime configuration
 
-## Flight Archive Recovery
-For a managed organization such as `mySAR`:
+Production secrets are mapped from Secret Manager by the deployment scripts.
+Do not commit `.env` files or place secret values in command arguments.
 
-1. Sign in through `/<designator>/admin` and open **Manage flight records**.
-2. Download the organization's current full CSV and flight-log archive as a
-   backup when applicable.
-3. Ensure that organization has no flight records. Records belonging to other
-   organizations and the legacy tracker do not need to be removed.
-4. Run **Import from Flight Log Archive** using the saved
-   `.tgz/.tar.gz/.tar` file from the legacy tracker.
-5. Run **Backfill Weather and Metadata from CSV** using the saved full admin
-   CSV from the legacy tracker.
+### Core and organization control
 
-The organization import assigns every rebuilt record to the authenticated
-organization and stores each raw log below
-`organizations/<designator>/<year>/<month>/`. Organization owners and members
-with the `records_admin` role can use these tools.
+| Variable | Purpose |
+| --- | --- |
+| `DATABASE_URL` | Async SQLAlchemy URL for flight and coordination data; defaults to local SQLite |
+| `CONTROL_PLANE_DATABASE_URL` | Different async database URL for organizations, roles, enrollment, lifecycle, billing, video, and audit state |
+| `CONTROL_PLANE_MODE` | `simulation` or `live`; the hosted pilot requires `live` |
+| `CONTROL_PLANE_SIGNING_KEY` | Signs activation and enrollment capabilities; use at least 32 random characters |
+| `CONTROL_PLANE_PUBLIC_URL` | Public HTTPS origin used in links and redirects |
+| `CONTROL_PLANE_TRACKER_BASE_URL` | Tracker base URL returned to enrolled devices |
+| `SECRET_KEY` | Browser session-cookie signing key |
+| `SESSION_COOKIE_HTTPS_ONLY` | Must be `true` for hosted organization administration |
+| `DEVICE_CREDENTIAL_ISSUANCE_ENABLED` | Enables one-time redemption into revocable per-device credentials |
+| `LEGACY_ADMIN_ENABLED` | Enables retired non-organization administration only when explicitly set; defaults to `false` |
+| `DEPLOYMENT_GATE_KEY` | Dedicated bearer secret protecting `/deployment-readiness` |
+| `MANAGED_REQUEST_INGEST_KEY` | Authenticates managed-access requests forwarded from the public website |
 
-For a legacy, non-organization tracker rebuild:
+### Identity, email, billing, and video
 
-1. Download the full admin CSV export from `/export` as a backup and metadata source.
-2. Download the flight log archive from `/flightlogs/archive`.
-3. Empty the `flights` table and clear the `flightlogs-vol` bucket contents.
-4. Deploy the current app version so the `archive_relpath` schema and archive import tools are available.
-5. In `/admin`, run `Import from Flight Log Archive` using the saved `.tgz/.tar.gz/.tar` file.
-6. In `/admin`, run `Backfill Weather and Metadata from CSV` using the saved full admin CSV.
+- Google organization and platform login use `GOOGLE_OAUTH_CLIENT_ID` and
+  `GOOGLE_OAUTH_CLIENT_SECRET`.
+- Hosted send-only Gmail uses `PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN` and
+  `PLATFORM_EMAIL_FROM`; STARTTLS SMTP variables remain an optional fallback.
+- Live aggregate billing uses `PLATFORM_BILLING_SOURCE=bigquery`, an explicit
+  project/dataset, and the mandatory `PLATFORM_BILLING_INCLUDED_PROJECTS`
+  allowlist. It does not query tenant operational data.
+- Optional payments require both `STRIPE_SECRET_KEY` and
+  `STRIPE_WEBHOOK_SECRET`; otherwise Checkout is disabled.
+- Direct/Routed preflight uses `VIDEO_ICE_SERVERS_JSON`. The pilot obtains
+  short-lived TURN credentials from `CLOUDFLARE_TURN_KEY_ID` and
+  `CLOUDFLARE_TURN_API_TOKEN` when configured.
 
-Notes:
-- Archive import rebuilds the database from GeoJSON flight logs and writes fresh archive files named with the new DB flight ID.
-- CSV backfill restores weather and other DB-only fields when a rebuilt flight can be matched safely.
-- Some historically deleted or mislabeled flights may remain unmatched during CSV backfill, which is expected.
+### FAA and bounded uploads
 
-## Tests
-Run the coordination tests with:
+The FAA proxy reads `FAA_NOTAM_CLIENT_ID`, `FAA_NOTAM_CLIENT_SECRET`, optional
+API/token URL overrides, request timeout, cache size/TTL/grid limits, and the
+upstream concurrency bound. Archive restore limits are controlled by
+`MAX_ARCHIVE_UPLOAD_BYTES`, `MAX_ARCHIVE_MEMBERS`,
+`MAX_FLIGHT_LOG_MEMBERS`, `MAX_FLIGHT_LOG_BYTES`, and
+`MAX_ARCHIVE_EXPANDED_BYTES`.
 
-`python3 -m unittest discover -s tests -p "test_*.py"`
+The full deployment mapping and guarded pilot defaults are authoritative in
+[`deploy.sh`](deploy.sh) and [`deploy_pilot.sh`](deploy_pilot.sh).
 
-These exercise owner selection, relayed sightings, and heartbeat/lease expiry
-without requiring filesystem persistence.
+## Organization records and migration
 
-The suite also covers deterministic tie-breaking, map isolation, lease refresh
-behavior, and owner-release edge cases for the multi-zone coordination path.
+Organization owners and records administrators control their own records:
 
-For higher-confidence release checks, `tests/test_r2c_scenarios.py` simulates
-multi-zone timelines with overlapping drone sightings, disconnect/expiry
-handoffs, and deterministic ownership assertions.
+1. Sign in at `/<designator>/admin` and open **Manage flight records**.
+2. Export the full organization CSV and flight-log archive.
+3. Delete or retain records according to the organization's policy.
+4. Restore raw logs with **Import from Flight Log Archive**.
+5. Restore matching DB-only weather and metadata with
+   **Backfill Weather and Metadata from CSV**.
 
-## Release Verification
-Run the local release gate before deploying:
+Every query is filtered by organization ID, and restored logs remain in the
+organization's namespaced storage path. The platform administrator does not
+approve or perform routine organization export, deletion, or restoration.
 
-`./release_check.sh`
+Legacy non-organization recovery routes remain in the source for historical
+installations but are disabled by default in the shared pilot.
 
-The release check uses an isolated temporary SQLite database, runs the full
-Python unit suite, starts a local tracker on `127.0.0.1:18080`, verifies `/`,
-`/r2c`, and `/versions`, then performs an authenticated `/ws/r2c` hello smoke
-test. Override `TRACKER_RELEASE_CHECK_PORT` if that port is already in use.
+## Tests and security gate
 
-### Guarded pilot deployment
+Useful focused commands are:
 
-The pilot release path keeps production traffic on the current revision until
-the candidate passes tests against Google Cloud databases, storage mounting,
-HTTP routing, authentication rejection, and the coordination WebSocket.
+```bash
+.venv/bin/python -m unittest discover -s tests -p 'test_*.py'
+.venv/bin/python -m unittest tests.test_r2c_scenarios
+./scripts/security_checks.sh
+```
 
-1. Run `./release_check.sh` and commit/tag the exact source being released.
-2. Run `./deploy_candidate.sh APP_VERSION_CODE`. This refuses to deploy when
-   the live service reports recent coordination, dashboard, or video activity.
-3. Re-run the cloud checks at any time with `./test_candidate.sh`.
-4. Run `./promote_candidate.sh` for an atomic 100-percent traffic switch after
-   another activity check.
-5. If the promoted release is unhealthy, run `./rollback_release.sh` to route
-   100 percent back to the recorded prior revision.
+The security gate runs authorization regression tests, dependency auditing,
+medium/high static analysis, tracked-source secret scanning, and CycloneDX SBOM
+generation. It does not replace independent adversarial review or physical
+Android/Apple field qualification.
 
-The one-time first deployment of the gate itself requires
-`./deploy_candidate.sh APP_VERSION_CODE --bootstrap` after manually confirming
-the pilot is idle, followed by `./promote_candidate.sh --bootstrap` after a
-second manual idle check. Do not use `--bootstrap` after the serving revision
-exposes `/deployment-readiness`.
+## Guarded pilot releases
 
-Candidate deployments still start against the shared databases, so startup
-migrations must remain backward-compatible with the prior revision. The local
-release gate rejects table/column drops and renames; changes requiring those
-operations need a separately reviewed expand/migrate/contract maintenance plan.
+Do not deploy the hosted pilot with `deploy.sh` or `deploy_pilot.sh` directly.
+The supported workflow keeps production on the current revision while testing
+a tagged candidate against the real Google Cloud dependencies:
+
+```bash
+./release_check.sh
+# Commit and tag the exact source first.
+./deploy_candidate.sh APP_VERSION_CODE
+./test_candidate.sh
+./promote_candidate.sh
+```
+
+`deploy_candidate.sh`:
+
+1. refuses a dirty or untagged worktree;
+2. reads the protected production activity gate and stops when coordination,
+   dashboard, stream, or video-request activity is present;
+3. deploys the candidate with zero production traffic;
+4. tests liveness, both databases, mounted-storage write/read/delete, public
+   routes, authorization rejection, and the coordination WebSocket against the
+   candidate URL; and
+5. records the candidate and previous revision locally under the ignored
+   `.release-state/` directory.
+
+`promote_candidate.sh` repeats the regression, waits for its synthetic
+heartbeat to expire, checks production activity again, and atomically routes
+100 percent to the candidate. If immediate post-promotion health or version
+verification fails, it automatically restores the prior revision.
+
+For a later operational problem, explicitly run:
+
+```bash
+./rollback_release.sh
+```
+
+The `--bootstrap` option was used only to install the deployment gate in
+v1.4.25. It must not be used now that the live service exposes
+`/deployment-readiness`.
+
+Cloud Run remains limited to one instance because coordination and browser
+connection state are process-local. Percentage traffic splitting is therefore
+not approved. Candidate releases may start against the shared databases only
+when the activity gate is idle, and startup migrations must remain compatible
+with the prior revision. The local release gate rejects table/column drops and
+renames; destructive changes require a separately reviewed
+expand/migrate/contract maintenance plan.
+
+See [the pilot environment guide](PILOT_SETUP.md) and
+[platform continuity runbook](docs/PLATFORM_CONTINUITY_RUNBOOK.md).
+
+## Additional documentation
+
+- [Release runbook](RELEASE.md)
+- [R2C coordination protocol](R2C_PROTOCOL.md)
+- [FAA proxy rollout and compatibility](FAA_PROXY_ROLLOUT.md)
+- [Managed-video architecture](VIDEO_STREAMING_ARCHITECTURE.md)
+- [Control-plane setup](CONTROL_PLANE_SETUP.md)
+- [Authorization matrix](docs/SECURITY_AUTHORIZATION_MATRIX.md)
+- [Incident response](docs/INCIDENT_RESPONSE_RUNBOOK.md)
+- [Security monitoring standard](docs/SECURITY_MONITORING_STANDARD.md)
+- [Platform continuity](docs/PLATFORM_CONTINUITY_RUNBOOK.md)
+- [Public-safety boundary review](docs/PUBLIC_SAFETY_BOUNDARY_REVIEW.md)
+- [Security policy](SECURITY.md)
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).

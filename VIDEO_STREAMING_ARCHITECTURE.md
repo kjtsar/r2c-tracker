@@ -49,7 +49,7 @@ Every transition is server-validated, organization-scoped, and auditable.
 ## Presence and ordering
 
 An enrolled device advertises at most four active streams over its existing
-authenticated `/ws/r2c` connection. Each advertisement contains:
+authenticated `/<designator>/ws/r2c` connection. Each advertisement contains:
 
 ```json
 {

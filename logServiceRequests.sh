@@ -26,8 +26,7 @@ gcloud logging read "
 resource.type=\"cloud_run_revision\"
 resource.labels.service_name=\"r2c-tracker\"
 logName:\"run.googleapis.com%2Frequests\"
-httpRequest.requestUrl:(\"/r2c\" OR \"/ws\")
+httpRequest.requestUrl=~\"/[^/]+/(ws/r2c|streams/events)\"
 timestamp>=\"$START_TS\"
 timestamp<\"$END_TS\"
 " --limit=200 --format=json >r2cOrWsServices.json
-

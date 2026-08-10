@@ -33,6 +33,7 @@ def load_coordination_classes():
         "UTC": UTC,
         "datetime": datetime,
         "WebSocket": type("WebSocket", (), {}),
+        "LEGACY_COORDINATION_ORGANIZATION_ID": "legacy",
         "logger": logger,
         "manager": manager,
         "R2C_HEARTBEAT_SEC": 15,
@@ -63,9 +64,30 @@ class FakeWebSocket:
         self.sent_texts.append(text)
 
 
+class LegacyScopedDict(dict):
+    def __init__(self, key_kind):
+        super().__init__()
+        self.key_kind = key_kind
+
+    def _key(self, key):
+        if self.key_kind == "map" and isinstance(key, str):
+            return ("legacy", key)
+        if self.key_kind == "owner" and isinstance(key, tuple) and len(key) == 2:
+            return ("legacy", *key)
+        return key
+
+    def __getitem__(self, key):
+        return super().__getitem__(self._key(key))
+
+    def __contains__(self, key):
+        return super().__contains__(self._key(key))
+
+
 class ScenarioHub(BaseHub):
     def __init__(self):
         super().__init__()
+        self._owners = LegacyScopedDict("owner")
+        self._zones_by_map = LegacyScopedDict("map")
         self.owner_upserts = []
         self.owner_deletes = []
         self.recorded_sightings = []
@@ -138,12 +160,13 @@ class ScenarioRunner:
         return self.hub._owners[(map_id, remote_id)]["owner_guid"]
 
     def owner_count_for_map(self, map_id: str) -> int:
-        return sum(1 for key in self.hub._owners if key[0] == map_id)
+        return sum(1 for key in self.hub._owners if key[1] == map_id)
 
     def owner_assignments(self):
         return {
             (map_id, remote_id): owner["owner_guid"]
-            for (map_id, remote_id), owner in self.hub._owners.items()
+            for (organization_id, map_id, remote_id), owner in self.hub._owners.items()
+            if organization_id == "legacy"
         }
 
     def messages_for(self, zone_id: str, message_type: str):
