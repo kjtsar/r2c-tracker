@@ -64,6 +64,12 @@
       outline: 3px solid #0b63c9;
       outline-offset: 3px;
   }
+  .stream-preview-image {
+      transition: opacity 180ms ease;
+  }
+  .stream-preview-image.is-refreshing {
+      opacity: 0.55;
+  }
   .cancel-button {
       border: 0;
       padding: 0;
@@ -269,7 +275,7 @@
         </thead>
         <tbody>
         {% for stream in streams %}
-          <tr>
+          <tr data-stream-session-id="{{ stream.session_id }}">
             <td>
               {% if stream.thumbnail_revision %}
               {% if stream.session_id not in request_in_progress_session_ids %}
@@ -281,22 +287,28 @@
                 <button class="preview-button" type="submit"
                         aria-label="{% if stream.media_kind == 'recording' %}Play{% else %}Request{% endif %} {{ stream.drone_designator }} {{ stream.media_kind }} video">
                   <img
-                    src="/r2c-thumbnail/{{ stream_tablet_codes[stream.session_id] }}/{{ stream.session_id }}.jpg"
+                    class="stream-preview-image"
+                    data-stream-session-id="{{ stream.session_id }}"
+                    data-thumbnail-revision="{{ stream.thumbnail_revision }}"
+                    src="/r2c-thumbnail/{{ stream_tablet_codes[stream.session_id] }}/{{ stream.session_id }}.jpg?rev={{ stream.thumbnail_revision|urlencode }}"
                     alt="{{ stream.drone_designator }} {{ stream.media_kind }} preview"
                     loading="lazy"
                     style="display:block;width:160px;max-height:100px;object-fit:cover;border-radius:6px"
                   >
-                  <span class="secondary" style="display:block">Session snapshot</span>
+                  <span class="secondary" style="display:block">Viewer preview</span>
                 </button>
               </form>
               {% else %}
               <img
-                src="/r2c-thumbnail/{{ stream_tablet_codes[stream.session_id] }}/{{ stream.session_id }}.jpg"
+                class="stream-preview-image"
+                data-stream-session-id="{{ stream.session_id }}"
+                data-thumbnail-revision="{{ stream.thumbnail_revision }}"
+                src="/r2c-thumbnail/{{ stream_tablet_codes[stream.session_id] }}/{{ stream.session_id }}.jpg?rev={{ stream.thumbnail_revision|urlencode }}"
                 alt="{{ stream.drone_designator }} {{ stream.media_kind }} preview"
                 loading="lazy"
                 style="display:block;width:160px;max-height:100px;object-fit:cover;background:#111;border-radius:6px"
               >
-              <span class="secondary" style="display:block">Session snapshot</span>
+              <span class="secondary" style="display:block">Viewer preview</span>
               {% endif %}
               {% else %}
               <span class="secondary">Preview pending</span>
@@ -483,9 +495,11 @@
 <div id="streams-live-status"
      hidden
      data-designator="{{ organization.designator|lower }}"
-     data-active="{{ 'true' if stream_status_active else 'false' }}"
-     data-revision="{{ stream_status_revision }}"></div>
-<script src="/static/organization_streams_live.js?v=20260811-1" defer></script>
+     data-device-id="{{ tablet_device_id }}"
+     data-stream-filter="{{ stream_filter }}"
+     data-membership-revision="{{ stream_membership_revision }}"
+     data-status-url="/{{ organization.designator|lower }}/streams/live-status"></div>
+<script src="/static/organization_streams_live.js?v=20260811-2" defer></script>
 {% if active_preflight_request_id %}
 <script src="/static/video_preflight.js?v=20260811-1" defer></script>
 {% endif %}

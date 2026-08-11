@@ -5,16 +5,22 @@
   if (!state) return;
 
   const designator = state.dataset.designator || "";
-  const renderedActive = state.dataset.active === "true";
-  const renderedRevision = state.dataset.revision || "";
+  const deviceId = state.dataset.deviceId || "";
+  const streamFilter = state.dataset.streamFilter || "";
+  const renderedMembershipRevision = state.dataset.membershipRevision || "";
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const eventUrl = `${protocol}//${window.location.host}/${encodeURIComponent(designator)}/streams/events`;
+  const query = new URLSearchParams();
+  if (deviceId) query.set("device", deviceId);
+  if (streamFilter) query.set("stream", streamFilter);
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  const eventUrl = `${protocol}//${window.location.host}/${encodeURIComponent(designator)}/streams/events${suffix}`;
+  const statusUrl = `${state.dataset.statusUrl || ""}${suffix}`;
   let retryDelayMs = 1000;
   let timer = null;
   let stopped = false;
   let socket = null;
-  let pendingReload = false;
-  let pendingReloadTimer = null;
+  let refreshPromise = null;
+  let refreshQueued = false;
   let windowFocused = document.hasFocus();
 
   function pageHasFocus() {
@@ -34,53 +40,74 @@
   function stopForNavigation() {
     stopped = true;
     window.clearTimeout(timer);
-    window.clearTimeout(pendingReloadTimer);
     if (socket) socket.close();
   }
 
-  // A lifecycle event can arrive while a request/cancel form is navigating.
-  // Let that navigation (and its preflight query parameter) win instead of
-  // reloading the old URL from the WebSocket callback.
   document.addEventListener("submit", stopForNavigation, true);
 
-  function preflightIsBusy() {
-    const preflight = document.getElementById("video-preflight");
-    if (!preflight) return false;
-    return !["complete", "error"].includes(preflight.dataset.state || "");
-  }
-
-  function preflightOwnsLifecycle() {
-    // The preflight controller already polls the request and performs the one
-    // intentional navigation after the pilot/VO decision.  Reloading this
-    // page for intermediate request notifications causes the stable session
-    // snapshot (and the rest of the page) to flash repeatedly.
-    return Boolean(document.getElementById("video-preflight"));
-  }
-
-  function mediaIsBusy() {
-    const media = document.getElementById("video-media");
-    if (!media) return false;
-    return !["error", "ended"].includes(media.dataset.state || "");
-  }
-
-  function reloadWhenIdle() {
+  function reloadForMembershipChange() {
     if (stopped) return;
-    if (preflightIsBusy() || mediaIsBusy()) {
-      pendingReload = true;
-      window.clearTimeout(pendingReloadTimer);
-      pendingReloadTimer = window.setTimeout(reloadWhenIdle, 1000);
-      return;
-    }
-    pendingReload = false;
     stopped = true;
+    suspend();
     window.location.reload();
   }
 
-  function readyStateDiffers(message) {
-    if (message.revision && renderedRevision) {
-      return message.revision !== renderedRevision;
+  function previewImage(sessionId) {
+    return Array.from(document.querySelectorAll(".stream-preview-image"))
+      .find((image) => image.dataset.streamSessionId === sessionId);
+  }
+
+  function updatePreview(item) {
+    const image = previewImage(item.sessionId);
+    if (!image || !item.thumbnailUrl) return;
+    if (image.dataset.thumbnailRevision === item.thumbnailRevision) return;
+
+    image.classList.add("is-refreshing");
+    const replacement = new Image();
+    replacement.onload = function () {
+      image.src = item.thumbnailUrl;
+      image.dataset.thumbnailRevision = item.thumbnailRevision;
+      image.classList.remove("is-refreshing");
+    };
+    replacement.onerror = function () {
+      image.classList.remove("is-refreshing");
+    };
+    replacement.src = item.thumbnailUrl;
+  }
+
+  async function fetchAndReconcile() {
+    if (stopped || !statusUrl) return;
+    const response = await fetch(statusUrl, {
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) throw new Error(`Stream status ${response.status}`);
+    const status = await response.json();
+    if (status.membershipRevision !== renderedMembershipRevision) {
+      reloadForMembershipChange();
+      return;
     }
-    return typeof message.active === "boolean" && message.active !== renderedActive;
+    (status.streams || []).forEach(updatePreview);
+  }
+
+  function reconcile() {
+    if (refreshPromise) {
+      refreshQueued = true;
+      return refreshPromise;
+    }
+    refreshPromise = fetchAndReconcile()
+      .catch(function () {
+        // The socket's reconnect/backoff will provide the next reconciliation.
+      })
+      .finally(function () {
+        refreshPromise = null;
+        if (refreshQueued && !stopped) {
+          refreshQueued = false;
+          reconcile();
+        }
+      });
+    return refreshPromise;
   }
 
   function scheduleReconnect(delayMs) {
@@ -103,20 +130,11 @@
       } catch (_error) {
         return;
       }
-      if (message.type === "ready" && readyStateDiffers(message)) {
-        if (preflightOwnsLifecycle()) return;
-        reloadWhenIdle();
-      } else if (message.type === "streams_changed") {
-        if (preflightOwnsLifecycle()) return;
-        // Do not tear down an in-flight preflight or media connection. Keep
-        // the refresh pending and apply it as soon as that operation reaches
-        // a terminal UI state.
-        reloadWhenIdle();
+      if (message.type === "ready" || message.type === "streams_changed") {
+        reconcile();
       }
     };
     connectedSocket.onclose = function () {
-      // A delayed close from a socket suspended during blur must not clear a
-      // newer socket opened after focus returned.
       if (socket !== connectedSocket) return;
       socket = null;
       if (!stopped && pageHasFocus()) {
@@ -134,16 +152,10 @@
       suspend();
       return;
     }
-    if (pendingReload) {
-      reloadWhenIdle();
-      return;
-    }
     if (!stopped && !socket) scheduleReconnect(0);
   }
 
   function handleFocus() {
-    // Some browsers dispatch focus before document.hasFocus() changes. Keep
-    // explicit window state so returning to the page always reconnects.
     windowFocused = true;
     syncPageActivity();
   }

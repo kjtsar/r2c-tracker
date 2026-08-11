@@ -36,7 +36,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.status import HTTP_403_FORBIDDEN
 from starlette.middleware.sessions import SessionMiddleware
 
-from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -1340,6 +1340,10 @@ class R2CCoordinationHub:
                     asyncio.create_task(
                         organization_stream_event_hub.broadcast(payload.strip())
                     )
+                elif channel == "r2c_video_thumbnail_preview":
+                    asyncio.create_task(
+                        self._deliver_notified_video_thumbnail_preview(payload)
+                    )
                 elif channel == "r2c_video_preflight":
                     asyncio.create_task(
                         self._deliver_notified_video_preflight_offer(payload)
@@ -1371,6 +1375,10 @@ class R2CCoordinationHub:
                     "r2c_stream_change",
                     receive_notification,
                 )
+                await connection.add_listener(
+                    "r2c_video_thumbnail_preview",
+                    receive_notification,
+                )
                 retry_seconds = 1
                 await wake.wait()
             except asyncio.CancelledError:
@@ -1392,6 +1400,18 @@ class R2CCoordinationHub:
                             "Managed video notification connection close failed",
                             exc_info=True,
                         )
+
+    async def _deliver_notified_video_thumbnail_preview(self, payload: str):
+        try:
+            message = json.loads(payload)
+            await self.send_video_thumbnail_preview(
+                device_credential_id=str(
+                    message.get("deviceCredentialId", "")
+                ).strip(),
+                ttl_seconds=int(message.get("ttlSec", 25) or 25),
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            logger.warning("Invalid managed thumbnail preview notification")
 
     async def _deliver_notified_video_stream_request(
         self,
@@ -2335,6 +2355,38 @@ class R2CCoordinationHub:
         except Exception:
             logger.warning(
                 "Managed video preflight offer delivery failed",
+                exc_info=True,
+            )
+            return False
+
+    async def send_video_thumbnail_preview(
+        self,
+        *,
+        device_credential_id: str,
+        ttl_seconds: int = 25,
+    ) -> bool:
+        """Renew a bounded thumbnail-preview lease on one connected tablet."""
+        safe_ttl = max(10, min(int(ttl_seconds), 60))
+        async with self._lock:
+            connections = self._device_connections_locked(device_credential_id)
+            connection = connections[0] if connections else None
+            websocket = connection.websocket if connection is not None else None
+        if websocket is None:
+            return False
+        try:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "video_thumbnail_preview",
+                        "ttlSec": safe_ttl,
+                    }
+                )
+            )
+            return True
+        except Exception:
+            logger.warning(
+                "Managed thumbnail preview delivery failed for device=%s",
+                device_credential_id,
                 exc_info=True,
             )
             return False
@@ -7516,6 +7568,9 @@ async def organization_streams(
             "organization_identity_name": user.display_name,
             "tablet_device": tablet_device,
             "tablet_code": clean_tablet_code,
+            "tablet_device_id": (
+                tablet_device.id if tablet_device is not None else ""
+            ),
             "stream_filter": clean_stream,
             "active_preflight_request_id": active_preflight_request_id,
             "active_media_request_id": active_media_request_id,
@@ -7525,7 +7580,9 @@ async def organization_streams(
             ),
             "video_ice_servers": video_ice_servers,
             "stream_status_active": stream_status["active"],
-            "stream_status_revision": stream_status["revision"],
+            "stream_membership_revision": stream_status[
+                "membership_revision"
+            ],
         },
         headers={
             "Cache-Control": "private, no-store",
@@ -7588,6 +7645,7 @@ def organization_stream_status(streams, requests) -> dict:
     )
     return {
         "revision": hashlib.sha256(encoded).hexdigest()[:20],
+        "membership_revision": stream_membership_revision(streams),
         # Passive page refresh is driven by an advertised R2C stream, not by a
         # request that can outlive the tablet which advertised it.  Explicit
         # preflight/media scripts continue to own their active operations.
@@ -7597,6 +7655,15 @@ def organization_stream_status(streams, requests) -> dict:
         ),
         "next_expiry": min(expiry_boundaries) if expiry_boundaries else None,
     }
+
+
+def stream_membership_revision(streams) -> str:
+    """Identify the rendered stream set without volatile source telemetry."""
+    encoded = json.dumps(
+        sorted(stream.session_id for stream in streams),
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:20]
 
 
 @app.post("/{designator}/streams/{session_id}/request")
@@ -8980,8 +9047,73 @@ async def download_current_year_flight_logs_archive(
 
     
         
+@app.get("/{designator}/streams/live-status")
+async def organization_stream_live_status(
+        request: Request,
+        designator: str,
+        device: str = "",
+        stream: str = ""):
+    """Return the small, authenticated model used for in-place previews."""
+    organization, _user = await require_organization_user(
+        request,
+        designator,
+        ("video_requester",),
+    )
+    streams = await control_plane_store.list_active_video_streams(
+        organization.id
+    )
+    clean_device_id = device.strip()
+    clean_stream = stream.strip().lower()
+    if clean_device_id:
+        streams = tuple(
+            item for item in streams
+            if item.device_credential_id == clean_device_id
+        )
+    if clean_stream:
+        streams = tuple(
+            item for item in streams
+            if item.drone_designator.strip().lower() == clean_stream
+        )
+    values = []
+    for item in streams:
+        revision = item.thumbnail_revision.strip()
+        thumbnail_url = ""
+        if revision:
+            thumbnail_url = (
+                "/r2c-thumbnail/"
+                f"{tablet_link_code(organization.designator, item.device_name)}/"
+                f"{quote(item.session_id, safe='')}.jpg?"
+                + urlencode({"rev": revision})
+            )
+        source_label = "Source details pending"
+        if item.source_width and item.source_height:
+            source_label = f"{item.source_width}×{item.source_height}"
+            if item.source_fps:
+                source_label += f" at {item.source_fps:.1f} fps"
+        values.append({
+            "sessionId": item.session_id,
+            "thumbnailRevision": revision,
+            "thumbnailUrl": thumbnail_url,
+            "sourceLabel": source_label,
+        })
+    return JSONResponse(
+        {
+            "membershipRevision": stream_membership_revision(streams),
+            "streams": values,
+        },
+        headers={
+            "Cache-Control": "private, no-store",
+            "Referrer-Policy": "no-referrer",
+        },
+    )
+
+
 @app.websocket("/{designator}/streams/events")
-async def organization_stream_events(websocket: WebSocket, designator: str):
+async def organization_stream_events(
+        websocket: WebSocket,
+        designator: str,
+        device: str = "",
+        stream: str = ""):
     """Notify an authenticated viewer only when stream lifecycle state changes."""
     if not organization_site_ready():
         await websocket.close(code=1013, reason="Organization site unavailable")
@@ -9001,6 +9133,31 @@ async def organization_stream_events(websocket: WebSocket, designator: str):
         await websocket.close(code=1008, reason="Organization login required")
         return
 
+    clean_device_id = device.strip()
+    clean_stream = stream.strip().lower()
+
+    async def renew_thumbnail_preview() -> None:
+        if not clean_device_id:
+            return
+        active_streams = await control_plane_store.list_active_video_streams(
+            organization.id
+        )
+        if not any(
+            stream.device_credential_id == clean_device_id
+            for stream in active_streams
+        ):
+            return
+        delivered = await r2c_hub.send_video_thumbnail_preview(
+            device_credential_id=clean_device_id,
+            ttl_seconds=25,
+        )
+        if not delivered:
+            await control_plane_store.notify_video_thumbnail_preview(
+                organization_id=organization.id,
+                device_credential_id=clean_device_id,
+                ttl_seconds=25,
+            )
+
     async def current_status():
         streams, requests = await asyncio.gather(
             control_plane_store.list_active_video_streams(organization.id),
@@ -9009,6 +9166,16 @@ async def organization_stream_events(websocket: WebSocket, designator: str):
                 requester_user_id=user.id,
             ),
         )
+        if clean_device_id:
+            streams = tuple(
+                item for item in streams
+                if item.device_credential_id == clean_device_id
+            )
+        if clean_stream:
+            streams = tuple(
+                item for item in streams
+                if item.drone_designator.strip().lower() == clean_stream
+            )
         return organization_stream_status(streams, requests)
 
     await organization_stream_event_hub.connect(organization.id, websocket)
@@ -9018,8 +9185,10 @@ async def organization_stream_events(websocket: WebSocket, designator: str):
             "type": "ready",
             "active": status_snapshot["active"],
             "revision": status_snapshot["revision"],
+            "membershipRevision": status_snapshot["membership_revision"],
         })
         while True:
+            await renew_thumbnail_preview()
             expiry = status_snapshot["next_expiry"]
             # PostgreSQL notifications are the fast path.  Reconcile over the
             # already-open focused-page socket as a bounded fallback so a
@@ -9032,6 +9201,8 @@ async def organization_stream_events(websocket: WebSocket, designator: str):
             timeout_seconds = (
                 1.0 if status_snapshot["awaiting_approval"] else 30.0
             )
+            if clean_device_id:
+                timeout_seconds = min(timeout_seconds, 10.0)
             if expiry is not None:
                 expiry = expiry if expiry.tzinfo else expiry.replace(tzinfo=UTC)
                 timeout_seconds = min(

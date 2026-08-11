@@ -283,6 +283,25 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
             payload["iceServers"][0]["credential"],
         )
 
+    async def test_thumbnail_preview_lease_is_bounded_and_device_scoped(self):
+        self.hub._connections_by_device_credential_id["device-1"] = (
+            types.SimpleNamespace(websocket=self.ws_alpha)
+        )
+
+        delivered = await self.hub.send_video_thumbnail_preview(
+            device_credential_id="device-1",
+            ttl_seconds=300,
+        )
+
+        self.assertTrue(delivered)
+        payload = json.loads(self.ws_alpha.sent_texts[-1])
+        self.assertEqual("video_thumbnail_preview", payload["type"])
+        self.assertEqual(60, payload["ttlSec"])
+        self.assertFalse(await self.hub.send_video_thumbnail_preview(
+            device_credential_id="device-2",
+            ttl_seconds=25,
+        ))
+
     async def test_device_reconnect_close_restores_still_live_connection(self):
         credential = types.SimpleNamespace(id="device-1")
         original = FakeWebSocket()

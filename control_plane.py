@@ -1359,6 +1359,43 @@ class ControlPlaneStore:
                 select(func.pg_notify("r2c_stream_change", organization_id))
             )
 
+    async def notify_video_thumbnail_preview(
+        self,
+        *,
+        organization_id: str,
+        device_credential_id: str,
+        ttl_seconds: int,
+    ) -> bool:
+        """Ask the instance holding a tablet socket to refresh previews."""
+        safe_ttl = max(10, min(int(ttl_seconds), 60))
+        async with self.sessions() as session:
+            credential = await session.get(DeviceCredential, device_credential_id)
+            if (
+                credential is None
+                or credential.organization_id != organization_id
+                or credential.state != "active"
+            ):
+                return False
+            if self.engine.dialect.name != "postgresql":
+                return False
+            await session.execute(
+                select(
+                    func.pg_notify(
+                        "r2c_video_thumbnail_preview",
+                        json.dumps(
+                            {
+                                "organizationId": organization_id,
+                                "deviceCredentialId": device_credential_id,
+                                "ttlSec": safe_ttl,
+                            },
+                            separators=(",", ":"),
+                        ),
+                    )
+                )
+            )
+            await session.commit()
+            return True
+
     async def dispose(self) -> None:
         await self.engine.dispose()
 
@@ -4210,11 +4247,6 @@ class ControlPlaneStore:
                 stream.incident_name != clean_incident[:160],
                 stream.drone_designator != clean_drone[:160],
                 stream.device_name != credential.device_name[:160],
-                width > 0 and stream.source_width != width,
-                height > 0 and stream.source_height != height,
-                fps_milli > 0 and stream.source_fps_milli != fps_milli,
-                bitrate > 0 and stream.source_bitrate_bps != bitrate,
-                bool(clean_codec) and stream.source_codec != clean_codec[:32],
                 stream.media_kind != clean_media_kind,
                 as_utc(stream.recorded_at) != clean_recorded_at,
                 stream.duration_ms != clean_duration_ms,

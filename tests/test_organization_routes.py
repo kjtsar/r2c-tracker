@@ -222,19 +222,19 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         script = Path("static/organization_streams_live.js").read_text()
 
         self.assertNotIn('state.dataset.active !== "true"', script)
-        self.assertIn("readyStateDiffers(message)", script)
-        self.assertIn("message.revision !== renderedRevision", script)
-        self.assertIn("pendingReload = true", script)
+        self.assertIn('message.type === "ready"', script)
+        self.assertIn("status.membershipRevision !== renderedMembershipRevision", script)
+        self.assertEqual(1, script.count("window.location.reload()"))
+        self.assertIn("new Image()", script)
+        self.assertIn("image.dataset.thumbnailRevision", script)
 
     def test_preflight_owns_request_refresh_until_one_decision_navigation(self):
         live_script = Path("static/organization_streams_live.js").read_text()
         preflight_script = Path("static/video_preflight.js").read_text()
 
-        self.assertIn("function preflightOwnsLifecycle()", live_script)
-        self.assertGreaterEqual(
-            live_script.count("if (preflightOwnsLifecycle()) return"),
-            2,
-        )
+        self.assertIn("function reloadForMembershipChange()", live_script)
+        self.assertNotIn("preflightIsBusy", live_script)
+        self.assertEqual(1, live_script.count("window.location.reload()"))
         self.assertIn("await waitForPilotDecision()", preflight_script)
         self.assertIn('["approved", "streaming"]', preflight_script)
         self.assertEqual(1, preflight_script.count("window.location.reload()"))
@@ -1516,6 +1516,10 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn("Android video tablet", streams_page.text)
         self.assertIn("R2C instance", streams_page.text)
         self.assertIn("/static/organization_streams_live.js", streams_page.text)
+        self.assertIn('data-membership-revision="', streams_page.text)
+        self.assertIn('data-status-url="/ncssar/streams/live-status"', streams_page.text)
+        self.assertIn('class="stream-preview-image"', streams_page.text)
+        self.assertIn("Viewer preview", streams_page.text)
         self.assertIn("does not start video", streams_page.text)
         self.assertNotIn("/whep", streams_page.text)
         self.assertNotIn("/streams/status", streams_page.text)
@@ -1538,6 +1542,28 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 "/ncssar/streams/Android%20video%20tablet"
             )
             self.assertEqual(200, tablet_page.status_code)
+            self.assertIn(
+                f'data-device-id="{device.id}"',
+                tablet_page.text,
+            )
+            status_response = self.client.get(
+                "/ncssar/streams/live-status",
+                params={"device": device.id},
+            )
+            self.assertEqual(200, status_response.status_code)
+            self.assertIn("no-store", status_response.headers["cache-control"])
+            status_payload = status_response.json()
+            self.assertRegex(
+                status_payload["membershipRevision"],
+                r"^[0-9a-f]{20}$",
+            )
+            self.assertTrue(status_payload["streams"])
+            self.assertTrue(
+                any(
+                    item["thumbnailUrl"].endswith("?rev=recording-thumb-1")
+                    for item in status_payload["streams"]
+                )
+            )
             self.assertIn("Android video tablet streams", tablet_page.text)
             self.assertIn("<td>10A</td>", tablet_page.text)
             self.assertIn("<td>2B</td>", tablet_page.text)
