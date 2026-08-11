@@ -1,4 +1,4 @@
-v1.4.27: pending review
+v1.4.27: deployed
 * Added an IAM-protected Google Cloud staging release path that refreshes isolated clones of both pilot databases, creates test credentials only inside the clone, runs authenticated regression there, and promotes the exact tested image digest through the existing zero-traffic production candidate and rollback workflow.
 * Added ephemeral short tablet and stream links, with authenticated current-session listings, thumbnails, live viewing, and playback of recently captured streams while the RID2Caltopo device remains connected.
 * Kept live streams available through the tablet link before telemetry identifies a drone; CalTopo Live and Archived Track links are added only when the app can match that stream to telemetry, with captured-video links retained after track completion.
