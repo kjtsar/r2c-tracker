@@ -29,6 +29,7 @@
   let startedReportInFlight = false;
   let endedReported = false;
   let statsTimer = null;
+  let serverStateTimer = null;
   let lastDecodedFrames = 0;
   let lastDecodeProgressAt = 0;
   let lastVideoBytes = 0;
@@ -164,6 +165,8 @@
     endedReported = true;
     window.clearInterval(statsTimer);
     statsTimer = null;
+    window.clearInterval(serverStateTimer);
+    serverStateTimer = null;
     if (video.srcObject) {
       video.srcObject.getTracks().forEach(function (track) { track.stop(); });
     }
@@ -182,6 +185,48 @@
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify({ form_token: formToken }),
     });
+  }
+
+  async function endFromServer(message) {
+    if (endedReported) return;
+    await reportMetrics(true, false).catch(function () {});
+    endedReported = true;
+    window.clearInterval(statsTimer);
+    statsTimer = null;
+    window.clearInterval(serverStateTimer);
+    serverStateTimer = null;
+    if (video.srcObject) {
+      video.srcObject.getTracks().forEach(function (track) { track.stop(); });
+    }
+    if (localAudioStream) {
+      localAudioStream.getTracks().forEach(function (track) { track.stop(); });
+      localAudioStream = null;
+    }
+    video.srcObject = null;
+    audio.srcObject = null;
+    video.style.display = "none";
+    show(message, "ended");
+    peer.close();
+  }
+
+  function terminalStatusMessage(current) {
+    if (!["redirected", "declined", "stopped", "e_nosuch_stream"].includes(
+      current.state || ""
+    )) return "";
+    return current.statusMessage || "Video stream stopped.";
+  }
+
+  async function inspectServerState() {
+    if (endedReported) return;
+    const response = await fetch(`${base}/status`, {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+    });
+    if (!response.ok) return;
+    const current = await response.json();
+    const message = terminalStatusMessage(current);
+    if (message) await endFromServer(message);
   }
 
   async function inspectFrameProgress() {
@@ -288,10 +333,20 @@
       });
       if (!response.ok) throw new Error("Media signaling status is unavailable.");
       const current = await response.json();
+      const terminalMessage = terminalStatusMessage(current);
+      if (terminalMessage) {
+        await endFromServer(terminalMessage);
+        return;
+      }
       if (current.answerSdp) {
         await peer.setRemoteDescription({ type: "answer", sdp: current.answerSdp });
         answerApplied = true;
         show("Media path negotiated; waiting for the first video frame…", "connecting");
+        if (!serverStateTimer) {
+          serverStateTimer = window.setInterval(function () {
+            inspectServerState().catch(function () {});
+          }, 1000);
+        }
         return;
       }
       await new Promise(function (resolve) { window.setTimeout(resolve, 300); });
@@ -345,6 +400,7 @@
   window.addEventListener("pagehide", function () {
     pageLeaving = true;
     window.clearInterval(statsTimer);
+    window.clearInterval(serverStateTimer);
     reportMetrics(true, true).catch(function () {});
     if (localAudioStream) {
       localAudioStream.getTracks().forEach(function (track) { track.stop(); });

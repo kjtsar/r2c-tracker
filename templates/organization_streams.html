@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}{{ organization.designator }} active streams{% endblock %}
+{% block title %}{{ organization.designator }}{% if tablet_device %} {{ tablet_device.device_name }}{% endif %} streams{% endblock %}
 {% block extra_head %}
 <style>
   .streams-shell {
@@ -51,6 +51,18 @@
       background: #e7ebef;
       color: #51606f;
       cursor: not-allowed;
+  }
+  .preview-button {
+      display: block;
+      border: 0;
+      border-radius: 6px;
+      padding: 0;
+      background: #111;
+      cursor: pointer;
+  }
+  .preview-button:focus-visible {
+      outline: 3px solid #0b63c9;
+      outline-offset: 3px;
   }
   .cancel-button {
       border: 0;
@@ -202,11 +214,11 @@
 <div class="streams-shell">
   <header class="streams-header">
     <div>
-      <h1>{{ organization.designator }} active streams</h1>
-      <p>{{ organization.legal_name }}</p>
+      <h1>{% if tablet_device %}{{ tablet_device.device_name }} streams{% else %}{{ organization.designator }} active streams{% endif %}</h1>
+      <p>{{ organization.legal_name }}{% if tablet_device %} • {{ tablet_device.platform|capitalize }} R2C instance{% endif %}</p>
     </div>
     <div class="header-actions">
-      <a href="/{{ organization.designator|lower }}/streams">
+      <a href="{% if tablet_device %}/{{ organization.designator|lower }}/streams/{{ tablet_device.device_name|urlencode }}{% if stream_filter %}/{{ stream_filter|urlencode }}{% endif %}{% else %}/{{ organization.designator|lower }}/streams{% endif %}">
         Refresh now
       </a>
       <a href="/{{ organization.designator|lower }}/admin">
@@ -240,12 +252,14 @@
   {% endif %}
 
   <section class="streams-panel">
-    <h2>Available now</h2>
+    <h2>Current tablet session</h2>
     {% if streams %}
     <div style="overflow-x:auto">
       <table class="stream-table">
         <thead>
           <tr>
+            <th>Preview</th>
+            <th>Type</th>
             <th>Incident</th>
             <th>Drone</th>
             <th>R2C instance</th>
@@ -256,6 +270,48 @@
         <tbody>
         {% for stream in streams %}
           <tr>
+            <td>
+              {% if stream.thumbnail_revision %}
+              {% if stream.session_id not in request_in_progress_session_ids %}
+              <form method="post"
+                    action="/{{ organization.designator|lower }}/streams/{{ stream.session_id }}/request">
+                <input type="hidden" name="form_token" value="{{ csrf_token }}">
+                {% if tablet_code %}<input type="hidden" name="tablet" value="{{ tablet_code }}">{% endif %}
+                {% if stream_filter %}<input type="hidden" name="stream" value="{{ stream_filter }}">{% endif %}
+                <button class="preview-button" type="submit"
+                        aria-label="{% if stream.media_kind == 'recording' %}Play{% else %}Request{% endif %} {{ stream.drone_designator }} {{ stream.media_kind }} video">
+                  <img
+                    src="/r2c-thumbnail/{{ stream_tablet_codes[stream.session_id] }}/{{ stream.session_id }}.jpg"
+                    alt="{{ stream.drone_designator }} {{ stream.media_kind }} preview"
+                    loading="lazy"
+                    style="display:block;width:160px;max-height:100px;object-fit:cover;border-radius:6px"
+                  >
+                </button>
+              </form>
+              {% else %}
+              <img
+                src="/r2c-thumbnail/{{ stream_tablet_codes[stream.session_id] }}/{{ stream.session_id }}.jpg"
+                alt="{{ stream.drone_designator }} {{ stream.media_kind }} preview"
+                loading="lazy"
+                style="display:block;width:160px;max-height:100px;object-fit:cover;background:#111;border-radius:6px"
+              >
+              {% endif %}
+              {% else %}
+              <span class="secondary">Preview pending</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if stream.media_kind == "recording" %}
+              <strong>Recorded</strong>
+              {% if stream.duration_ms %}
+              <span class="secondary" style="display:block">
+                {{ (stream.duration_ms / 1000)|round|int|duration_clock }}
+              </span>
+              {% endif %}
+              {% else %}
+              <strong>Live</strong>
+              {% endif %}
+            </td>
             <td><strong>{{ stream.incident_name }}</strong></td>
             <td>{{ stream.drone_designator }}</td>
             <td>{{ stream.device_name }}</td>
@@ -277,7 +333,11 @@
               <form method="post"
                     action="/{{ organization.designator|lower }}/streams/{{ stream.session_id }}/request">
                 <input type="hidden" name="form_token" value="{{ csrf_token }}">
-                <button class="request-button" type="submit">Request video</button>
+                {% if tablet_code %}<input type="hidden" name="tablet" value="{{ tablet_code }}">{% endif %}
+                {% if stream_filter %}<input type="hidden" name="stream" value="{{ stream_filter }}">{% endif %}
+                <button class="request-button" type="submit">
+                  {% if stream.media_kind == "recording" %}Play recording{% else %}Request video{% endif %}
+                </button>
               </form>
               {% endif %}
             </td>
@@ -288,7 +348,7 @@
     </div>
     {% else %}
     <p class="empty-state">
-      No drone teams are advertising video right now. This page will update
+      {% if tablet_device %}This R2C instance is not{% else %}No drone teams are{% endif %} advertising video right now. This page will update
       automatically when a stream becomes available while the page has focus.
     </p>
     {% endif %}
@@ -394,6 +454,11 @@
               {% else %}
               <span class="state-chip">{{ stream_request.state }}</span>
               {% endif %}
+              {% if stream_request.status_message %}
+              <span class="secondary" style="display:block">
+                {{ stream_request.status_message }}
+              </span>
+              {% endif %}
               {% if stream_request.state in ("pending", "probing", "awaiting_approval") %}
               <form method="post"
                     style="display:inline"
@@ -429,6 +494,6 @@
      data-designator="{{ organization.designator|lower }}"
      data-form-token="{{ csrf_token }}"
      data-ice-servers='{{ video_ice_servers|tojson }}'></div>
-<script src="/static/video_media.js?v=20260805-1" defer></script>
+<script src="/static/video_media.js?v=20260810-1" defer></script>
 {% endif %}
 {% endblock %}

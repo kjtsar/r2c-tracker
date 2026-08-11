@@ -1,3 +1,9 @@
+v1.4.27: pending review
+* Added an IAM-protected Google Cloud staging release path that refreshes isolated clones of both pilot databases, creates test credentials only inside the clone, runs authenticated regression there, and promotes the exact tested image digest through the existing zero-traffic production candidate and rollback workflow.
+* Added ephemeral short tablet and stream links, with authenticated current-session listings, thumbnails, live viewing, and playback of recently captured streams while the RID2Caltopo device remains connected.
+* Kept live streams available through the tablet link before telemetry identifies a drone; CalTopo Live and Archived Track links are added only when the app can match that stream to telemetry, with captured-video links retained after track completion.
+* Limited each RID2Caltopo device to one remote viewer, with pilot/VO-controlled rejection or higher-priority replacement and clear requester-facing outcomes.
+
 v1.4.26: deployed
 * Removed the retired unscoped `/ws/r2c`, `/upload`, `/r2c`, and `/ws` surfaces plus unused public API-documentation routes; device coordination, uploads, and release regression now require organization-scoped enrollment credentials and URLs.
 * Enforced server-derived organization scope throughout R2C coordination: websocket groups, zone presence, owner leases, confirmation replay, standalone proximity grouping, recent sightings, persistence queries, cleanup, and public legacy snapshots no longer combine tenants that use the same map or Remote ID.

@@ -28,9 +28,10 @@ or platform-admin views.
 
 ```text
 pending -> probing -> awaiting_approval -> approved -> streaming -> stopped
-   |          |              |               |
-   +----------+--------------+---------------+-> denied
-   +----------+--------------+---------------+-> expired
+   |          |              |               |           |
+   +----------+--------------+---------------+-----------> declined
+   +----------+--------------+---------------+-----------> expired
+                                             +-----------> redirected
 ```
 
 - `pending`: the website accepted an authorized user's request.
@@ -41,8 +42,18 @@ pending -> probing -> awaiting_approval -> approved -> streaming -> stopped
 - `streaming`: media is flowing and both ends show a persistent viewer/data-use
   indicator.
 - `stopped`: pilot/VO, viewer, timeout, or connectivity ended the session.
-- `denied`: pilot/VO rejected the request.
+- `declined`: pilot/VO rejected the request. With no current viewer, the
+  requester sees `insufficient bandwidth`; while another viewer is active,
+  the requester sees `App already streaming to <email-addr>`.
 - `expired`: no decision was made within ten minutes.
+- `redirected`: the pilot/VO approved a higher-priority request. The displaced
+  browser tears down its media peer and shows
+  `Stream redirected to <email-addr>`.
+
+Only one request per R2C device may be `approved` or `streaming`. One pending
+replacement may be reviewed while that session remains active. Approving it
+atomically retires the prior control-plane session and the tablet closes the
+prior WebRTC sender before accepting media signaling for the replacement.
 
 Every transition is server-validated, organization-scoped, and auditable.
 
@@ -72,6 +83,14 @@ authenticated `/<designator>/ws/r2c` connection. Each advertisement contains:
 Presence expires 45 seconds after the last advertisement. The organization
 page orders active records case-insensitively by incident name and then drone
 designator. It refreshes only on user demand; it does not poll.
+
+Presence does not depend on a stream-to-telemetry association. A newly started
+camera therefore appears immediately in the authenticated tablet inventory
+reached through its ephemeral `/t/<code>` link. RID2Caltopo adds CalTopo Live
+Track video metadata only after a telemetry identity matches the stream, and
+adds an Archived Track `/s/<code>` link only when the matching stream was
+captured locally. An unmatched stream remains available through the tablet
+inventory without being attached to either track type.
 
 ## Request delivery
 
@@ -149,8 +168,9 @@ options later; source-resolution/lower-frame-rate remains the first target.
 The tracker relays short-lived authenticated WHEP/ICE signaling messages only.
 The browser offer is forwarded to the enrolled tablet, which exchanges it with
 the tablet-local MediaMTX WHEP endpoint. Media then follows the selected ICE
-path directly or through TURN. A request authorizes one viewer for ten minutes;
-additional viewers require new pilot approval.
+path directly or through TURN. A request authorizes one viewer for ten minutes.
+The current implementation never serves two viewers concurrently from one R2C
+device; a newly approved higher-priority viewer replaces the existing viewer.
 
 Android already enables MediaMTX WebRTC, but its host/candidate and TURN
 configuration is not yet field-qualified. Apple currently disables MediaMTX

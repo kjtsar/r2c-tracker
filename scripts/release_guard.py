@@ -4,13 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 from pathlib import Path
 import secrets
 import subprocess
 import sys
-import time
 from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -24,6 +24,8 @@ SERVICE = os.environ.get("SERVICE_NAME", "r2c-tracker-pilot")
 PUBLIC_URL = os.environ.get("CONTROL_PLANE_PUBLIC_URL", "https://r2c-tracker.com").rstrip("/")
 GATE_SECRET = os.environ.get("DEPLOYMENT_GATE_KEY_SECRET_NAME", "r2c-deployment-gate-key")
 CONFIG = os.environ.get("CLOUDSDK_ACTIVE_CONFIG_NAME", "r2c-tracker-pilot")
+STAGING_SERVICE = "r2c-tracker-staging"
+STAGING_GATE_SECRET = "r2c-staging-deployment-gate-key"  # pragma: allowlist secret
 
 
 def run(*args: str, capture: bool = False, env: dict[str, str] | None = None) -> str:
@@ -51,9 +53,9 @@ def gcloud(*args: str, capture: bool = False, input_text: str | None = None) -> 
     return completed.stdout.strip() if capture else ""
 
 
-def service_description() -> dict:
+def service_description(service: str = SERVICE) -> dict:
     return json.loads(gcloud(
-        "run", "services", "describe", SERVICE,
+        "run", "services", "describe", service,
         "--project", PROJECT, "--region", REGION, "--format=json",
         capture=True,
     ))
@@ -72,6 +74,27 @@ def tagged_candidate(description: dict) -> tuple[str, str]:
         if item.get("tag") == "candidate" and item.get("revisionName") and item.get("url"):
             return str(item["revisionName"]), str(item["url"]).rstrip("/")
     raise RuntimeError("Cloud Run did not report the candidate tag and URL.")
+
+
+def latest_revision(description: dict) -> tuple[str, str]:
+    status = description.get("status", {})
+    revision = str(status.get("latestReadyRevisionName", ""))
+    url = str(status.get("url", "")).rstrip("/")
+    if not revision or not url:
+        raise RuntimeError("Cloud Run did not report a ready revision and URL.")
+    return revision, url
+
+
+def revision_image_digest(revision: str) -> str:
+    description = json.loads(gcloud(
+        "run", "revisions", "describe", revision,
+        "--project", PROJECT, "--region", REGION, "--format=json",
+        capture=True,
+    ))
+    digest = str(description.get("status", {}).get("imageDigest", ""))
+    if "@sha256:" not in digest:
+        raise RuntimeError(f"Revision {revision} did not report an immutable image digest.")
+    return digest
 
 
 def ensure_gate_secret() -> None:
@@ -97,17 +120,30 @@ def secret_value(name: str) -> str:
     )
 
 
-def request(url: str, *, bearer: str | None = None, expected: int = 200) -> tuple[int, bytes]:
+def identity_token() -> str:
+    return gcloud("auth", "print-identity-token", capture=True)
+
+
+def request(
+    url: str,
+    *,
+    bearer: str | None = None,
+    serverless_bearer: str | None = None,
+    expected: int = 200,
+    method: str = "GET",
+) -> tuple[int, bytes]:
     parsed = urlparse(url)
     if parsed.scheme != "https" or not parsed.hostname:
         raise RuntimeError(f"Release checks require an HTTPS URL; received {url!r}.")
     headers = {"User-Agent": "r2c-release-guard/1"}
     if bearer:
         headers["Authorization"] = f"Bearer {bearer}"
+    if serverless_bearer:
+        headers["X-Serverless-Authorization"] = f"Bearer {serverless_bearer}"
     try:
         # The scheme and hostname are constrained above; urlopen is used only
         # for the explicitly resolved Cloud Run/custom-domain targets.
-        with urlopen(Request(url, headers=headers), timeout=30) as response:  # nosec B310
+        with urlopen(Request(url, headers=headers, method=method), timeout=30) as response:  # nosec B310
             status_code, body = response.status, response.read()
     except HTTPError as exc:
         status_code, body = exc.code, exc.read()
@@ -116,9 +152,19 @@ def request(url: str, *, bearer: str | None = None, expected: int = 200) -> tupl
     return status_code, body
 
 
-def deployment_readiness(base_url: str, gate_key: str, *, storage_probe: bool = False) -> dict:
+def deployment_readiness(
+    base_url: str,
+    gate_key: str,
+    *,
+    storage_probe: bool = False,
+    serverless_bearer: str | None = None,
+) -> dict:
     suffix = "?storage_probe=true" if storage_probe else ""
-    _, body = request(f"{base_url}/deployment-readiness{suffix}", bearer=gate_key)
+    _, body = request(
+        f"{base_url}/deployment-readiness{suffix}",
+        bearer=gate_key,
+        serverless_bearer=serverless_bearer,
+    )
     result = json.loads(body)
     if not result.get("safe_to_deploy"):
         raise RuntimeError(
@@ -131,6 +177,75 @@ def deployment_readiness(base_url: str, gate_key: str, *, storage_probe: bool = 
 def is_bootstrap_gate_unavailable(error: RuntimeError) -> bool:
     message = str(error)
     return "received 404" in message or "received 503" in message
+
+
+async def websocket_smoke(
+    base_url: str,
+    designator: str,
+    tracker_key: str,
+    serverless_bearer: str,
+) -> None:
+    import websockets
+
+    parsed = urlparse(base_url)
+    websocket_url = f"wss://{parsed.netloc}/{designator}/ws/r2c"
+    async with websockets.connect(
+        websocket_url,
+        additional_headers={
+            "X-SAR-Token": tracker_key,
+            "X-Serverless-Authorization": f"Bearer {serverless_bearer}",
+            "User-Agent": "RID2Caltopo/staging-release-check",
+        },
+        open_timeout=20,
+    ) as websocket:
+        await websocket.send(json.dumps({
+            "type": "hello",
+            "mapId": "RELEASECHECK",
+            "zoneId": "staging-release-check",
+            "guid": "staging-release-check",
+            "name": "Staging Release Check",
+            "lat": 39.1,
+            "lng": -121.1,
+            "caltopoRttMs": 1,
+        }))
+        payload = json.loads(await asyncio.wait_for(websocket.recv(), timeout=10))
+        if payload.get("type") != "hello_ack":
+            raise RuntimeError(f"Expected hello_ack; received {payload!r}")
+
+
+def staging_regression(base_url: str, expected_version: str) -> None:
+    gate_key = secret_value(STAGING_GATE_SECRET)
+    serverless_bearer = identity_token()
+    _, live_body = request(f"{base_url}/livez", serverless_bearer=serverless_bearer)
+    _, ready_body = request(f"{base_url}/readyz", serverless_bearer=serverless_bearer)
+    live = json.loads(live_body)
+    ready = json.loads(ready_body)
+    if live.get("status") != "ok" or ready.get("status") != "ready":
+        raise RuntimeError(f"Staging health checks failed: live={live!r} ready={ready!r}")
+    if live.get("version") != expected_version:
+        raise RuntimeError(
+            f"Staging reports {live.get('version')!r}; expected {expected_version!r}."
+        )
+    deployment_readiness(
+        base_url,
+        gate_key,
+        storage_probe=True,
+        serverless_bearer=serverless_bearer,
+    )
+    _, fixture_body = request(
+        f"{base_url}/deployment-test-fixture",
+        bearer=gate_key,
+        serverless_bearer=serverless_bearer,
+        method="POST",
+    )
+    fixture = json.loads(fixture_body)
+    asyncio.run(websocket_smoke(
+        base_url,
+        str(fixture["designator"]),
+        str(fixture["device_token"]),
+        serverless_bearer,
+    ))
+    print(f"Authenticated staging regression passed against {base_url}.")
 
 
 def regression(base_url: str, expected_version: str = "") -> None:
@@ -188,25 +303,71 @@ def deploy_candidate(app_version_code: int, bootstrap: bool) -> None:
         if not is_bootstrap_gate_unavailable(exc):
             raise
         print("Bootstrap acknowledged: the serving revision does not yet expose the deployment gate.")
-    deploy_env = dict(os.environ)
-    deploy_env.update({
-        "ACTIVATE_LATEST_REVISION": "0",
-        "REVISION_TAG": "candidate",
-        "DEPLOYMENT_GATE_KEY_SECRET_NAME": GATE_SECRET,
-    })
-    run(str(ROOT / "deploy_pilot.sh"), str(app_version_code), env=deploy_env)
-    candidate_revision, candidate_url = tagged_candidate(service_description())
-    state = {
-        "candidate_revision": candidate_revision,
-        "candidate_url": candidate_url,
-        "expected_version": expected_version,
-        "previous_revision": previous_revision,
-        "public_url": PUBLIC_URL,
-        "bootstrap": bootstrap,
-        "status": "candidate",
-    }
-    save_state(state)
-    regression(candidate_url, expected_version)
+    run(str(ROOT / "setup_pilot_staging.sh"))
+    try:
+        run(str(ROOT / "scripts" / "refresh_staging_databases.sh"))
+        staging_env = dict(os.environ)
+        staging_env.update({
+            "ACTIVATE_LATEST_REVISION": "1",
+            "REVISION_TAG": "staging",
+        })
+        run(str(ROOT / "deploy_staging.sh"), str(app_version_code), env=staging_env)
+        active_accounts = gcloud(
+            "auth", "list", "--filter=status:ACTIVE", "--format=value(account)",
+            capture=True,
+        ).splitlines()
+        if not active_accounts:
+            raise RuntimeError("No active gcloud account is available for staging invocation.")
+        active_account = active_accounts[0]
+        gcloud(
+            "run", "services", "add-iam-policy-binding", STAGING_SERVICE,
+            "--project", PROJECT, "--region", REGION,
+            f"--member=user:{active_account}", "--role=roles/run.invoker",
+        )
+        staging_revision, staging_url = latest_revision(
+            service_description(STAGING_SERVICE)
+        )
+        image_digest = revision_image_digest(staging_revision)
+        staging_regression(staging_url, expected_version)
+        deploy_env = dict(os.environ)
+        deploy_env.update({
+            "ACTIVATE_LATEST_REVISION": "0",
+            "REVISION_TAG": "candidate",
+            "DEPLOYMENT_GATE_KEY_SECRET_NAME": GATE_SECRET,
+            "CONTAINER_IMAGE": image_digest,
+        })
+        run(str(ROOT / "deploy_pilot.sh"), str(app_version_code), env=deploy_env)
+        candidate_revision, candidate_url = tagged_candidate(service_description())
+        candidate_digest = revision_image_digest(candidate_revision)
+        if candidate_digest != image_digest:
+            raise RuntimeError(
+                "Production candidate image digest differs from the tested staging image."
+            )
+        state = {
+            "candidate_revision": candidate_revision,
+            "candidate_url": candidate_url,
+            "expected_version": expected_version,
+            "image_digest": image_digest,
+            "previous_revision": previous_revision,
+            "public_url": PUBLIC_URL,
+            "staging_revision": staging_revision,
+            "staging_url": staging_url,
+            "bootstrap": bootstrap,
+            "status": "candidate",
+        }
+        save_state(state)
+        regression(candidate_url, expected_version)
+    except Exception:
+        print(
+            "Candidate preparation failed; removing ephemeral staging resources.",
+            file=sys.stderr,
+        )
+        subprocess.run(
+            [str(ROOT / "cleanup_pilot_staging.sh")],
+            cwd=ROOT,
+            check=False,
+        )
+        raise
     print(f"Candidate ready: {candidate_revision}")
     print("Production traffic is unchanged. Run ./promote_candidate.sh to go live.")
 
@@ -221,8 +382,6 @@ def promote_candidate(*, bootstrap: bool) -> None:
     if bootstrap and not state.get("bootstrap"):
         raise RuntimeError("Bootstrap promotion is allowed only for the recorded first gate release.")
     regression(state["candidate_url"], state.get("expected_version", ""))
-    print("Waiting for the synthetic coordination heartbeat to age out...")
-    time.sleep(2 * 15 + 2)
     try:
         deployment_readiness(state["public_url"], secret_value(GATE_SECRET))
     except RuntimeError as exc:

@@ -10,6 +10,7 @@ import subprocess
 import requests
 import asyncio
 import asyncpg
+import base64
 import warnings
 import traceback
 import logging
@@ -18,7 +19,7 @@ import hashlib
 from dataclasses import replace
 from decimal import Decimal
 import numpy as np
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from pprint import pprint
 from datetime import datetime, date, timedelta, timezone, UTC
 from zoneinfo import ZoneInfo
@@ -55,6 +56,8 @@ from control_plane import (
     InvalidOrganizationError,
     normalize_video_preflight_answer,
     require_separate_database,
+    stream_link_code,
+    tablet_link_code,
 )
 from enrollment import (
     ControlPlaneTokenService,
@@ -122,6 +125,10 @@ CONTROL_PLANE_DATABASE_URL = os.environ.get(
 CONTROL_PLANE_SIMULATION = (
     os.environ.get("CONTROL_PLANE_MODE", "simulation").strip().lower()
     != "live"
+)
+RELEASE_STAGING_MODE = (
+    os.environ.get("RELEASE_STAGING_MODE", "false").strip().lower()
+    in {"1", "true", "yes", "on"}
 )
 CONTROL_PLANE_SIGNING_KEY = os.environ.get(
     "CONTROL_PLANE_SIGNING_KEY", ""
@@ -258,6 +265,19 @@ class BrowserVideoMediaMetrics(BrowserVideoMediaState):
     audio_bytes_sent: int = Field(ge=0, le=10_000_000_000_000)
     audio_bytes_received: int = Field(ge=0, le=10_000_000_000_000)
     video_bytes_received: int = Field(ge=0, le=10_000_000_000_000)
+
+
+def optional_iso_datetime(value: object) -> Optional[datetime]:
+    text_value = str(value or "").strip()
+    if not text_value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text_value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ControlPlaneError("Recorded video time is invalid.") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def public_video_ice_servers() -> list[dict[str, object]]:
@@ -1071,6 +1091,8 @@ class R2CCoordinationHub:
     CONFIRMATION_RETENTION_MS = 12 * 60 * 60 * 1000
     COORDINATION_MODE_MAP = "map"
     COORDINATION_MODE_STANDALONE = "standalone"
+    VIDEO_THUMBNAIL_MAX_BYTES = 256 * 1024
+    VIDEO_THUMBNAIL_TTL_SECONDS = 90
 
     def __init__(self):
         self._lock = asyncio.Lock()
@@ -1087,6 +1109,169 @@ class R2CCoordinationHub:
         self._load_task: Optional[asyncio.Task] = None
         self._cleanup_task: Optional[asyncio.Task] = None
         self._video_notification_task: Optional[asyncio.Task] = None
+        # Short-lived JPEGs support browser cards and CalTopo's conventional
+        # thumbnail_url. They are never written to the database or filesystem.
+        self._video_thumbnails: dict[
+            tuple[str, str], tuple[bytes, str, datetime]
+        ] = {}
+
+    async def resolve_tablet_link_code(
+        self,
+        code: str,
+    ) -> Optional[DeviceCredentialRecord]:
+        """Resolve a short alias strictly from authenticated live sockets.
+
+        A 32-bit code can collide. Never guess in that case: an ambiguous
+        alias is unavailable until only one matching tablet remains connected.
+        """
+        clean_code = code.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{6}", clean_code):
+            return None
+        async with self._lock:
+            matches: dict[str, DeviceCredentialRecord] = {}
+            for connection in self._connections.values():
+                credential = connection.device_credential
+                if credential is None:
+                    continue
+                expected = tablet_link_code(
+                    credential.designator,
+                    credential.device_name,
+                )
+                if secrets.compare_digest(clean_code, expected):
+                    matches[credential.id] = credential
+            if len(matches) != 1:
+                if len(matches) > 1:
+                    logger.warning(
+                        "Ambiguous live tablet alias rejected: code=%s matches=%s",
+                        clean_code,
+                        len(matches),
+                    )
+                return None
+            return next(iter(matches.values()))
+
+    async def resolve_connected_tablet(
+        self,
+        designator: str,
+        device_name: str,
+    ) -> Optional[DeviceCredentialRecord]:
+        """Resolve one canonical tablet path from live connection state."""
+        clean_designator = designator.strip().lower()
+        clean_device_name = device_name.strip().lower()
+        if not clean_designator or not clean_device_name:
+            return None
+        async with self._lock:
+            matches: dict[str, DeviceCredentialRecord] = {}
+            for connection in self._connections.values():
+                credential = connection.device_credential
+                if (
+                    credential is not None
+                    and credential.designator.strip().lower() == clean_designator
+                    and credential.device_name.strip().lower() == clean_device_name
+                ):
+                    matches[credential.id] = credential
+            if len(matches) != 1:
+                return None
+            return next(iter(matches.values()))
+
+    async def resolve_stream_link_code(self, code: str):
+        """Resolve one captured stream alias from live tablet advertisements."""
+        clean_code = code.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{6}", clean_code):
+            return None
+        async with self._lock:
+            credentials = {
+                connection.device_credential.id: connection.device_credential
+                for connection in self._connections.values()
+                if connection.device_credential is not None
+            }
+        matches = []
+        for credential in credentials.values():
+            streams = await control_plane_store.list_active_video_streams(
+                credential.organization_id
+            )
+            for stream in streams:
+                if stream.device_credential_id != credential.id:
+                    continue
+                expected = stream_link_code(
+                    credential.designator,
+                    credential.device_name,
+                    stream.drone_designator,
+                )
+                if secrets.compare_digest(clean_code, expected):
+                    matches.append((credential, stream))
+        unique = {
+            (credential.id, stream.drone_designator.strip().lower()): (
+                credential,
+                stream,
+            )
+            for credential, stream in matches
+        }
+        if len(unique) != 1:
+            if len(unique) > 1:
+                logger.warning(
+                    "Ambiguous captured stream alias rejected: code=%s matches=%s",
+                    clean_code,
+                    len(unique),
+                )
+            return None
+        return next(iter(unique.values()))
+
+    async def cache_video_thumbnail(
+        self,
+        *,
+        device_credential_id: str,
+        session_id: str,
+        revision: str,
+        jpeg_base64: str,
+    ) -> bool:
+        clean_revision = revision.strip()[:64]
+        encoded = jpeg_base64.strip()
+        if not clean_revision or not encoded:
+            return False
+        try:
+            jpeg = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError):
+            return False
+        if (
+            len(jpeg) < 4
+            or len(jpeg) > self.VIDEO_THUMBNAIL_MAX_BYTES
+            or not jpeg.startswith(b"\xff\xd8")
+            or not jpeg.endswith(b"\xff\xd9")
+        ):
+            return False
+        expires_at = datetime.now(UTC) + timedelta(
+            seconds=self.VIDEO_THUMBNAIL_TTL_SECONDS
+        )
+        async with self._lock:
+            self._video_thumbnails[(device_credential_id, session_id)] = (
+                jpeg,
+                clean_revision,
+                expires_at,
+            )
+        return True
+
+    async def video_thumbnail(
+        self,
+        *,
+        device_credential_id: str,
+        session_id: str,
+        revision: str = "",
+    ) -> Optional[bytes]:
+        now = datetime.now(UTC)
+        async with self._lock:
+            key = (device_credential_id, session_id)
+            cached = self._video_thumbnails.get(key)
+            if cached is None:
+                return None
+            jpeg, cached_revision, expires_at = cached
+            if expires_at < now:
+                self._video_thumbnails.pop(key, None)
+                return None
+            if revision and not secrets.compare_digest(
+                revision[:64], cached_revision
+            ):
+                return None
+            return jpeg
 
     async def start(self):
         if self._sweep_task is None:
@@ -1735,7 +1920,7 @@ class R2CCoordinationHub:
         if not isinstance(advertised_streams, list):
             advertised_streams = []
         accepted_session_ids: list[str] = []
-        for advertised in advertised_streams[:4]:
+        for advertised in advertised_streams[:24]:
             if not isinstance(advertised, dict):
                 continue
             try:
@@ -1755,9 +1940,25 @@ class R2CCoordinationHub:
                         advertised.get("sourceBitrateBps", 0) or 0
                     ),
                     source_codec=str(advertised.get("sourceCodec", "") or ""),
+                    media_kind=str(advertised.get("mediaKind", "live") or "live"),
+                    recorded_at=optional_iso_datetime(
+                        advertised.get("recordedAt")
+                    ),
+                    duration_ms=int(advertised.get("durationMs", 0) or 0),
+                    thumbnail_revision=str(
+                        advertised.get("thumbnailRevision", "") or ""
+                    ),
                     timezone_name=timezone_name,
                 )
                 accepted_session_ids.append(stream.session_id)
+                await self.cache_video_thumbnail(
+                    device_credential_id=credential.id,
+                    session_id=stream.session_id,
+                    revision=stream.thumbnail_revision,
+                    jpeg_base64=str(
+                        advertised.get("thumbnailJpegBase64", "") or ""
+                    ),
+                )
             except (ControlPlaneError, TypeError, ValueError):
                 logger.warning(
                     "Rejected managed stream advertisement from device=%s",
@@ -2288,7 +2489,19 @@ class R2CCoordinationHub:
             conn.coordination_mode = coordination_mode
             conn.zone_id = zone_id
             conn.guid = payload.get("guid", zone_id)
-            conn.name = payload.get("name", zone_id)
+            reported_name = str(payload.get("name", zone_id) or zone_id)[:160]
+            conn.name = reported_name
+            if conn.device_credential is not None and reported_name.strip():
+                # The marker code is computed from the tablet's current
+                # operator-visible name, so live alias resolution must use the
+                # name reported by this authenticated connection rather than a
+                # possibly older enrollment label.
+                conn.device_credential = type(conn.device_credential)(
+                    **{
+                        **vars(conn.device_credential),
+                        "device_name": reported_name.strip(),
+                    }
+                )
             conn.app_version = str(payload.get("appVersion", "") or "")
             conn.app_version_code = self._parse_nonnegative_int(payload.get("appVersionCode"))
             conn.lat = lat
@@ -4763,6 +4976,66 @@ async def deployment_readiness(
     }
 
 
+@app.post("/deployment-test-fixture")
+async def deployment_test_fixture(request: Request, response: Response):
+    """Create an isolated authenticated fixture only in a staging clone."""
+    if not RELEASE_STAGING_MODE:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    require_deployment_gate_key(request)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Robots-Tag"] = "noindex, nofollow"
+    if control_plane_store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The staging control-plane database is unavailable.",
+        )
+    designator = "RELEASECHECK"
+    try:
+        existing = await control_plane_store.get_organization(designator)
+    except InvalidOrganizationError:
+        existing = None
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "The staging fixture already exists. Refresh the staging "
+                "database clones before starting another release."
+            ),
+        )
+    organization = await control_plane_store.create_organization(
+        legal_name="Release Check Search and Rescue",
+        designator=designator,
+        admin_name="Release Check Administrator",
+        admin_email="release-check@example.invalid",
+        postal_address="Isolated staging fixture",
+        actor_id="release-staging",
+        simulation=True,
+    )
+    owner = await control_plane_store.activate_owner(
+        designator,
+        organization.primary_admin_email,
+        secrets.token_urlsafe(32),
+    )
+    campaign = await control_plane_store.create_enrollment_campaign(
+        organization_id=organization.id,
+        label="Automated staging release check",
+        created_by_user_id=owner.id,
+        expires_in_hours=1,
+        max_redemptions=1,
+    )
+    credential = await control_plane_store.issue_device_credential(
+        campaign_id=campaign.id,
+        organization_id=organization.id,
+        device_name="Staging Release Check",
+        platform="android",
+    )
+    return {
+        "designator": organization.designator.lower(),
+        "device_token": credential.token,
+        "expires_at": credential.expires_at.isoformat(),
+    }
+
+
 @app.get("/platform-admin/login", response_class=HTMLResponse)
 async def platform_admin_login_page(
         request: Request,
@@ -5905,6 +6178,20 @@ async def organization_activate_with_google(
     )
 
 
+def organization_safe_login_next(designator: str, requested: str) -> str:
+    organization_path = f"/{designator.lower()}"
+    if requested == organization_path:
+        return requested
+    if re.fullmatch(
+        re.escape(organization_path)
+        + r"/streams/(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2}){1,480}"
+        + r"(?:/(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2}){1,480})?",
+        requested,
+    ):
+        return requested
+    return ""
+
+
 @app.get("/{designator}/login", response_class=HTMLResponse)
 async def organization_login_page(
         request: Request,
@@ -5922,8 +6209,7 @@ async def organization_login_page(
         request,
         organization.designator,
     )
-    dashboard_path = f"/{organization.designator.lower()}"
-    next_path = dashboard_path if next == dashboard_path else ""
+    next_path = organization_safe_login_next(organization.designator, next)
     return templates.TemplateResponse(
         request=request,
         name="organization_login.html",
@@ -5976,7 +6262,7 @@ async def organization_login(
         return RedirectResponse(
             url=(
                 login_path + "?" + urlencode({"next": next})
-                if next == f"/{designator.lower()}"
+                if organization_safe_login_next(designator, next)
                 else login_path
             ),
             status_code=status.HTTP_303_SEE_OTHER,
@@ -5986,8 +6272,9 @@ async def organization_login(
     request.session["organization_user_id"] = user.id
     request.session["organization_designator"] = organization.designator
     dashboard_path = f"/{organization.designator.lower()}"
+    next_path = organization_safe_login_next(organization.designator, next)
     return RedirectResponse(
-        url=dashboard_path if next == dashboard_path else f"{dashboard_path}/admin",
+        url=next_path or f"{dashboard_path}/admin",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -6171,11 +6458,7 @@ async def organization_google_start(
         **flow,
         "organization_id": organization.id,
         "designator": organization.designator,
-        "next": (
-            f"/{organization.designator.lower()}"
-            if next == f"/{organization.designator.lower()}"
-            else ""
-        ),
+        "next": organization_safe_login_next(organization.designator, next),
     }
     return RedirectResponse(
         url=authorization_url,
@@ -6273,12 +6556,12 @@ async def organization_google_callback(
     if flow.get("activation_nonce"):
         flash(request, "Administrator account activated.", "success")
     dashboard_path = f"/{organization.designator.lower()}"
+    next_path = organization_safe_login_next(
+        organization.designator,
+        str(flow.get("next", "")),
+    )
     return RedirectResponse(
-        url=(
-            dashboard_path
-            if flow.get("next") == dashboard_path
-            else f"{dashboard_path}/admin"
-        ),
+        url=next_path or f"{dashboard_path}/admin",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -7043,14 +7326,88 @@ async def organization_import_flight_archive(
     return RedirectResponse(url=redirect_url, status_code=status.HTTP_303_SEE_OTHER)
 
 
+@app.get("/r2c-thumbnail/{tablet_code}/{session_id}.jpg")
+async def r2c_transient_video_thumbnail(
+        tablet_code: str,
+        session_id: str):
+    """Return a current tablet JPEG without persisting it in tracker storage.
+
+    This endpoint is intentionally capability-addressed rather than
+    session-authenticated because CalTopo fetches camera.thumbnail_url itself.
+    Both locators are high-entropy, the stream must still be actively
+    advertised, and every response is non-cacheable.
+    """
+    tablet = await r2c_hub.resolve_tablet_link_code(tablet_code)
+    if tablet is None:
+        raise HTTPException(status_code=404, detail="Thumbnail not found.")
+    streams = await control_plane_store.list_active_video_streams(
+        tablet.organization_id
+    )
+    stream = next((
+        item for item in streams
+        if item.device_credential_id == tablet.id
+        and secrets.compare_digest(item.session_id, session_id)
+    ), None)
+    if stream is None or not stream.thumbnail_revision:
+        raise HTTPException(status_code=404, detail="Thumbnail not found.")
+    jpeg = await r2c_hub.video_thumbnail(
+        device_credential_id=tablet.id,
+        session_id=stream.session_id,
+        revision=stream.thumbnail_revision,
+    )
+    if jpeg is None:
+        raise HTTPException(status_code=404, detail="Thumbnail not available.")
+    return Response(
+        content=jpeg,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-store, max-age=0",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+            "X-Robots-Tag": "noindex, nofollow, noimageindex",
+        },
+    )
+
+
 @app.get("/{designator}/streams", response_class=HTMLResponse)
-async def organization_streams(request: Request, designator: str):
+async def organization_streams(
+        request: Request,
+        designator: str,
+        tablet: str = "",
+        stream: str = ""):
+    clean_tablet_code = tablet.strip()
+    clean_stream = stream.strip()
+    tablet_device = None
+    if clean_tablet_code:
+        tablet_device = await r2c_hub.resolve_tablet_link_code(
+            clean_tablet_code
+        )
+        if tablet_device is None:
+            raise HTTPException(status_code=404, detail="R2C tablet not found.")
     organization, user = await require_organization_user(
         request,
         designator,
         ("video_requester",),
         redirect_to_login=True,
+        login_next=(
+            f"/{designator.lower()}/streams/"
+            f"{quote(tablet_device.device_name, safe='')}"
+            + (
+                f"/{quote(clean_stream, safe='')}"
+                if clean_stream
+                else ""
+            )
+            if tablet_device is not None
+            else ""
+        ),
     )
+    if tablet_device is not None:
+        if (
+            tablet_device.organization_id != organization.id
+        ):
+            raise HTTPException(status_code=404, detail="R2C tablet not found.")
+
     streams, requests, organization_requests, video_ice_servers = (
         await asyncio.gather(
             control_plane_store.list_active_video_streams(organization.id),
@@ -7064,6 +7421,26 @@ async def organization_streams(request: Request, designator: str):
             video_ice_server_provider.get_ice_servers(),
         )
     )
+    if tablet_device is not None:
+        streams = tuple(
+            stream for stream in streams
+            if stream.device_credential_id == tablet_device.id
+        )
+        requests = tuple(
+            stream_request for stream_request in requests
+            if stream_request.device_credential_id == tablet_device.id
+        )
+        organization_requests = tuple(
+            stream_request for stream_request in organization_requests
+            if stream_request.device_credential_id == tablet_device.id
+        )
+    if clean_stream:
+        streams = tuple(
+            item for item in streams
+            if item.drone_designator.strip().lower() == clean_stream.lower()
+        )
+        if not streams:
+            raise HTTPException(status_code=404, detail="Captured stream not found.")
     session_preflight = request.session.pop(
         "organization_video_preflight_request", None
     )
@@ -7124,11 +7501,21 @@ async def organization_streams(request: Request, designator: str):
             "organization": organization,
             "organization_user": user,
             "streams": streams,
+            "stream_tablet_codes": {
+                stream.session_id: tablet_link_code(
+                    organization.designator,
+                    stream.device_name,
+                )
+                for stream in streams
+            },
             "stream_requests": requests,
             "csrf_token": csrf_token(request, "organization_streams"),
             "logout_csrf_token": csrf_token(request, "organization_admin"),
             "organization_page_designator": organization.designator,
             "organization_identity_name": user.display_name,
+            "tablet_device": tablet_device,
+            "tablet_code": clean_tablet_code,
+            "stream_filter": clean_stream,
             "active_preflight_request_id": active_preflight_request_id,
             "active_media_request_id": active_media_request_id,
             "active_media_request": active_media_request,
@@ -7159,6 +7546,13 @@ def organization_stream_status(streams, requests) -> dict:
             "fps": stream.source_fps,
             "bitrate": stream.source_bitrate_bps,
             "codec": stream.source_codec,
+            "kind": stream.media_kind,
+            "recordedAt": (
+                stream.recorded_at.isoformat()
+                if stream.recorded_at is not None else ""
+            ),
+            "durationMs": stream.duration_ms,
+            "thumbnailRevision": stream.thumbnail_revision,
         }
         for stream in streams
     ]
@@ -7167,6 +7561,7 @@ def organization_stream_status(streams, requests) -> dict:
             "id": stream_request.id,
             "device": stream_request.device_name,
             "state": stream_request.state,
+            "statusMessage": getattr(stream_request, "status_message", ""),
             "route": stream_request.route_kind,
             "uplink": stream_request.estimated_uplink_bps,
             "selectedWidth": stream_request.selected_width,
@@ -7208,7 +7603,9 @@ async def organization_request_stream(
         request: Request,
         designator: str,
         session_id: str,
-        form_token: Annotated[str, Form()]):
+        form_token: Annotated[str, Form()],
+        tablet: Annotated[str, Form()] = "",
+        stream: Annotated[str, Form()] = ""):
     verify_csrf(request, "organization_streams", form_token)
     organization, user = await require_organization_user(
         request,
@@ -7256,7 +7653,17 @@ async def organization_request_stream(
         flash(request, str(exc), "warning")
     return RedirectResponse(
         url=(
-            f"/{organization.designator.lower()}/streams"
+            (
+                f"/{organization.designator.lower()}/streams/"
+                f"{quote(stream_request.device_name, safe='')}"
+                + (
+                    f"/{quote(stream.strip(), safe='')}"
+                    if stream.strip()
+                    else ""
+                )
+                if preflight_request_id
+                else f"/{organization.designator.lower()}/streams"
+            )
             + (
                 f"?{urlencode({'preflight': preflight_request_id})}"
                 if preflight_request_id
@@ -7365,6 +7772,7 @@ async def organization_video_preflight_status(
         return {
             "requestId": exchange.request_id,
             "state": exchange.state,
+            "statusMessage": exchange.status_message,
             # Long-lived tablet WebSockets can remain attached to the previous
             # Cloud Run revision during a rolling deployment.  Normalize again
             # at the browser boundary so an answer written by an older revision
@@ -7422,6 +7830,7 @@ async def organization_video_media_status(
         return {
             "requestId": exchange.request_id,
             "state": exchange.state,
+            "statusMessage": exchange.status_message,
             "answerSdp": exchange.device_answer_sdp,
             "expiresAt": exchange.expires_at.isoformat(),
         }
@@ -8734,6 +9143,103 @@ async def organization_r2c_websocket_endpoint(
         designator: str):
     """Serve organization-bound R2C clients on the managed tracker path."""
     await serve_r2c_websocket(websocket, designator)
+
+
+@app.get("/t/{tablet_code}")
+async def connected_tablet_short_link(
+        tablet_code: str):
+    """Resolve an ephemeral tablet alias to its authenticated portal path."""
+    tablet = await r2c_hub.resolve_tablet_link_code(tablet_code)
+    if tablet is None:
+        raise HTTPException(status_code=404, detail="R2C tablet is not connected.")
+    return RedirectResponse(
+        url=(
+            f"/{tablet.designator.lower()}/streams/"
+            f"{quote(tablet.device_name, safe='')}"
+        ),
+        status_code=status.HTTP_303_SEE_OTHER,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/s/{stream_code}")
+async def connected_captured_stream_short_link(stream_code: str):
+    """Resolve an ephemeral captured-stream alias to its portal path."""
+    resolved = await r2c_hub.resolve_stream_link_code(stream_code)
+    if resolved is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Captured stream is not available.",
+        )
+    tablet, stream = resolved
+    return RedirectResponse(
+        url=(
+            f"/{tablet.designator.lower()}/streams/"
+            f"{quote(tablet.device_name, safe='')}/"
+            f"{quote(stream.drone_designator, safe='')}"
+        ),
+        status_code=status.HTTP_303_SEE_OTHER,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get(
+    "/{designator}/streams/{device_name}/{video_stream}",
+    response_class=HTMLResponse,
+)
+async def organization_captured_stream(
+        request: Request,
+        designator: str,
+        device_name: str,
+        video_stream: str):
+    """Render locally captured recordings for one tablet drone stream."""
+    tablet = await r2c_hub.resolve_connected_tablet(designator, device_name)
+    if tablet is None:
+        raise HTTPException(status_code=404, detail="R2C tablet not found.")
+    await require_organization_user(
+        request,
+        tablet.designator,
+        ("video_requester",),
+        redirect_to_login=True,
+        login_next=(
+            f"/{tablet.designator.lower()}/streams/"
+            f"{quote(tablet.device_name, safe='')}/"
+            f"{quote(video_stream, safe='')}"
+        ),
+    )
+    return await organization_streams(
+        request=request,
+        designator=tablet.designator,
+        tablet=tablet_link_code(tablet.designator, tablet.device_name),
+        stream=video_stream,
+    )
+
+
+@app.get("/{designator}/streams/{device_name}", response_class=HTMLResponse)
+async def organization_tablet_streams(
+        request: Request,
+        designator: str,
+        device_name: str):
+    """Render the authenticated stream catalog for one R2C tablet."""
+    tablet = await r2c_hub.resolve_connected_tablet(designator, device_name)
+    if tablet is None:
+        raise HTTPException(status_code=404, detail="R2C tablet not found.")
+    tablet_code = tablet_link_code(tablet.designator, tablet.device_name)
+    await require_organization_user(
+        request,
+        tablet.designator,
+        ("video_requester",),
+        redirect_to_login=True,
+        login_next=(
+            f"/{tablet.designator.lower()}/streams/"
+            f"{quote(tablet.device_name, safe='')}"
+        ),
+    )
+    return await organization_streams(
+        request=request,
+        designator=tablet.designator,
+        tablet=tablet_code,
+    )
 
 
 @app.get("/{designator}", response_class=HTMLResponse)

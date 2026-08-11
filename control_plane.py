@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import re
@@ -71,6 +72,36 @@ MANAGED_ACCESS_TERMS_VERSION = "2026-08-07"
 EMERGENCY_VIDEO_MAX_LONG_EDGE = 640
 EMERGENCY_VIDEO_MAX_FPS = 5.0
 EMERGENCY_VIDEO_MAX_BITRATE_BPS = 200_000
+TABLET_LINK_CODE_DIGEST_BYTES = 4
+
+
+def tablet_link_code(organization_designator: str, device_name: str) -> str:
+    """Return the 32-bit base64url alias for a tablet's canonical path."""
+    material = (
+        f"/{organization_designator.strip().lower()}"
+        f"/streams/{device_name.strip().lower()}"
+    )
+    digest = hashlib.sha256(material.encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(
+        digest[:TABLET_LINK_CODE_DIGEST_BYTES]
+    ).decode("ascii").rstrip("=")
+
+
+def stream_link_code(
+    organization_designator: str,
+    device_name: str,
+    video_stream: str,
+) -> str:
+    """Return the 32-bit base64url alias for one canonical stream path."""
+    material = (
+        f"/{organization_designator.strip().lower()}"
+        f"/streams/{device_name.strip().lower()}"
+        f"/{video_stream.strip().lower()}"
+    )
+    digest = hashlib.sha256(material.encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(
+        digest[:TABLET_LINK_CODE_DIGEST_BYTES]
+    ).decode("ascii").rstrip("=")
 
 
 def is_emergency_video_fallback(
@@ -597,6 +628,12 @@ class ActiveVideoStream(Base):
     source_fps_milli: Mapped[int] = mapped_column(Integer, default=0)
     source_bitrate_bps: Mapped[int] = mapped_column(BigInteger, default=0)
     source_codec: Mapped[str] = mapped_column(String(32), default="")
+    media_kind: Mapped[str] = mapped_column(String(16), default="live")
+    recorded_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True)
+    )
+    duration_ms: Mapped[int] = mapped_column(BigInteger, default=0)
+    thumbnail_revision: Mapped[str] = mapped_column(String(64), default="")
     timezone_name: Mapped[str] = mapped_column(String(64), default="UTC")
     state: Mapped[str] = mapped_column(String(24), default="active")
     created_at: Mapped[datetime] = mapped_column(
@@ -625,6 +662,7 @@ class VideoStreamRequest(Base):
     )
     requester_email: Mapped[str] = mapped_column(String(320), nullable=False)
     state: Mapped[str] = mapped_column(String(24), default="pending")
+    status_message: Mapped[str] = mapped_column(String(400), default="")
     route_kind: Mapped[str] = mapped_column(String(16), default="unknown")
     estimated_uplink_bps: Mapped[int] = mapped_column(BigInteger, default=0)
     selected_width: Mapped[int] = mapped_column(Integer, default=0)
@@ -903,6 +941,10 @@ class ActiveVideoStreamRecord:
     source_fps: float
     source_bitrate_bps: int
     source_codec: str
+    media_kind: str
+    recorded_at: Optional[datetime]
+    duration_ms: int
+    thumbnail_revision: str
     timezone_name: str
     last_seen_at: datetime
     expires_at: datetime
@@ -926,6 +968,7 @@ class VideoStreamRequestRecord:
     source_codec: str
     timezone_name: str
     state: str
+    status_message: str
     route_kind: str
     estimated_uplink_bps: int
     selected_width: int
@@ -967,6 +1010,7 @@ class VideoPreflightExchangeRecord:
     device_credential_id: str
     requester_user_id: str
     state: str
+    status_message: str
     route_kind: str
     estimated_uplink_bps: int
     browser_offer_sdp: str
@@ -982,6 +1026,7 @@ class VideoMediaExchangeRecord:
     requester_user_id: str
     stream_session_id: str
     state: str
+    status_message: str
     browser_offer_sdp: str
     device_answer_sdp: str
     expires_at: datetime
@@ -1215,6 +1260,33 @@ class ControlPlaneStore:
                     "ADD COLUMN device_name VARCHAR(160) "
                     "DEFAULT 'Unknown device' NOT NULL"
                 ))
+            if "media_kind" not in columns:
+                await connection.execute(text(
+                    "ALTER TABLE active_video_streams "
+                    "ADD COLUMN media_kind VARCHAR(16) "
+                    "DEFAULT 'live' NOT NULL"
+                ))
+            if "recorded_at" not in columns:
+                timestamp_type = (
+                    "TIMESTAMP WITH TIME ZONE"
+                    if self.engine.dialect.name == "postgresql"
+                    else "DATETIME"
+                )
+                await connection.execute(text(
+                    "ALTER TABLE active_video_streams "
+                    f"ADD COLUMN recorded_at {timestamp_type}"
+                ))
+            if "duration_ms" not in columns:
+                await connection.execute(text(
+                    "ALTER TABLE active_video_streams "
+                    "ADD COLUMN duration_ms BIGINT DEFAULT 0 NOT NULL"
+                ))
+            if "thumbnail_revision" not in columns:
+                await connection.execute(text(
+                    "ALTER TABLE active_video_streams "
+                    "ADD COLUMN thumbnail_revision VARCHAR(64) "
+                    "DEFAULT '' NOT NULL"
+                ))
             request_columns = await connection.run_sync(
                 lambda sync_connection: {
                     item["name"]
@@ -1232,6 +1304,11 @@ class ControlPlaneStore:
                 await connection.execute(text(
                     "ALTER TABLE video_stream_requests "
                     f"ADD COLUMN started_at {timestamp_type}"
+                ))
+            if "status_message" not in request_columns:
+                await connection.execute(text(
+                    "ALTER TABLE video_stream_requests "
+                    "ADD COLUMN status_message VARCHAR(400) DEFAULT '' NOT NULL"
                 ))
             for column_name in (
                 "audio_bytes_sent",
@@ -4056,6 +4133,10 @@ class ControlPlaneStore:
         source_fps: float = 0.0,
         source_bitrate_bps: int = 0,
         source_codec: str = "",
+        media_kind: str = "live",
+        recorded_at: Optional[datetime] = None,
+        duration_ms: int = 0,
+        thumbnail_revision: str = "",
         timezone_name: str = "UTC",
         ttl_seconds: int = 45,
         now: Optional[datetime] = None,
@@ -4066,6 +4147,14 @@ class ControlPlaneStore:
         clean_drone = drone_designator.strip()
         clean_device_name = device_name.strip()
         clean_codec = source_codec.strip().lower()
+        clean_media_kind = media_kind.strip().lower()
+        if clean_media_kind not in {"live", "recording"}:
+            raise ControlPlaneError("Video media kind must be live or recording.")
+        clean_thumbnail_revision = thumbnail_revision.strip()
+        if len(clean_thumbnail_revision) > 64:
+            raise ControlPlaneError("Thumbnail revision must be 64 characters or fewer.")
+        clean_recorded_at = as_utc(recorded_at) if recorded_at is not None else None
+        clean_duration_ms = max(0, min(int(duration_ms), 24 * 60 * 60 * 1000))
         clean_timezone = normalize_timezone_name(timezone_name)
         if not clean_session_id or len(clean_session_id) > 36:
             raise ControlPlaneError("A valid stream session ID is required.")
@@ -4126,6 +4215,10 @@ class ControlPlaneStore:
                 fps_milli > 0 and stream.source_fps_milli != fps_milli,
                 bitrate > 0 and stream.source_bitrate_bps != bitrate,
                 bool(clean_codec) and stream.source_codec != clean_codec[:32],
+                stream.media_kind != clean_media_kind,
+                as_utc(stream.recorded_at) != clean_recorded_at,
+                stream.duration_ms != clean_duration_ms,
+                stream.thumbnail_revision != clean_thumbnail_revision,
                 stream.timezone_name != clean_timezone,
             ))
             stream.incident_name = clean_incident[:160]
@@ -4141,6 +4234,10 @@ class ControlPlaneStore:
                 stream.source_bitrate_bps = bitrate
             if is_new_stream or clean_codec:
                 stream.source_codec = clean_codec[:32]
+            stream.media_kind = clean_media_kind
+            stream.recorded_at = clean_recorded_at
+            stream.duration_ms = clean_duration_ms
+            stream.thumbnail_revision = clean_thumbnail_revision
             stream.timezone_name = clean_timezone
             stream.state = "active"
             stream.last_seen_at = seen_at
@@ -4283,23 +4380,28 @@ class ControlPlaneStore:
                 raise ControlPlaneError(
                     "Your organization role does not permit stream requests."
                 )
-            existing_request = await session.scalar(
-                select(VideoStreamRequest).where(
-                    VideoStreamRequest.active_stream_id == stream.id,
+            pending_device_request = await session.scalar(
+                select(VideoStreamRequest)
+                .join(
+                    ActiveVideoStream,
+                    ActiveVideoStream.id == VideoStreamRequest.active_stream_id,
+                )
+                .where(
+                    ActiveVideoStream.device_credential_id
+                    == stream.device_credential_id,
                     VideoStreamRequest.state.in_((
                         "pending",
                         "probing",
                         "awaiting_approval",
-                        "approved",
-                        "streaming",
                     )),
                     VideoStreamRequest.expires_at >= requested_at,
                 )
+                .with_for_update()
             )
-            if existing_request is not None:
+            if pending_device_request is not None:
                 raise ControlPlaneError(
-                    "A video request for this stream is already in progress. "
-                    "Cancel or stop it before requesting again."
+                    "A video request is already in progress and awaiting review "
+                    "on this R2C app."
                 )
             request = VideoStreamRequest(
                 id=new_id(),
@@ -4945,6 +5047,21 @@ class ControlPlaneStore:
                 raise ControlPlaneError(
                     "Video stream request is not awaiting pilot approval."
                 )
+            active_requests = tuple((await session.scalars(
+                select(VideoStreamRequest)
+                .join(
+                    ActiveVideoStream,
+                    ActiveVideoStream.id == VideoStreamRequest.active_stream_id,
+                )
+                .where(
+                    ActiveVideoStream.device_credential_id
+                    == stream.device_credential_id,
+                    VideoStreamRequest.id != request.id,
+                    VideoStreamRequest.state.in_(("approved", "streaming")),
+                )
+                .order_by(VideoStreamRequest.requested_at)
+                .with_for_update()
+            )).all())
             if clean_decision == "approve":
                 if fps_milli <= 0 or bitrate <= 0:
                     raise ControlPlaneError(
@@ -4969,12 +5086,37 @@ class ControlPlaneStore:
                 request.selected_height = height
                 request.selected_fps_milli = fps_milli
                 request.selected_bitrate_bps = bitrate
+                request.status_message = ""
+                redirect_message = (
+                    f"Stream redirected to {request.requester_email}"
+                )
+                for displaced in active_requests:
+                    displaced.state = "redirected"
+                    displaced.status_message = redirect_message
+                    displaced.stopped_at = decided_at
+                    session.add(ControlPlaneAuditEvent(
+                        organization_id=displaced.organization_id,
+                        actor_type="organization_device",
+                        actor_id=device_credential_id,
+                        event_type="video.redirected",
+                        details_json=json.dumps({
+                            "request_id": displaced.id,
+                            "replacement_request_id": request.id,
+                        }),
+                        created_at=decided_at,
+                    ))
             else:
                 request.state = "declined"
                 request.selected_width = 0
                 request.selected_height = 0
                 request.selected_fps_milli = 0
                 request.selected_bitrate_bps = 0
+                request.status_message = (
+                    "App already streaming to "
+                    f"{active_requests[0].requester_email}"
+                    if active_requests
+                    else "insufficient bandwidth"
+                )
             request.decided_at = decided_at
             session.add(
                 ControlPlaneAuditEvent(
@@ -5361,22 +5503,32 @@ class ControlPlaneStore:
             request, stream = row
             if stream.device_credential_id != device_credential_id:
                 raise ControlPlaneError("Video stream request belongs to another device.")
-            if request.state not in {"approved", "streaming", "stopped"}:
+            if request.state not in {
+                "approved", "streaming", "stopped", "redirected"
+            }:
                 raise ControlPlaneError("Video stream cannot be stopped.")
-            if request.state != "stopped":
-                request.state = "stopped"
+            if request.state not in {"stopped", "redirected"}:
+                clean_reason = str(reason or "device_terminated").strip()[:400]
+                redirected = clean_reason.startswith("Stream redirected to ")
+                request.state = "redirected" if redirected else "stopped"
+                request.status_message = clean_reason if redirected else ""
                 request.stopped_at = stopped_at
-                exchange = await session.get(VideoMediaExchange, request.id)
-                if exchange is not None:
-                    await session.delete(exchange)
+                if not redirected:
+                    exchange = await session.get(VideoMediaExchange, request.id)
+                    if exchange is not None:
+                        await session.delete(exchange)
                 session.add(ControlPlaneAuditEvent(
                     organization_id=request.organization_id,
                     actor_type="organization_device",
                     actor_id=device_credential_id,
-                    event_type="video.stopped_by_device",
+                    event_type=(
+                        "video.redirected"
+                        if redirected
+                        else "video.stopped_by_device"
+                    ),
                     details_json=json.dumps({
                         "request_id": request.id,
-                        "reason": str(reason or "device_terminated")[:80],
+                        "reason": clean_reason[:80],
                     }),
                     created_at=stopped_at,
                 ))
@@ -5396,6 +5548,7 @@ class ControlPlaneStore:
             device_credential_id=stream.device_credential_id,
             requester_user_id=request.requester_user_id,
             state=request.state,
+            status_message=request.status_message or "",
             route_kind=request.route_kind,
             estimated_uplink_bps=request.estimated_uplink_bps,
             browser_offer_sdp=exchange.browser_offer_sdp,
@@ -5416,6 +5569,7 @@ class ControlPlaneStore:
             requester_user_id=request.requester_user_id,
             stream_session_id=stream.session_id,
             state=request.state,
+            status_message=request.status_message or "",
             browser_offer_sdp=exchange.browser_offer_sdp,
             device_answer_sdp=exchange.device_answer_sdp,
             expires_at=as_utc(request.expires_at),
@@ -5438,6 +5592,10 @@ class ControlPlaneStore:
             source_fps=stream.source_fps_milli / 1000.0,
             source_bitrate_bps=stream.source_bitrate_bps,
             source_codec=stream.source_codec,
+            media_kind=stream.media_kind,
+            recorded_at=as_utc(stream.recorded_at),
+            duration_ms=max(0, stream.duration_ms),
+            thumbnail_revision=stream.thumbnail_revision,
             timezone_name=stream.timezone_name or "UTC",
             last_seen_at=as_utc(stream.last_seen_at),
             expires_at=as_utc(stream.expires_at),
@@ -5465,6 +5623,7 @@ class ControlPlaneStore:
             source_codec=stream.source_codec,
             timezone_name=stream.timezone_name or "UTC",
             state=request.state,
+            status_message=request.status_message or "",
             route_kind=request.route_kind,
             estimated_uplink_bps=request.estimated_uplink_bps,
             selected_width=request.selected_width,

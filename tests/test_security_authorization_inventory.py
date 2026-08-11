@@ -167,6 +167,7 @@ class SecurityAuthorizationInventoryTest(unittest.TestCase):
                     "require_organization_user",
                     "require_organization_records_admin",
                     "get_api_key",
+                    "require_deployment_gate_key",
                 )
             )
             self.assertTrue(

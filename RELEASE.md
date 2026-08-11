@@ -24,6 +24,11 @@ The release owner needs:
 - read access to the deployment-gate secret; and
 - a working project virtual environment installed from `requirements.lock`.
 
+Staging preparation requires Cloud SQL administration in `r2c-tracker-pilot`,
+IAP tunnel access to the pilot PostgreSQL VM, and local `pg_dump`, `pg_restore`,
+and `cloud-sql-proxy` commands. Review the fixed instance, database, role,
+service-account, secret, firewall-rule, and bucket names before releasing.
+
 Use individual Google Cloud identities and repository accounts. Do not share
 credentials or copy Secret Manager values into tickets, chat, shell history, or
 the repository.
@@ -89,7 +94,7 @@ Choose the next version rather than copying the example literally. The existing
 untracked file. Use it only from an intentionally clean, fully reviewed
 worktree.
 
-## 4. Deploy and test the zero-traffic candidate
+## 4. Test the immutable image in staging and deploy a production candidate
 
 Authenticate the named Google Cloud configuration, then run:
 
@@ -102,13 +107,25 @@ R2C_MINIMUM_ANDROID_BUILD=126
 Replace the example with the minimum compatible Android build selected during
 release preparation.
 
-`deploy_candidate.sh` refuses a dirty or untagged checkout, stops when the live
-activity gate reports operational use, deploys the candidate with zero
-production traffic, and immediately runs cloud regression tests. The tests
-exercise both databases, mounted-storage write/read/delete, public routes,
-authorization rejection, and version reporting. The local release gate covers
-the authenticated organization-scoped R2C WebSocket without creating synthetic
-records in the hosted control plane.
+`deploy_candidate.sh` refuses a dirty or untagged checkout and stops when the
+live activity gate reports operational use. It then:
+
+1. creates an ephemeral PostgreSQL 15 Cloud SQL staging instance and refreshes
+   `r2c_stage_tracker` and `r2c_stage_control_plane` from production database
+   dumps transferred through authenticated IAP and Cloud SQL proxies;
+2. deploys the tagged source to the IAM-protected `r2c-tracker-staging` service
+   with staging-only roles, secrets, and Cloud Storage;
+3. creates a one-use `RELEASECHECK` fixture only inside the cloned control-plane
+   database and runs health, database, storage, authorization, and authenticated
+   organization-scoped WebSocket regression;
+4. resolves the tested staging revision to its immutable Artifact Registry
+   `sha256` digest; and
+5. deploys that exact digest as a zero-traffic production candidate, verifies
+   the digest match, and runs non-mutating production readiness checks.
+
+Production data is never used to create a test credential, staging is not
+publicly invokable, outbound email and payment integrations are disabled, and
+production flight-log objects are not copied into the staging bucket.
 
 The command records the candidate and previous production revision in the
 ignored `.release-state/pilot.json`. That file contains no application secret,
@@ -156,6 +173,9 @@ Organization administrators own their record lifecycle.
 4. Record the production revision and verification evidence in the release
    issue.
 5. Monitor the new revision during the agreed observation window.
+6. Run `./cleanup_pilot_staging.sh` after the observation window, and within 24
+   hours of cloning, to delete the staging service and ephemeral Cloud SQL
+   instance.
 
 ## Rollback and recovery
 
@@ -180,12 +200,15 @@ use the incident and continuity runbooks rather than improvising a redeploy.
 - [ ] Local release and security gates passed
 - [ ] Pull request approved and exact commit tagged/pushed
 - [ ] Production activity gate idle
+- [ ] Staging database clones refreshed and authenticated regression passed
+- [ ] Production candidate digest matches the tested staging image digest
 - [ ] Zero-traffic candidate regression passed
 - [ ] Changed workflows checked at the candidate URL
 - [ ] Candidate retested immediately before promotion
 - [ ] Production health, version, workflows, and logs verified
 - [ ] `/versions` and `changes.txt` marked and verified
 - [ ] Evidence recorded and observation window completed
+- [ ] Staging service and ephemeral Cloud SQL instance removed within 24 hours
 
 Related documentation: [pilot setup](PILOT_SETUP.md),
 [incident response](docs/INCIDENT_RESPONSE_RUNBOOK.md), and

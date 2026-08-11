@@ -27,6 +27,8 @@ from control_plane import (
     DeviceCredentialRecord,
     MANAGED_ACCESS_TERMS_VERSION,
     VideoPreflightExchange,
+    stream_link_code,
+    tablet_link_code,
 )
 from enrollment import ControlPlaneTokenService
 from platform_admin_identity import PlatformAdminIdentity
@@ -110,6 +112,31 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 class OrganizationRouteFlowTest(unittest.TestCase):
+    def test_deployment_fixture_is_staging_only_and_gate_protected(self):
+        production = self.client.post("/deployment-test-fixture")
+        self.assertEqual(404, production.status_code)
+
+        with (
+            patch.object(main, "RELEASE_STAGING_MODE", True),
+            patch.object(main, "DEPLOYMENT_GATE_KEY", "staging-gate-key"),
+        ):
+            unauthorized = self.client.post("/deployment-test-fixture")
+            self.assertEqual(403, unauthorized.status_code)
+            created = self.client.post(
+                "/deployment-test-fixture",
+                headers={"Authorization": "Bearer staging-gate-key"},
+            )
+            duplicate = self.client.post(
+                "/deployment-test-fixture",
+                headers={"Authorization": "Bearer staging-gate-key"},
+            )
+
+        self.assertEqual(200, created.status_code)
+        self.assertEqual("releasecheck", created.json()["designator"])
+        self.assertTrue(created.json()["device_token"].startswith("r2c_dev_"))
+        self.assertEqual("no-store", created.headers["cache-control"])
+        self.assertEqual(409, duplicate.status_code)
+
     def test_scoped_upload_route_is_registered(self):
         paths = {route.path for route in main.app.routes}
         self.assertIn("/{designator}/upload", paths)
@@ -1419,6 +1446,11 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                             "sourceFps": 30,
                             "sourceBitrateBps": 2_000_000,
                             "sourceCodec": "h264",
+                            "mediaKind": "recording",
+                            "recordedAt": "2026-08-10T19:30:00Z",
+                            "durationMs": 91_000,
+                            "thumbnailRevision": "recording-thumb-1",
+                            "thumbnailJpegBase64": "/9j/2Q==",
                         },
                     ],
                 }
@@ -1453,12 +1485,74 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             streams_page.text.index("<td>2B</td>"),
         )
         self.assertIn("Request video", streams_page.text)
+        self.assertIn("Play recording", streams_page.text)
         self.assertIn("Android video tablet", streams_page.text)
         self.assertIn("R2C instance", streams_page.text)
         self.assertIn("/static/organization_streams_live.js", streams_page.text)
         self.assertIn("does not start video", streams_page.text)
         self.assertNotIn("/whep", streams_page.text)
         self.assertNotIn("/streams/status", streams_page.text)
+        tablet_code = tablet_link_code("ncssar", "Android video tablet")
+        self.assertEqual("Bz2DZg", tablet_link_code("ncssar", "Kjt A5 Pro"))
+        with self.client.websocket_connect(
+            "/ncssar/ws/r2c",
+            headers={"X-SAR-Token": device.token},
+        ):
+            short_link = self.client.get(
+                f"/t/{tablet_code}",
+                follow_redirects=False,
+            )
+            self.assertEqual(303, short_link.status_code)
+            self.assertEqual(
+                "/ncssar/streams/Android%20video%20tablet",
+                short_link.headers["location"],
+            )
+            tablet_page = self.client.get(
+                "/ncssar/streams/Android%20video%20tablet"
+            )
+            self.assertEqual(200, tablet_page.status_code)
+            self.assertIn("Android video tablet streams", tablet_page.text)
+            self.assertIn("<td>10A</td>", tablet_page.text)
+            self.assertIn("<td>2B</td>", tablet_page.text)
+            thumbnail = self.client.get(
+                f"/r2c-thumbnail/{tablet_code}/"
+                "00000000-0000-0000-0000-000000000002.jpg"
+            )
+            self.assertEqual(200, thumbnail.status_code)
+            self.assertEqual("image/jpeg", thumbnail.headers["content-type"])
+            self.assertEqual(
+                "no-store, max-age=0",
+                thumbnail.headers["cache-control"],
+            )
+            self.assertEqual(b"\xff\xd8\xff\xd9", thumbnail.content)
+            stream_code = stream_link_code(
+                "ncssar",
+                "Android video tablet",
+                "2B",
+            )
+            self.assertEqual("Gv2sGQ", stream_code)
+            stream_link = self.client.get(
+                f"/s/{stream_code}",
+                follow_redirects=False,
+            )
+            self.assertEqual(303, stream_link.status_code)
+            self.assertEqual(
+                "/ncssar/streams/Android%20video%20tablet/2B",
+                stream_link.headers["location"],
+            )
+            captured_page = self.client.get(stream_link.headers["location"])
+            self.assertEqual(200, captured_page.status_code)
+            self.assertIn("<td>2B</td>", captured_page.text)
+            self.assertNotIn("<td>10A</td>", captured_page.text)
+        unavailable_link = self.client.get(
+            f"/t/{tablet_code}",
+            follow_redirects=False,
+        )
+        self.assertEqual(404, unavailable_link.status_code)
+        self.assertEqual(
+            404,
+            self.client.get(f"/s/{stream_code}", follow_redirects=False).status_code,
+        )
         with self.client.websocket_connect(
             "/ncssar/streams/events"
         ) as event_websocket:

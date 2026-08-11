@@ -29,6 +29,14 @@ R2C_RECOMMENDED_APP_VERSION_CODE="$1"
 R2C_UPDATE_URL="${2:-}"
 export R2C_RECOMMENDED_APP_VERSION_CODE
 export R2C_UPDATE_URL
+CONTAINER_IMAGE="${CONTAINER_IMAGE:-}"
+export CONTAINER_IMAGE
+if [ -n "${CONTAINER_IMAGE}" ]; then
+  python3 -c 'import os, re, sys; value=os.environ["CONTAINER_IMAGE"]; sys.exit(0 if re.fullmatch(r"[A-Za-z0-9._/-]+@sha256:[0-9a-f]{64}", value) else 1)' || {
+    echo "CONTAINER_IMAGE must be an immutable Artifact Registry sha256 digest." >&2
+    exit 2
+  }
+fi
 R2C_RECOMMENDED_IOS_APP_BUILD_NUMBER="${R2C_RECOMMENDED_IOS_APP_BUILD_NUMBER:-0}"
 R2C_IOS_UPDATE_URL="${R2C_IOS_UPDATE_URL:-}"
 export R2C_RECOMMENDED_IOS_APP_BUILD_NUMBER
@@ -435,6 +443,7 @@ print(json.dumps({
     "PLATFORM_BILLING_DATASET": os.environ.get("PLATFORM_BILLING_DATASET", ""),
     "PLATFORM_BILLING_INCLUDED_PROJECTS": os.environ.get("PLATFORM_BILLING_INCLUDED_PROJECTS", ""),
     "CONTROL_PLANE_MODE": os.environ.get("CONTROL_PLANE_MODE", "simulation"),
+    "RELEASE_STAGING_MODE": os.environ.get("RELEASE_STAGING_MODE", "false"),
     "CONTROL_PLANE_PUBLIC_URL": os.environ.get("CONTROL_PLANE_PUBLIC_URL", ""),
     "CONTROL_PLANE_TRACKER_BASE_URL": os.environ.get("CONTROL_PLANE_TRACKER_BASE_URL", ""),
     "DEVICE_CREDENTIAL_ISSUANCE_ENABLED": os.environ.get("DEVICE_CREDENTIAL_ISSUANCE_ENABLED", "false"),
@@ -513,7 +522,6 @@ if [ -n "${STRIPE_SECRET_KEY_SECRET_NAME}" ]; then
   SECRET_MAPPINGS="${SECRET_MAPPINGS},STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET_SECRET_NAME}:latest"
 fi
 set -- run deploy "${SERVICE_NAME}" \
-  --source . \
   --region "${REGION}" \
   --project "${GCLOUD_PROJECT}" \
   --service-account "${RUNTIME_SERVICE_ACCOUNT}" \
@@ -524,11 +532,19 @@ set -- run deploy "${SERVICE_NAME}" \
   --env-vars-file "${ENV_VARS_FILE}" \
   --set-secrets "${SECRET_MAPPINGS}"
 
+if [ -n "${CONTAINER_IMAGE}" ]; then
+  set -- "$@" --image "${CONTAINER_IMAGE}"
+else
+  set -- "$@" --source .
+fi
+
 if [ -n "${CLOUD_RUN_MEMORY}" ]; then
   set -- "$@" --memory "${CLOUD_RUN_MEMORY}"
 fi
 if [ "${ALLOW_UNAUTHENTICATED}" = "1" ]; then
   set -- "$@" --allow-unauthenticated
+else
+  set -- "$@" --no-allow-unauthenticated
 fi
 if [ -n "${CLOUD_SQL_INSTANCE}" ]; then
   set -- "$@" --set-cloudsql-instances "${CLOUD_SQL_INSTANCE}"

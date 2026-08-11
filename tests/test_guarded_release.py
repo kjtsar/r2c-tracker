@@ -29,6 +29,15 @@ class GuardedReleaseTest(unittest.TestCase):
 
     def test_candidate_promotion_and_rollback_are_separate_commands(self):
         guard = (self.root / "scripts" / "release_guard.py").read_text()
+        self.assertIn("refresh_staging_databases.sh", guard)
+        self.assertIn("setup_pilot_staging.sh", guard)
+        self.assertIn("deploy_staging.sh", guard)
+        self.assertIn("staging_regression(staging_url", guard)
+        self.assertIn('"CONTAINER_IMAGE": image_digest', guard)
+        self.assertIn("candidate_digest != image_digest", guard)
+        self.assertIn("websocket_smoke", guard)
+        self.assertIn("Candidate preparation failed; removing ephemeral staging resources.", guard)
+        self.assertIn("cleanup_pilot_staging.sh", guard)
         self.assertIn('"ACTIVATE_LATEST_REVISION": "0"', guard)
         self.assertIn('"REVISION_TAG": "candidate"', guard)
         self.assertIn("deployment_readiness(PUBLIC_URL", guard)
@@ -46,6 +55,25 @@ class GuardedReleaseTest(unittest.TestCase):
     def test_local_release_gate_checks_migration_rollback_compatibility(self):
         release_check = (self.root / "release_check.sh").read_text()
         self.assertIn("scripts/check_migration_compatibility.py", release_check)
+
+    def test_staging_clone_lifecycle_is_explicitly_scoped(self):
+        refresh = (self.root / "scripts" / "refresh_staging_databases.sh").read_text()
+        cleanup = (self.root / "cleanup_pilot_staging.sh").read_text()
+        setup = (self.root / "setup_pilot_staging.sh").read_text()
+
+        self.assertIn("r2c_pilot_tracker", refresh)
+        self.assertIn("r2c_stage_tracker", refresh)
+        self.assertIn('"${PG_DUMP}" --format=custom', refresh)
+        self.assertIn("pg_dump_major", refresh)
+        self.assertIn("compute start-iap-tunnel", refresh)
+        self.assertIn("cloud-sql-proxy", refresh)
+        self.assertIn("allow-iap-postgres-r2c-staging", refresh)
+        self.assertIn("r2c-release-staging", cleanup)
+        self.assertNotIn("DROP DATABASE IF EXISTS r2c_pilot_tracker", cleanup)
+        self.assertIn("r2c_stage_tracker_user", setup)
+        self.assertIn("r2c_stage_control_user", setup)
+        self.assertIn("POSTGRES_15", setup)
+        self.assertIn("db-f1-micro", setup)
 
     def test_bootstrap_recognizes_old_revision_http_status_wording(self):
         spec = importlib.util.spec_from_file_location(

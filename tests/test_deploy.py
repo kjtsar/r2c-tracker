@@ -1,4 +1,5 @@
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -30,6 +31,21 @@ class DeployScriptTest(unittest.TestCase):
 
         self.assertNotEqual(0, result.returncode)
         self.assertIn("positive integer", result.stderr)
+
+    def test_deploy_rejects_mutable_container_image_reference(self):
+        repo = pathlib.Path(__file__).resolve().parents[1]
+        env = dict(os.environ)
+        env["CONTAINER_IMAGE"] = "us-west1-docker.pkg.dev/project/repo/app:latest"
+        result = subprocess.run(
+            ["sh", "deploy.sh", "126"],
+            cwd=repo,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(2, result.returncode)
+        self.assertIn("immutable Artifact Registry sha256 digest", result.stderr)
 
     def test_deploy_exports_app_version_policy_env_vars(self):
         script = (pathlib.Path(__file__).resolve().parents[1] / "deploy.sh").read_text()
@@ -88,6 +104,9 @@ class DeployScriptTest(unittest.TestCase):
         self.assertIn("mount-path=/flightlogs-vol", script)
         self.assertIn('--no-traffic', script)
         self.assertIn('--tag "${REVISION_TAG}"', script)
+        self.assertIn('--image "${CONTAINER_IMAGE}"', script)
+        self.assertIn("immutable Artifact Registry sha256 digest", script)
+        self.assertIn("RELEASE_STAGING_MODE", script)
         self.assertIn('clean_line.endswith(": pending review")', script)
         self.assertIn('clean_line.removesuffix(": pending review")', script)
 
@@ -128,6 +147,7 @@ class DeployScriptTest(unittest.TestCase):
         self.assertIn("r2c-google-oauth-client-secret", script)
         self.assertIn("r2c-managed-request-ingest-key", script)
         self.assertIn('CONTROL_PLANE_MODE="${CONTROL_PLANE_MODE:-live}"', script)
+        self.assertIn('RELEASE_STAGING_MODE="false"', script)
         self.assertIn('CONTROL_PLANE_MODE}" != "live"', script)
         self.assertIn("The production pilot must keep organization provisioning in live mode.", script)
         self.assertIn('PLATFORM_EMAIL_SMTP_HOST="${PLATFORM_EMAIL_SMTP_HOST:-}"', script)
@@ -147,6 +167,21 @@ class DeployScriptTest(unittest.TestCase):
             [{"urls": ["stun:stun.cloudflare.com:3478"]}],
             json.loads(ice_default.group(1)),
         )
+
+    def test_staging_wrapper_is_private_and_uses_isolated_resources(self):
+        repo = pathlib.Path(__file__).resolve().parents[1]
+        script = (repo / "deploy_staging.sh").read_text()
+
+        self.assertIn("r2c-tracker-staging", script)
+        self.assertIn("r2c-staging-tracker-database-url", script)
+        self.assertIn("r2c-staging-control-plane-database-url", script)
+        self.assertIn("r2c-tracker-staging-flightlogs", script)
+        self.assertIn("r2c-release-staging", script)
+        self.assertIn('ALLOW_UNAUTHENTICATED="0"', script)
+        self.assertIn('RELEASE_STAGING_MODE="true"', script)
+        self.assertIn('CONTROL_PLANE_MODE="simulation"', script)
+        self.assertIn('PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_SECRET_NAME=""', script)
+        self.assertIn('STRIPE_SECRET_KEY_SECRET_NAME=""', script)
 
     def test_local_setup_uses_isolated_gcloud_configuration_and_private_env_file(self):
         repo = pathlib.Path(__file__).resolve().parents[1]

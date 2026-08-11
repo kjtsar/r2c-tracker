@@ -15,6 +15,11 @@ The pilot environment is isolated from `tracker.kjt.us`.
 - network path: Cloud Run Direct VPC egress through the dedicated
   `r2c-pilot-vpc` subnet, peered with the database VM's VPC
 - Cloud Storage bucket: `r2c-tracker-pilot-flightlogs`
+- staging Cloud Run service: `r2c-tracker-staging` (IAM invocation only)
+- ephemeral staging Cloud SQL instance: `r2c-release-staging` (PostgreSQL 15,
+  zonal `db-f1-micro`, deleted after each release)
+- staging databases: `r2c_stage_tracker` and `r2c_stage_control_plane`
+- staging Cloud Storage bucket: `r2c-tracker-staging-flightlogs`
 
 The project has a monthly USD 25 budget alert. A budget sends notifications; it
 does not stop resources or cap spending.
@@ -49,6 +54,15 @@ Generated secrets:
 - `r2c-platform-email-gmail-refresh-token`
 - `r2c-cloudflare-turn-key-id`
 - `r2c-cloudflare-turn-api-token`
+
+Staging-only generated secrets:
+
+- `r2c-staging-tracker-database-url`
+- `r2c-staging-control-plane-database-url`
+- `r2c-staging-tracker-admin-password`
+- `r2c-staging-deployment-gate-key`
+- `r2c-staging-secret-key`
+- `r2c-staging-control-plane-signing-key`
 
 FAA proxy secrets, created during the FAA credential migration:
 
@@ -94,6 +108,21 @@ service:
 ./set_super_admin.sh kjtsar@kjt.us "R2C Platform Administrator"
 ```
 
+The guarded release command prepares the isolated staging resources for each
+release. To prepare them independently, run:
+
+```bash
+./setup_pilot_staging.sh
+```
+
+This creates the fixed ephemeral `r2c-release-staging` Cloud SQL instance,
+`r2c_stage_*` users/databases, staging secrets, a dedicated staging runtime
+service account, and the private staging bucket. Cloning uses an authenticated
+IAP TCP tunnel to read the production databases and a Cloud SQL Auth Proxy to
+write staging. A narrowly scoped IAP-to-PostgreSQL firewall rule is removed
+after cloning. It does not change the production database names or production
+Cloud Run service.
+
 Run the local release gate, commit and tag the exact source, then use the
 guarded candidate workflow:
 
@@ -105,13 +134,24 @@ guarded candidate workflow:
 ```
 
 The candidate command refuses a dirty or untagged worktree, blocks while the
-live service reports operational activity, and deploys the new revision with
-zero production traffic. Cloud regression checks both databases, the mounted
-bucket, public routes, authorization rejection, and version reporting before
-promotion is allowed; the local gate covers the authenticated organization-
-scoped R2C WebSocket. Promotion repeats the cloud checks and activity gate
-before an atomic 100-percent traffic switch. Use `./rollback_release.sh` to
-restore the recorded prior revision.
+live service reports operational activity, refreshes the two staging database
+clones, and deploys an IAM-protected staging service. Full authenticated
+regression runs against the clones and isolated bucket. The exact tested image
+digest is then deployed with zero production traffic and checked non-mutatively
+against production before promotion is allowed. Promotion repeats the
+production checks and activity gate before an atomic 100-percent traffic
+switch. Use `./rollback_release.sh` to restore the recorded prior revision.
+
+After the post-release observation window, and no later than 24 hours after the
+clone refresh, run:
+
+```bash
+./cleanup_pilot_staging.sh
+```
+
+Cleanup removes only `r2c-tracker-staging` and the `r2c-release-staging` Cloud
+SQL instance containing both cloned databases. Reusable staging secrets,
+service account, and the empty bucket remain in place for the next release.
 
 The underlying pilot wrapper pins the project, region, service, dedicated VPC
 network and subnet, bucket, service account, and Secret Manager names. It

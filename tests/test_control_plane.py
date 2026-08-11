@@ -645,6 +645,10 @@ class ControlPlaneStoreTest(unittest.TestCase):
         )
         self.assertEqual(29.97, streams[0].source_fps)
         self.assertEqual("Ken's iPad", streams[0].device_name)
+        self.assertEqual("live", streams[0].media_kind)
+        self.assertIsNone(streams[0].recorded_at)
+        self.assertEqual(0, streams[0].duration_ms)
+        self.assertEqual("", streams[0].thumbnail_revision)
 
         retired = asyncio.run(
             self.store.reconcile_device_video_streams(
@@ -1038,6 +1042,171 @@ class ControlPlaneStoreTest(unittest.TestCase):
                     self.now + timedelta(seconds=46),
                 )
             ),
+        )
+
+    def test_video_request_decline_and_priority_replacement_are_device_scoped(self):
+        organization = self.create_organization()
+        invitation = asyncio.run(self.store.get_invitation(
+            organization.designator,
+            organization.primary_admin_email,
+        ))
+        owner = asyncio.run(self.store.activate_owner(
+            organization.designator,
+            organization.primary_admin_email,
+            "correct horse battery staple",
+            self.now,
+            activation_nonce=invitation.activation_nonce,
+        ))
+        campaign = asyncio.run(self.store.create_enrollment_campaign(
+            organization_id=organization.id,
+            label="Priority video tablet",
+            created_by_user_id=owner.id,
+            expires_in_hours=24,
+            max_redemptions=1,
+            now=self.now,
+        ))
+        device = asyncio.run(self.store.issue_device_credential(
+            campaign_id=campaign.id,
+            organization_id=organization.id,
+            device_name="Pilot tablet",
+            platform="android",
+            now=self.now,
+        ))
+        session_ids = (
+            "10000000-0000-0000-0000-000000000001",
+            "10000000-0000-0000-0000-000000000002",
+        )
+        for index, session_id in enumerate(session_ids):
+            asyncio.run(self.store.advertise_video_stream(
+                organization_id=organization.id,
+                device_credential_id=device.id,
+                device_name="Pilot tablet",
+                session_id=session_id,
+                incident_name="Priority test",
+                drone_designator=f"DRONE-{index + 1}",
+                source_width=1280,
+                source_height=720,
+                source_fps=15,
+                source_bitrate_bps=1_000_000,
+                source_codec="H264",
+                now=self.now,
+            ))
+
+        offer_sdp = "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n"
+
+        def ready_request(session_id, offset):
+            request = asyncio.run(self.store.create_video_stream_request(
+                organization_id=organization.id,
+                stream_session_id=session_id,
+                requester_user_id=owner.id,
+                now=self.now + timedelta(seconds=offset),
+            ))
+            asyncio.run(self.store.start_video_preflight(
+                request_id=request.id,
+                organization_id=organization.id,
+                requester_user_id=owner.id,
+                browser_offer_sdp=offer_sdp,
+                now=self.now + timedelta(seconds=offset + 1),
+            ))
+            asyncio.run(self.store.record_video_preflight_result(
+                request_id=request.id,
+                device_credential_id=device.id,
+                route_kind="routed",
+                estimated_uplink_bps=2_000_000,
+                now=self.now + timedelta(seconds=offset + 2),
+            ))
+            return request
+
+        initial = ready_request(session_ids[0], 1)
+        declined_initial = asyncio.run(self.store.record_video_stream_decision(
+            request_id=initial.id,
+            device_credential_id=device.id,
+            decision="decline",
+            now=self.now + timedelta(seconds=4),
+        ))
+        self.assertEqual("insufficient bandwidth", declined_initial.status_message)
+
+        first_viewer = ready_request(session_ids[0], 5)
+        asyncio.run(self.store.record_video_stream_decision(
+            request_id=first_viewer.id,
+            device_credential_id=device.id,
+            decision="approve",
+            selected_width=640,
+            selected_height=360,
+            selected_fps=5,
+            selected_bitrate_bps=200_000,
+            now=self.now + timedelta(seconds=8),
+        ))
+        asyncio.run(self.store.start_video_media(
+            request_id=first_viewer.id,
+            organization_id=organization.id,
+            requester_user_id=owner.id,
+            browser_offer_sdp=offer_sdp,
+            now=self.now + timedelta(seconds=9),
+        ))
+
+        lower_priority = asyncio.run(self.store.create_video_stream_request(
+            organization_id=organization.id,
+            stream_session_id=session_ids[1],
+            requester_user_id=owner.id,
+            now=self.now + timedelta(seconds=10),
+        ))
+        with self.assertRaisesRegex(ControlPlaneError, "already in progress"):
+            asyncio.run(self.store.create_video_stream_request(
+                organization_id=organization.id,
+                stream_session_id=session_ids[0],
+                requester_user_id=owner.id,
+                now=self.now + timedelta(seconds=11),
+            ))
+        asyncio.run(self.store.start_video_preflight(
+            request_id=lower_priority.id,
+            organization_id=organization.id,
+            requester_user_id=owner.id,
+            browser_offer_sdp=offer_sdp,
+            now=self.now + timedelta(seconds=11),
+        ))
+        asyncio.run(self.store.record_video_preflight_result(
+            request_id=lower_priority.id,
+            device_credential_id=device.id,
+            route_kind="routed",
+            estimated_uplink_bps=2_000_000,
+            now=self.now + timedelta(seconds=12),
+        ))
+        declined_secondary = asyncio.run(
+            self.store.record_video_stream_decision(
+                request_id=lower_priority.id,
+                device_credential_id=device.id,
+                decision="decline",
+                now=self.now + timedelta(seconds=13),
+            )
+        )
+        self.assertEqual(
+            f"App already streaming to {owner.email}",
+            declined_secondary.status_message,
+        )
+
+        replacement = ready_request(session_ids[1], 14)
+        asyncio.run(self.store.record_video_stream_decision(
+            request_id=replacement.id,
+            device_credential_id=device.id,
+            decision="approve",
+            selected_width=640,
+            selected_height=360,
+            selected_fps=5,
+            selected_bitrate_bps=200_000,
+            now=self.now + timedelta(seconds=17),
+        ))
+        displaced = asyncio.run(
+            self.store.get_video_media_exchange_for_requester(
+                request_id=first_viewer.id,
+                organization_id=organization.id,
+                requester_user_id=owner.id,
+            )
+        )
+        self.assertEqual("redirected", displaced.state)
+        self.assertEqual(
+            f"Stream redirected to {owner.email}",
+            displaced.status_message,
         )
 
     def test_missing_video_source_closes_pending_request(self):
