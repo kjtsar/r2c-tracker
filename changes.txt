@@ -1,4 +1,4 @@
-v1.4.29: pending review
+v1.4.29: deployed
 * Replaced repeated current-session page reloads with authenticated membership reconciliation: the page now reloads only when stream session IDs change and swaps refreshed preview frames in place.
 * Added focused-viewer thumbnail leases so connected Android and iOS tablets refresh live previews every five seconds only while the tablet stream page is being viewed, without starting a full video session or storing media in the cloud.
 * Stopped volatile source dimensions, frame rate, bitrate, and codec observations from being treated as stream lifecycle changes.
