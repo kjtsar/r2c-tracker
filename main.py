@@ -1119,7 +1119,7 @@ class R2CCoordinationHub:
     async def resolve_tablet_link_code(
         self,
         code: str,
-    ) -> Optional[DeviceCredentialRecord]:
+    ) -> Optional["DeviceCredentialRecord"]:
         """Resolve a short alias strictly from authenticated live sockets.
 
         A 32-bit code can collide. Never guess in that case: an ambiguous
@@ -1129,7 +1129,7 @@ class R2CCoordinationHub:
         if not re.fullmatch(r"[A-Za-z0-9_-]{6}", clean_code):
             return None
         async with self._lock:
-            matches: dict[str, DeviceCredentialRecord] = {}
+            matches: dict[str, "DeviceCredentialRecord"] = {}
             for connection in self._connections.values():
                 credential = connection.device_credential
                 if credential is None:
@@ -1154,14 +1154,14 @@ class R2CCoordinationHub:
         self,
         designator: str,
         device_name: str,
-    ) -> Optional[DeviceCredentialRecord]:
+    ) -> Optional["DeviceCredentialRecord"]:
         """Resolve one canonical tablet path from live connection state."""
         clean_designator = designator.strip().lower()
         clean_device_name = device_name.strip().lower()
         if not clean_designator or not clean_device_name:
             return None
         async with self._lock:
-            matches: dict[str, DeviceCredentialRecord] = {}
+            matches: dict[str, "DeviceCredentialRecord"] = {}
             for connection in self._connections.values():
                 credential = connection.device_credential
                 if (
