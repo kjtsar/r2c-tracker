@@ -42,6 +42,7 @@
   let audioBytesReceived = 0;
   let videoBytesReceived = 0;
   let lastMetricsReportAt = 0;
+  let trackAttachedAt = 0;
   const metricsSessionId = window.crypto && typeof window.crypto.randomUUID === "function"
     ? window.crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -160,7 +161,6 @@
 
   async function reportEnded(message) {
     if (endedReported) return;
-    await reportStarted().catch(function () {});
     await reportMetrics(true, false).catch(function () {});
     endedReported = true;
     window.clearInterval(statsTimer);
@@ -183,7 +183,7 @@
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({ form_token: formToken }),
+      body: JSON.stringify({ form_token: formToken, reason: message }),
     });
   }
 
@@ -231,10 +231,6 @@
 
   async function inspectFrameProgress() {
     if (endedReported) return;
-    if (!startedReported) {
-      await reportStarted().catch(function () {});
-      if (!startedReported) return;
-    }
     if (document.hidden) {
       lastDecodeProgressAt = Date.now();
       lastPacketProgressAt = Date.now();
@@ -261,6 +257,9 @@
     videoBytesReceived = inspectedVideoBytesReceived;
     await reportMetrics(false, false).catch(function () {});
     const now = Date.now();
+    if (!startedReported && (videoBytesReceived > 0 || decodedFrames > 0)) {
+      await reportStarted().catch(function () {});
+    }
     if (videoBytesReceived > lastVideoBytes) {
       lastVideoBytes = videoBytesReceived;
       lastPacketProgressAt = now;
@@ -274,6 +273,9 @@
     }
     if (lastPacketProgressAt && now - lastPacketProgressAt >= 15000) {
       await reportEnded("Video source stopped; the frozen last frame was cleared.");
+    } else if (!lastPacketProgressAt && trackAttachedAt &&
+               now - trackAttachedAt >= 15000) {
+      await reportEnded("No video packets arrived; the media connection was closed.");
     }
     renderAudioCounters(microphoneEnabled ? "Microphone live" : "Microphone off");
   }
@@ -296,6 +298,7 @@
     }
     video.srcObject = stream;
     video.style.display = "block";
+    trackAttachedAt = Date.now();
     event.track.addEventListener("ended", function () {
       if (!pageLeaving) {
         reportEnded("Video source stopped; the last frame was cleared.").catch(function () {});
@@ -306,15 +309,13 @@
     });
   });
   video.addEventListener("playing", function () {
-    show("Live video • remote viewing authorized by the pilot or visual observer", "playing");
-    lastDecodeProgressAt = Date.now();
-    lastPacketProgressAt = Date.now();
+    show("Video track attached; waiting for the first video frame…", "connecting");
     if (!statsTimer) {
       statsTimer = window.setInterval(function () {
         inspectFrameProgress().catch(function () {});
       }, 1500);
     }
-    reportStarted().catch(function () {});
+    inspectFrameProgress().catch(function () {});
   });
   peer.addEventListener("connectionstatechange", function () {
     if (!pageLeaving && !endedReported &&

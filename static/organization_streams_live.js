@@ -49,6 +49,14 @@
     return !["complete", "error"].includes(preflight.dataset.state || "");
   }
 
+  function preflightOwnsLifecycle() {
+    // The preflight controller already polls the request and performs the one
+    // intentional navigation after the pilot/VO decision.  Reloading this
+    // page for intermediate request notifications causes the stable session
+    // snapshot (and the rest of the page) to flash repeatedly.
+    return Boolean(document.getElementById("video-preflight"));
+  }
+
   function mediaIsBusy() {
     const media = document.getElementById("video-media");
     if (!media) return false;
@@ -96,8 +104,10 @@
         return;
       }
       if (message.type === "ready" && readyStateDiffers(message)) {
+        if (preflightOwnsLifecycle()) return;
         reloadWhenIdle();
       } else if (message.type === "streams_changed") {
+        if (preflightOwnsLifecycle()) return;
         // Do not tear down an in-flight preflight or media connection. Keep
         // the refresh pending and apply it as soon as that operation reaches
         // a terminal UI state.

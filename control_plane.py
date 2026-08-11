@@ -5452,6 +5452,7 @@ class ControlPlaneStore:
 
     async def stop_video_stream(
         self, *, request_id: str, organization_id: str, requester_user_id: str,
+        reason: str = "",
         now: Optional[datetime] = None,
     ) -> VideoStreamRequestRecord:
         stopped_at = now or utc_now()
@@ -5471,6 +5472,8 @@ class ControlPlaneStore:
             if request.state == "stopped":
                 return self._video_stream_request_record(request, stream)
             request.state = "stopped"
+            clean_reason = str(reason or "").strip()[:400]
+            request.status_message = clean_reason
             request.stopped_at = stopped_at
             exchange = await session.get(VideoMediaExchange, request.id)
             if exchange is not None:
@@ -5480,7 +5483,10 @@ class ControlPlaneStore:
                 actor_type="organization_user",
                 actor_id=requester_user_id,
                 event_type="video.stopped",
-                details_json=json.dumps({"request_id": request.id}),
+                details_json=json.dumps({
+                    "request_id": request.id,
+                    "reason": clean_reason,
+                }),
                 created_at=stopped_at,
             ))
             await self._notify_video_stream_change(session, request.organization_id)

@@ -226,16 +226,43 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn("message.revision !== renderedRevision", script)
         self.assertIn("pendingReload = true", script)
 
+    def test_preflight_owns_request_refresh_until_one_decision_navigation(self):
+        live_script = Path("static/organization_streams_live.js").read_text()
+        preflight_script = Path("static/video_preflight.js").read_text()
+
+        self.assertIn("function preflightOwnsLifecycle()", live_script)
+        self.assertGreaterEqual(
+            live_script.count("if (preflightOwnsLifecycle()) return"),
+            2,
+        )
+        self.assertIn("await waitForPilotDecision()", preflight_script)
+        self.assertIn('["approved", "streaming"]', preflight_script)
+        self.assertEqual(1, preflight_script.count("window.location.reload()"))
+
     def test_video_start_marker_retries_until_the_server_acknowledges_it(self):
         script = Path("static/video_media.js").read_text()
 
         self.assertIn("if (!response.ok) throw new Error", script)
         self.assertIn("startedReported = true", script)
-        self.assertIn("if (!startedReported) {", script)
+        self.assertIn(
+            "!startedReported && (videoBytesReceived > 0 || decodedFrames > 0)",
+            script,
+        )
+        self.assertNotIn(
+            "await reportStarted().catch(function () {});\n"
+            "    await reportMetrics(true, false)",
+            script,
+        )
         self.assertLess(
             script.index("if (!response.ok) throw new Error"),
             script.index("startedReported = true"),
         )
+
+    def test_video_end_reports_browser_reason(self):
+        script = Path("static/video_media.js").read_text()
+
+        self.assertIn("reason: message", script)
+        self.assertIn("No video packets arrived", script)
 
     def test_video_decoder_stall_keeps_live_packet_flow_connected(self):
         script = Path("static/video_media.js").read_text()

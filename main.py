@@ -258,6 +258,7 @@ class BrowserVideoMediaOffer(BaseModel):
 
 class BrowserVideoMediaState(BaseModel):
     form_token: str = Field(min_length=16, max_length=512)
+    reason: str = Field(default="", max_length=400)
 
 
 class BrowserVideoMediaMetrics(BrowserVideoMediaState):
@@ -7870,6 +7871,7 @@ async def organization_video_media_ended(
             request_id=request_id,
             organization_id=organization.id,
             requester_user_id=user.id,
+            reason=payload.reason,
         )
         await r2c_hub.send_video_stream_request_cancelled(
             device_credential_id=result.device_credential_id,

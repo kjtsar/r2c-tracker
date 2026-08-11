@@ -961,6 +961,7 @@ class ControlPlaneStoreTest(unittest.TestCase):
                 request_id=failed_low_request.id,
                 organization_id=organization.id,
                 requester_user_id=owner.id,
+                reason="Video connection failed before packets arrived.",
                 now=self.now + timedelta(seconds=37),
             )
         )

@@ -175,6 +175,7 @@
         );
         finished = true;
         peer.close();
+        await waitForPilotDecision();
         return;
       }
       await new Promise((resolve) => window.setTimeout(resolve, 250));
@@ -185,6 +186,27 @@
         `(${browserTransportState()}). ` +
         "The request remains available until it expires.",
       );
+    }
+  }
+
+  async function waitForPilotDecision() {
+    // Keep the completed link-test UI and session snapshot stable.  The
+    // general stream event socket deliberately ignores intermediate request
+    // notifications while this controller is present; navigate exactly once
+    // when the operator has made a decision.
+    while (true) {
+      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+      const current = await readStatus();
+      if (["approved", "streaming"].includes(current.state || "")) {
+        window.location.reload();
+        return;
+      }
+      if (["declined", "stopped", "redirected", "expired", "e_nosuch_stream"].includes(
+        current.state || ""
+      )) {
+        show(current.statusMessage || "The video request was not started.", "error");
+        return;
+      }
     }
   }
 

@@ -286,6 +286,7 @@
                     loading="lazy"
                     style="display:block;width:160px;max-height:100px;object-fit:cover;border-radius:6px"
                   >
+                  <span class="secondary" style="display:block">Session snapshot</span>
                 </button>
               </form>
               {% else %}
@@ -295,6 +296,7 @@
                 loading="lazy"
                 style="display:block;width:160px;max-height:100px;object-fit:cover;background:#111;border-radius:6px"
               >
+              <span class="secondary" style="display:block">Session snapshot</span>
               {% endif %}
               {% else %}
               <span class="secondary">Preview pending</span>
@@ -483,9 +485,9 @@
      data-designator="{{ organization.designator|lower }}"
      data-active="{{ 'true' if stream_status_active else 'false' }}"
      data-revision="{{ stream_status_revision }}"></div>
-<script src="/static/organization_streams_live.js?v=20260802-2" defer></script>
+<script src="/static/organization_streams_live.js?v=20260811-1" defer></script>
 {% if active_preflight_request_id %}
-<script src="/static/video_preflight.js?v=20260805-1" defer></script>
+<script src="/static/video_preflight.js?v=20260811-1" defer></script>
 {% endif %}
 {% if active_media_request_id %}
 <div id="video-media"
