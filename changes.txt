@@ -1,4 +1,4 @@
-v1.4.28: pending review
+v1.4.28: deployed
 * Stabilized the current-session streams page around a clearly labeled single session snapshot, avoiding repeated full-page reloads while link testing and waiting for pilot/VO approval.
 * Count video as started only after the browser receives media, retain the browser-side WebRTC termination reason, and report a clear no-packets failure instead of briefly presenting an empty track as playing.
 
