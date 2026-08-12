@@ -54,6 +54,7 @@ from control_plane import (
     DeviceCredentialRecord,
     DuplicateOrganizationError,
     InvalidOrganizationError,
+    managed_video_quality_choices,
     normalize_video_preflight_answer,
     require_separate_database,
     stream_link_code,
@@ -254,6 +255,14 @@ class BrowserVideoMediaOffer(BaseModel):
     sdp: str = Field(min_length=3, max_length=262_144)
     form_token: str = Field(min_length=16, max_length=512)
     relay_candidate_ms: int = Field(default=0, ge=0, le=60_000)
+
+
+class BrowserVideoQualitySelection(BaseModel):
+    form_token: str = Field(min_length=16, max_length=512)
+    width: int = Field(ge=2, le=16_384)
+    height: int = Field(ge=2, le=16_384)
+    fps: float = Field(gt=0, le=240)
+    bitrate_bps: int = Field(gt=0, le=1_000_000_000)
 
 
 class BrowserVideoMediaState(BaseModel):
@@ -1000,6 +1009,11 @@ async def protect_control_plane_pages(request: Request, call_next):
     if (
         path.startswith("/platform-admin/")
         or path == "/google/callback"
+        or path == "/organizations/select"
+        or (
+            path == "/"
+            and request.session.get("organization_user_id")
+        )
         or organization_page is not None
     ):
         response.headers["Cache-Control"] = "no-store"
@@ -1445,6 +1459,7 @@ class R2CCoordinationHub:
             source_fps=stream_request.source_fps,
             source_bitrate_bps=stream_request.source_bitrate_bps,
             source_codec=stream_request.source_codec,
+            remote_control_enabled=stream_request.remote_control_enabled,
             expires_at=stream_request.expires_at,
         )
 
@@ -1970,6 +1985,9 @@ class R2CCoordinationHub:
                         advertised.get("thumbnailRevision", "") or ""
                     ),
                     timezone_name=timezone_name,
+                    remote_control_enabled=bool(
+                        payload.get("remoteControlEnabled", False)
+                    ),
                 )
                 accepted_session_ids.append(stream.session_id)
                 await self.cache_video_thumbnail(
@@ -2023,6 +2041,7 @@ class R2CCoordinationHub:
                 source_fps=stream_request.source_fps,
                 source_bitrate_bps=stream_request.source_bitrate_bps,
                 source_codec=stream_request.source_codec,
+                remote_control_enabled=stream_request.remote_control_enabled,
                 expires_at=stream_request.expires_at,
             )
         for exchange in pending_preflight_offers:
@@ -2411,6 +2430,14 @@ class R2CCoordinationHub:
                 "type": "video_media_offer",
                 "requestId": exchange.request_id,
                 "streamSessionId": exchange.stream_session_id,
+                "requesterEmail": getattr(exchange, "requester_email", ""),
+                "routeKind": getattr(exchange, "route_kind", "unknown"),
+                "selectedWidth": getattr(exchange, "selected_width", 0),
+                "selectedHeight": getattr(exchange, "selected_height", 0),
+                "selectedFps": getattr(exchange, "selected_fps", 0.0),
+                "selectedBitrateBps": getattr(
+                    exchange, "selected_bitrate_bps", 0
+                ),
                 "sdp": exchange.browser_offer_sdp,
                 "iceServers": ice_servers,
                 "expiresAt": exchange.expires_at.isoformat(),
@@ -2439,6 +2466,7 @@ class R2CCoordinationHub:
         source_fps: float,
         source_bitrate_bps: int,
         source_codec: str,
+        remote_control_enabled: bool,
         expires_at: datetime,
     ) -> bool:
         async with self._lock:
@@ -2465,7 +2493,8 @@ class R2CCoordinationHub:
                         "sourceBitrateBps": source_bitrate_bps,
                         "sourceCodec": source_codec,
                         "expiresAt": expires_at.isoformat(),
-                        "consentRequired": True,
+                        "consentRequired": not remote_control_enabled,
+                        "remoteControlEnabled": remote_control_enabled,
                     }
                 )
             )
@@ -4347,7 +4376,7 @@ def template_navigation(request, organization_designator=None):
     if designator:
         return {
             "scope": "organization",
-            "home_url": f"/{designator}",
+            "home_url": "/",
             "designator": designator,
         }
     try:
@@ -4759,15 +4788,71 @@ async def organization_directory(
         response: Response):
     response.headers["X-Robots-Tag"] = "noindex, nofollow"
     organizations = ()
+    authorized_organizations = ()
+    current_organization_designator = ""
+    organization_identity_name = ""
     if control_plane_store is not None:
+        all_organizations = await control_plane_store.list_organizations()
+        organization_by_id = {
+            organization.id: organization
+            for organization in all_organizations
+            if organization.lifecycle_state != "archived"
+        }
+        user_id = request.session.get("organization_user_id")
+        session_designator = request.session.get("organization_designator")
+        current_user = (
+            await control_plane_store.get_user(user_id)
+            if isinstance(user_id, str)
+            else None
+        )
+        current_organization = organization_by_id.get(
+            current_user.organization_id if current_user is not None else ""
+        )
+        if (
+            current_user is not None
+            and current_user.state == "active"
+            and current_organization is not None
+            and session_designator == current_organization.designator
+        ):
+            memberships = (
+                await control_plane_store.list_active_users_by_email(
+                    current_user.email
+                )
+                if request.session.get("organization_google_subject")
+                else (current_user,)
+            )
+            authorized_ids = {membership.organization_id for membership in memberships}
+            authorized_organizations = tuple(
+                sorted(
+                    (
+                        organization_by_id[organization_id]
+                        for organization_id in authorized_ids
+                        if organization_id in organization_by_id
+                    ),
+                    key=lambda organization: (
+                        organization.legal_name.casefold(),
+                        organization.designator,
+                    ),
+                )
+            )
+            current_organization_designator = current_organization.designator
+            organization_identity_name = current_user.display_name
+        elif user_id or session_designator:
+            request.session.pop("organization_user_id", None)
+            request.session.pop("organization_designator", None)
+
+        authorized_ids = {
+            organization.id for organization in authorized_organizations
+        }
         organizations = tuple(
             sorted(
                 (
                     organization
-                    for organization in await control_plane_store.list_organizations()
+                    for organization in all_organizations
                     if (
                         organization.lifecycle_state != "archived"
                         and organization.records_visibility == "public"
+                        and organization.id not in authorized_ids
                     )
                 ),
                 key=lambda organization: (
@@ -4784,7 +4869,55 @@ async def organization_directory(
             "enable_live_refresh": False,
             "include_leaflet": False,
             "organizations": organizations,
+            "authorized_organizations": authorized_organizations,
+            "current_organization_designator": current_organization_designator,
+            "organization_identity_name": organization_identity_name,
+            "organization_select_csrf_token": csrf_token(
+                request,
+                "organization_select",
+            ),
         },
+    )
+
+
+@app.post("/organizations/select", include_in_schema=False)
+async def select_authorized_organization(
+        request: Request,
+        form_token: Annotated[str, Form()],
+        designator: Annotated[str, Form()]):
+    verify_csrf(request, "organization_select", form_token)
+    session_designator = request.session.get("organization_designator")
+    if not isinstance(session_designator, str):
+        raise HTTPException(status_code=401, detail="Organization login required.")
+    _current_organization, current_user = await require_organization_user(
+        request,
+        session_designator,
+    )
+    organization = await control_plane_store.get_organization(designator)
+    memberships = (
+        await control_plane_store.list_active_users_by_email(current_user.email)
+        if request.session.get("organization_google_subject")
+        else (current_user,)
+    )
+    membership = next(
+        (
+            candidate
+            for candidate in memberships
+            if organization is not None
+            and candidate.organization_id == organization.id
+        ),
+        None,
+    )
+    if organization is None or membership is None:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not authorized for that organization.",
+        )
+    request.session["organization_user_id"] = membership.id
+    request.session["organization_designator"] = organization.designator
+    return RedirectResponse(
+        f"/{organization.designator.lower()}/admin",
+        status_code=status.HTTP_303_SEE_OTHER,
     )
 
 
@@ -4904,6 +5037,11 @@ async def render_public_dashboard(
             ),
             "organization_legal_name": (
                 organization.legal_name if organization else None
+            ),
+            "organization_identity_name": (
+                await organization_page_identity(request, organization.designator)
+                if organization is not None
+                else ""
             ),
         },
     )
@@ -7539,6 +7677,11 @@ async def organization_streams(
         }
         and stream_request.expires_at >= datetime.now(UTC)
     }
+    active_consumers_by_device_id = {
+        stream_request.device_credential_id: stream_request.requester_email
+        for stream_request in organization_requests
+        if stream_request.state in {"approved", "streaming"}
+    }
     stream_status = organization_stream_status(
         streams,
         organization_requests,
@@ -7578,6 +7721,10 @@ async def organization_streams(
             "request_in_progress_session_ids": (
                 request_in_progress_session_ids
             ),
+            "active_consumers_by_device_id": active_consumers_by_device_id,
+            "remote_control_enabled": any(
+                stream.remote_control_enabled for stream in streams
+            ),
             "video_ice_servers": video_ice_servers,
             "stream_status_active": stream_status["active"],
             "stream_membership_revision": stream_status[
@@ -7611,6 +7758,7 @@ def organization_stream_status(streams, requests) -> dict:
             ),
             "durationMs": stream.duration_ms,
             "thumbnailRevision": stream.thumbnail_revision,
+            "remoteControlEnabled": stream.remote_control_enabled,
         }
         for stream in streams
     ]
@@ -7666,6 +7814,19 @@ def stream_membership_revision(streams) -> str:
     return hashlib.sha256(encoded).hexdigest()[:20]
 
 
+def thumbnail_preview_device_ids(streams, scoped_device_id: str = "") -> tuple[str, ...]:
+    """Return the tablets whose visible live thumbnails need a refresh lease."""
+    scoped = scoped_device_id.strip()
+    device_ids = {
+        stream.device_credential_id
+        for stream in streams
+        if stream.media_kind == "live"
+        and stream.device_credential_id
+        and (not scoped or stream.device_credential_id == scoped)
+    }
+    return tuple(sorted(device_ids))
+
+
 @app.post("/{designator}/streams/{session_id}/request")
 async def organization_request_stream(
         request: Request,
@@ -7699,6 +7860,7 @@ async def organization_request_stream(
             source_fps=stream_request.source_fps,
             source_bitrate_bps=stream_request.source_bitrate_bps,
             source_codec=stream_request.source_codec,
+            remote_control_enabled=stream_request.remote_control_enabled,
             expires_at=stream_request.expires_at,
         )
         preflight_request_id = stream_request.id
@@ -7713,8 +7875,11 @@ async def organization_request_stream(
                 if delivered
                 else "Stream request recorded; device delivery is pending. "
             )
-            + "Video will remain off until the pilot or visual observer "
-            "approves it.",
+            + (
+                "You will choose the measured video quality."
+                if stream_request.remote_control_enabled
+                else "Video will remain off until the pilot or visual observer approves it."
+            ),
             "success",
         )
     except ControlPlaneError as exc:
@@ -7852,6 +8017,18 @@ async def organization_video_preflight_status(
             ),
             "routeKind": exchange.route_kind,
             "estimatedUplinkBps": exchange.estimated_uplink_bps,
+            "remoteControlEnabled": exchange.remote_control_enabled,
+            "qualityChoices": (
+                managed_video_quality_choices(
+                    source_width=exchange.source_width,
+                    source_height=exchange.source_height,
+                    source_fps=exchange.source_fps,
+                    usable_uplink_bps=exchange.estimated_uplink_bps,
+                )
+                if exchange.remote_control_enabled
+                and exchange.state == "awaiting_approval"
+                else ()
+            ),
             "expiresAt": exchange.expires_at.isoformat(),
         }
     except ControlPlaneError as exc:
@@ -7859,6 +8036,36 @@ async def organization_video_preflight_status(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),
         ) from exc
+
+
+@app.post(
+    "/{designator}/streams/requests/{request_id}/remote-control/approve"
+)
+async def organization_remote_control_video_selection(
+        request: Request,
+        designator: str,
+        request_id: str,
+        payload: BrowserVideoQualitySelection):
+    verify_csrf(request, "organization_streams", payload.form_token)
+    organization, user = await require_organization_user(
+        request,
+        designator,
+        ("video_requester",),
+    )
+    try:
+        result = await control_plane_store.record_video_stream_decision(
+            request_id=request_id,
+            requester_user_id=user.id,
+            organization_id=organization.id,
+            decision="approve",
+            selected_width=payload.width,
+            selected_height=payload.height,
+            selected_fps=payload.fps,
+            selected_bitrate_bps=payload.bitrate_bps,
+        )
+        return {"accepted": True, "state": result.state}
+    except ControlPlaneError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/{designator}/streams/requests/{request_id}/media/offer")
@@ -8073,7 +8280,129 @@ async def organization_add_member(
     except (ControlPlaneError, InvalidOrganizationError, ValueError) as exc:
         flash(request, str(exc), "warning")
     return RedirectResponse(
-        url=f"/{organization.designator.lower()}/admin",
+        url=f"/{organization.designator.lower()}/admin#members",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post("/{designator}/members/{member_id}")
+async def organization_update_member(
+        request: Request,
+        designator: str,
+        member_id: str,
+        display_name: Annotated[str, Form()],
+        email: Annotated[str, Form()],
+        form_token: Annotated[str, Form()],
+        roles: Annotated[list[str] | None, Form()] = None):
+    verify_csrf(request, "organization_admin", form_token)
+    organization, user = await require_organization_user(
+        request,
+        designator,
+        ("organization_owner", "user_admin"),
+    )
+    try:
+        target = await control_plane_store.get_user(member_id)
+        if (
+            target is not None
+            and target.organization_id == organization.id
+            and "organization_owner" in target.roles
+            and "organization_owner" not in user.roles
+        ):
+            raise ControlPlaneError(
+                "Only the organization owner can edit the owner record."
+            )
+        member = await control_plane_store.update_user(
+            organization_id=organization.id,
+            user_id=member_id,
+            display_name=display_name,
+            email=email,
+            roles=tuple(roles or ()),
+            actor_id=user.id,
+        )
+        flash(request, f"Updated member {member.email}.", "success")
+    except (ControlPlaneError, InvalidOrganizationError, ValueError) as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(
+        url=f"/{organization.designator.lower()}/admin#members",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post("/{designator}/members/{member_id}/delete")
+async def organization_delete_member(
+        request: Request,
+        designator: str,
+        member_id: str,
+        confirmation: Annotated[str, Form()],
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_admin", form_token)
+    organization, user = await require_organization_user(
+        request,
+        designator,
+        ("organization_owner", "user_admin"),
+    )
+    try:
+        if confirmation != "delete":
+            raise ControlPlaneError("Confirm that you want to delete this member.")
+        target = await control_plane_store.get_user(member_id)
+        if (
+            target is not None
+            and target.organization_id == organization.id
+            and "organization_owner" in target.roles
+            and "organization_owner" not in user.roles
+        ):
+            raise ControlPlaneError(
+                "Only the organization owner can manage the owner record."
+            )
+        member = await control_plane_store.delete_user(
+            organization_id=organization.id,
+            user_id=member_id,
+            actor_id=user.id,
+        )
+        flash(request, f"Deleted member {member.email} and revoked access.", "success")
+    except ControlPlaneError as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(
+        url=f"/{organization.designator.lower()}/admin#members",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post("/{designator}/members/{member_id}/restore")
+async def organization_restore_member(
+        request: Request,
+        designator: str,
+        member_id: str,
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_admin", form_token)
+    organization, user = await require_organization_user(
+        request,
+        designator,
+        ("organization_owner", "user_admin"),
+    )
+    try:
+        member = await control_plane_store.restore_user(
+            organization_id=organization.id,
+            user_id=member_id,
+            actor_id=user.id,
+        )
+        invitation = await control_plane_store.get_invitation(
+            organization.designator,
+            member.email,
+        )
+        if CONTROL_PLANE_SIMULATION and invitation is not None:
+            request.session["_organization_invitation_url"] = (
+                control_plane_tokens.activation_url(invitation)
+            )
+        flash(
+            request,
+            f"Restored {member.email} as a pending member.",
+            "success",
+        )
+    except (ControlPlaneError, InvalidOrganizationError) as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(
+        url=f"/{organization.designator.lower()}/admin#members",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -9137,26 +9466,23 @@ async def organization_stream_events(
     clean_stream = stream.strip().lower()
 
     async def renew_thumbnail_preview() -> None:
-        if not clean_device_id:
-            return
         active_streams = await control_plane_store.list_active_video_streams(
             organization.id
         )
-        if not any(
-            stream.device_credential_id == clean_device_id
-            for stream in active_streams
+        for device_id in thumbnail_preview_device_ids(
+            active_streams,
+            clean_device_id,
         ):
-            return
-        delivered = await r2c_hub.send_video_thumbnail_preview(
-            device_credential_id=clean_device_id,
-            ttl_seconds=25,
-        )
-        if not delivered:
-            await control_plane_store.notify_video_thumbnail_preview(
-                organization_id=organization.id,
-                device_credential_id=clean_device_id,
+            delivered = await r2c_hub.send_video_thumbnail_preview(
+                device_credential_id=device_id,
                 ttl_seconds=25,
             )
+            if not delivered:
+                await control_plane_store.notify_video_thumbnail_preview(
+                    organization_id=organization.id,
+                    device_credential_id=device_id,
+                    ttl_seconds=25,
+                )
 
     async def current_status():
         streams, requests = await asyncio.gather(
@@ -9201,7 +9527,9 @@ async def organization_stream_events(
             timeout_seconds = (
                 1.0 if status_snapshot["awaiting_approval"] else 30.0
             )
-            if clean_device_id:
+            # A live catalog can represent one tablet or several.  Renew its
+            # 25-second device leases before they expire in either case.
+            if status_snapshot["active"]:
                 timeout_seconds = min(timeout_seconds, 10.0)
             if expiry is not None:
                 expiry = expiry if expiry.tzinfo else expiry.replace(tzinfo=UTC)

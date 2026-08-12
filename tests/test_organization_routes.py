@@ -236,8 +236,10 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertNotIn("preflightIsBusy", live_script)
         self.assertEqual(1, live_script.count("window.location.reload()"))
         self.assertIn("await waitForPilotDecision()", preflight_script)
+        self.assertIn("renderRemoteQualityChooser(current)", preflight_script)
+        self.assertIn("remote-control/approve", preflight_script)
         self.assertIn('["approved", "streaming"]', preflight_script)
-        self.assertEqual(1, preflight_script.count("window.location.reload()"))
+        self.assertEqual(2, preflight_script.count("window.location.reload()"))
 
     def test_video_start_marker_retries_until_the_server_acknowledges_it(self):
         script = Path("static/video_media.js").read_text()
@@ -315,6 +317,34 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         status = main.organization_stream_status([], [waiting_request])
 
         self.assertTrue(status["awaiting_approval"])
+
+    def test_organization_stream_page_renews_each_visible_live_tablet(self):
+        streams = [
+            SimpleNamespace(device_credential_id="tablet-b", media_kind="live"),
+            SimpleNamespace(device_credential_id="tablet-a", media_kind="live"),
+            SimpleNamespace(device_credential_id="tablet-a", media_kind="live"),
+            SimpleNamespace(device_credential_id="tablet-c", media_kind="recording"),
+        ]
+
+        self.assertEqual(
+            ("tablet-a", "tablet-b"),
+            main.thumbnail_preview_device_ids(streams),
+        )
+
+    def test_tablet_stream_page_limits_preview_renewal_to_that_tablet(self):
+        streams = [
+            SimpleNamespace(device_credential_id="tablet-a", media_kind="live"),
+            SimpleNamespace(device_credential_id="tablet-b", media_kind="live"),
+        ]
+
+        self.assertEqual(
+            ("tablet-b",),
+            main.thumbnail_preview_device_ids(streams, "tablet-b"),
+        )
+        self.assertEqual(
+            (),
+            main.thumbnail_preview_device_ids(streams, "tablet-missing"),
+        )
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -445,7 +475,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn("User: Guest", guest_page.text)
         self.assertIn('href="/ncssar/admin"', guest_page.text)
         self.assertNotIn('href="/admin"', guest_page.text)
-        self.assertIn('class="site-home" href="/ncssar"', guest_page.text)
+        self.assertIn('class="site-home" href="/"', guest_page.text)
         self.assertNotIn('href="/r2c"', guest_page.text)
         self.assertNotIn('href="/docs"', guest_page.text)
 
@@ -498,8 +528,18 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         )
         admin_page = self.client.get("/ncssar/admin")
         self.assertIn("User: Primary Administrator", admin_page.text)
+        self.assertIn('class="site-home" href="/"', admin_page.text)
         self.assertIn('href="/ncssar/admin"', admin_page.text)
         self.assertIn('href="/ncssar/admin/flights"', admin_page.text)
+        public_dashboard = self.client.get("/ncssar")
+        self.assertIn("User: Primary Administrator", public_dashboard.text)
+        authenticated_directory = self.client.get("/")
+        self.assertIn(
+            "You are signed in as <strong>Primary Administrator</strong>",
+            authenticated_directory.text,
+        )
+        self.assertIn('action="/organizations/select"', authenticated_directory.text)
+        self.assertIn('value="NCSSAR"', authenticated_directory.text)
         billing_snapshot = SimpleNamespace(
             source_status="ready",
             source_message="Live billing data.",
@@ -549,6 +589,174 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             Decimal("25.00"),
             fake_checkout.create_checkout.call_args.kwargs["amount"],
         )
+
+    def test_google_identity_can_switch_memberships_but_password_identity_cannot(self):
+        first = asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Ken Taylor",
+                admin_email="ken@example.test",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        second = asyncio.run(
+            self.store.create_organization(
+                legal_name="Hill County Search and Rescue",
+                designator="HCSAR",
+                admin_name="Ken Taylor",
+                admin_email="ken@example.test",
+                postal_address="200 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        for organization in (first, second):
+            asyncio.run(
+                self.store.activate_owner(
+                    organization.designator,
+                    organization.primary_admin_email,
+                    "correct horse battery staple",
+                )
+            )
+
+        with patch.object(
+            main,
+            "google_oidc_client",
+            FakeGoogleOidcClient(first.primary_admin_email),
+        ):
+            self.client.get("/ncssar/google/start", follow_redirects=False)
+            login = self.client.get(
+                "/google/callback?code=test-code&state=organization-state",
+                follow_redirects=False,
+            )
+        self.assertEqual(303, login.status_code)
+
+        directory = self.client.get("/")
+        self.assertIn("North County Search and Rescue", directory.text)
+        self.assertIn("Hill County Search and Rescue", directory.text)
+        selected = self.client.post(
+            "/organizations/select",
+            data={
+                "form_token": self.form_token(directory),
+                "designator": "HCSAR",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(303, selected.status_code)
+        self.assertEqual("/hcsar/admin", selected.headers["location"])
+        hcsar_admin = self.client.get(selected.headers["location"])
+        self.assertEqual(200, hcsar_admin.status_code)
+        self.assertIn("User: Ken Taylor", hcsar_admin.text)
+
+        self.client.cookies.clear()
+        password_login_page = self.client.get("/ncssar/login")
+        password_login = self.client.post(
+            "/ncssar/login",
+            data={
+                "form_token": self.form_token(password_login_page),
+                "email": first.primary_admin_email,
+                "password": "correct horse battery staple",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(303, password_login.status_code)
+        password_directory = self.client.get("/")
+        self.assertNotIn("Hill County Search and Rescue", password_directory.text)
+        rejected = self.client.post(
+            "/organizations/select",
+            data={
+                "form_token": self.form_token(password_directory),
+                "designator": "HCSAR",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(403, rejected.status_code)
+
+    def test_owner_can_edit_delete_and_restore_member_from_admin_panel(self):
+        organization = asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Primary Administrator",
+                admin_email="admin@ncssar.example",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        owner = asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+            )
+        )
+        member = asyncio.run(
+            self.store.add_user(
+                organization_id=organization.id,
+                display_name="Member To Edit",
+                email="member@ncssar.example",
+                roles=("records_viewer",),
+                actor_id=owner.id,
+            )
+        )
+        login_page = self.client.get("/ncssar/login")
+        login = self.client.post(
+            "/ncssar/login",
+            data={
+                "form_token": self.form_token(login_page),
+                "email": organization.primary_admin_email,
+                "password": "correct horse battery staple",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(303, login.status_code)
+
+        page = self.client.get("/ncssar/admin")
+        self.assertIn(
+            f'class="member-link" href="#member-{member.id}"',
+            page.text,
+        )
+        self.assertIn("Save member", page.text)
+        updated = self.client.post(
+            f"/ncssar/members/{member.id}",
+            data={
+                "form_token": self.form_token(page),
+                "display_name": "Edited Member",
+                "email": "edited@ncssar.example",
+                "roles": ["records_admin", "video_requester"],
+            },
+            follow_redirects=True,
+        )
+        self.assertIn("Updated member edited@ncssar.example", updated.text)
+        current = asyncio.run(self.store.get_user(member.id))
+        self.assertEqual("Edited Member", current.display_name)
+        self.assertEqual({"records_admin", "video_requester"}, set(current.roles))
+
+        deleted = self.client.post(
+            f"/ncssar/members/{member.id}/delete",
+            data={
+                "form_token": self.form_token(updated),
+                "confirmation": "delete",
+            },
+            follow_redirects=True,
+        )
+        self.assertIn("Deleted member edited@ncssar.example", deleted.text)
+        self.assertIn("Deleted", deleted.text)
+        self.assertIn("Restore as pending member", deleted.text)
+        self.assertEqual("disabled", asyncio.run(self.store.get_user(member.id)).state)
+
+        restored = self.client.post(
+            f"/ncssar/members/{member.id}/restore",
+            data={"form_token": self.form_token(deleted)},
+            follow_redirects=True,
+        )
+        self.assertIn("Restored edited@ncssar.example as a pending member", restored.text)
+        self.assertIn("Pending activation", restored.text)
+        self.assertEqual("invited", asyncio.run(self.store.get_user(member.id)).state)
 
     def test_platform_navigation_does_not_expose_legacy_admin_links(self):
         self.client.cookies.clear()

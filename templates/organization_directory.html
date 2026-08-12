@@ -127,6 +127,27 @@
     text-align: left;
     text-decoration: none;
   }
+  .organization-list form {
+    margin: 0;
+  }
+  .organization-select {
+    display: flex;
+    width: 100%;
+    align-items: center;
+    justify-content: space-between;
+    gap: 18px;
+    padding: 17px 4px;
+    border: 0;
+    background: transparent;
+    color: #183153;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .organization-select:hover,
+  .organization-select:focus-visible {
+    color: #0b63c9;
+  }
   .organization-list a:hover,
   .organization-list a:focus-visible {
     color: #0b63c9;
@@ -165,6 +186,9 @@
 {% block content %}
 <section class="directory-shell">
   <h1>Find your organization.</h1>
+  {% if organization_identity_name %}
+  <p>You are signed in as <strong>{{ organization_identity_name }}</strong>.</p>
+  {% endif %}
   <p>
     Select a participating organization to open its R2C flight dashboard.
     Restricted dashboards will ask you to sign in.
@@ -195,8 +219,26 @@
       <button class="picker-close" type="submit" aria-label="Close organization list">×</button>
     </form>
   </div>
+  {% if authorized_organizations %}
+  <ul class="organization-list" aria-label="Your organizations">
+    {% for organization in authorized_organizations %}
+    <li>
+      <form method="post" action="/organizations/select">
+        <input type="hidden" name="form_token" value="{{ organization_select_csrf_token }}">
+        <input type="hidden" name="designator" value="{{ organization.designator }}">
+        <button class="organization-select" type="submit">
+          <strong>{{ organization.legal_name }}</strong>
+          <span>
+            {{ organization.designator }}{% if organization.designator == current_organization_designator %} · Current{% endif %}
+          </span>
+        </button>
+      </form>
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
   {% if organizations %}
-  <ul class="organization-list">
+  <ul class="organization-list" aria-label="Public organizations">
     {% for organization in organizations %}
     <li>
       <a href="/{{ organization.designator | lower }}">
@@ -208,7 +250,7 @@
     </li>
     {% endfor %}
   </ul>
-  {% else %}
+  {% elif not authorized_organizations %}
   <p class="directory-empty">
     No public organizations are listed. Use your organization&apos;s direct sign-in link or
     <a href="https://rid2caltopo.org/managed-pilot">request access</a>.

@@ -7,10 +7,17 @@ source; no remote media path is enabled by this work.
 ## Product contract
 
 An authenticated organization member with the `video_requester` role may ask
-to view a currently advertised stream. A request never starts video. The
-RID2Caltopo operator must see the requester's verified organization email,
-review the link estimate and data-rate choices, and explicitly select Start.
-There is no administrator bypass.
+to view a currently advertised stream. By default, a request never starts
+video until the RID2Caltopo operator sees the requester's verified organization
+email, reviews the link estimate and data-rate choices, and explicitly selects
+Start.
+
+Android and Apple also provide a persistent, device-local `Remote Video
+Control` setting, off by default. When it is on, the browser requester sees the
+measured route and bandwidth-safe quality choices and selects Start directly.
+The setting is advertised by the enrolled device; it is not an organization or
+platform-administrator bypass. Each request snapshots the advertised setting
+so changing it does not alter a request already in progress.
 
 The browser and tablet must display:
 
@@ -37,8 +44,10 @@ pending -> probing -> awaiting_approval -> approved -> streaming -> stopped
 - `pending`: the website accepted an authorized user's request.
 - `probing`: a consent-safe WebRTC data channel is measuring the candidate
   browser-to-tablet path. No controller frame may be attached.
-- `awaiting_approval`: route and quality estimates are visible on the tablet.
-- `approved`: the pilot/VO selected a quality and tapped Start.
+- `awaiting_approval`: route and quality estimates are ready for the pilot/VO,
+  or for the requester when the request's remote-control snapshot is enabled.
+- `approved`: the authorized decision-maker selected a quality and tapped
+  Start.
 - `streaming`: media is flowing and both ends show a persistent viewer/data-use
   indicator.
 - `stopped`: pilot/VO, viewer, timeout, or connectivity ended the session.
@@ -50,10 +59,10 @@ pending -> probing -> awaiting_approval -> approved -> streaming -> stopped
   browser tears down its media peer and shows
   `Stream redirected to <email-addr>`.
 
-Only one request per R2C device may be `approved` or `streaming`. One pending
-replacement may be reviewed while that session remains active. Approving it
-atomically retires the prior control-plane session and the tablet closes the
-prior WebRTC sender before accepting media signaling for the replacement.
+Only one request per R2C device may be `approved` or `streaming`. In the normal
+pilot/VO-controlled mode, one pending replacement may be reviewed while that
+session remains active. In remote-control mode, the session page identifies
+the current consumer and disables Request Video until that session ends.
 
 Every transition is server-validated, organization-scoped, and auditable.
 
@@ -106,9 +115,17 @@ locally connected tablet receives:
   "incidentName": "Training 2026-07-30",
   "droneDesignator": "NCS1m3",
   "expiresAt": "2026-07-30T18:10:00+00:00",
-  "consentRequired": true
+  "consentRequired": true,
+  "remoteControlEnabled": false
 }
 ```
+
+For a request created while Remote Video Control is advertised, both booleans
+are inverted. The device performs the same consent-safe preflight but does not
+show an approval prompt. After the requester selects a server-provided quality
+choice, the media offer includes that selection and the device announces
+`Now sharing video stream with <emailaddr>` as the existing stream/microphone
+legend becomes active.
 
 Cloud Run can place the browser request and tablet WebSocket on different
 instances. The database request is therefore the source of truth. In-process
@@ -129,8 +146,10 @@ The preflight creates an encrypted WebRTC data channel without a video track:
 2. The selected candidate pair determines `Direct` or `Routed`.
 3. The tablet sends paced, synthetic payload for approximately two seconds;
    the browser acknowledges sequence numbers and received bytes.
-4. The tablet computes usable uplink from delivered bytes, loss, and RTT, then
-   applies a safety margin before presenting quality choices.
+4. The tablet computes usable uplink from delivered bytes, loss, and RTT. The
+   tracker applies the same bounded Android/Apple quality policy and presents
+   choices to the pilot/VO or, for an enabled remote-control request, directly
+   to the requester.
 5. Probe payload and ICE credentials are discarded when the request ends.
 
 No image, audio, controller packet, flight record, or location is part of the

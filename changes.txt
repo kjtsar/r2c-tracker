@@ -1,3 +1,10 @@
+v1.4.30: pending review
+* Added requester-controlled remote video for tablets that explicitly advertise the persistent Remote Video Control setting, while preserving pilot/VO approval when that setting is off.
+* Show the measured Direct/Routed link result and selectable bandwidth-safe frame sizes and rates to the requester, while continuing to enforce one viewer per RID2Caltopo device.
+* Show the current viewer on tablet session pages and disable additional Request Video actions while a remotely controlled stream is in use.
+* Made organization member names open a direct editor for names, email addresses, and roles, with auditable disable and restore actions that preserve member history.
+* Kept authenticated organization identity across public dashboards and the tracker home page, where Google-authenticated users can select any active organization membership authorized for their verified email while password sessions remain tenant-scoped.
+
 v1.4.29: deployed
 * Replaced repeated current-session page reloads with authenticated membership reconciliation: the page now reloads only when stream session IDs change and swaps refreshed preview frames in place.
 * Added focused-viewer thumbnail leases so connected Android and iOS tablets refresh live previews every five seconds only while the tablet stream page is being viewed, without starting a full video session or storing media in the cloud.

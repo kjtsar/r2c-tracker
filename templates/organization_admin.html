@@ -105,6 +105,40 @@
       color: #24576a;
       font-size: 0.76rem;
   }
+  .member-link {
+      color: var(--org-teal);
+      font-weight: 800;
+  }
+  .member-editor {
+      display: none;
+      margin-top: 18px;
+      padding: 18px;
+      border: 2px solid var(--org-teal);
+      border-radius: 10px;
+      background: #f7fbfc;
+  }
+  .member-editor:target { display: block; }
+  .member-editor-header,
+  .member-actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+  }
+  .member-editor-header h3 { margin: 0; color: var(--org-navy); }
+  .member-editor-close { color: var(--org-teal); font-weight: 750; }
+  .member-delete-form {
+      margin-top: 18px;
+      padding-top: 16px;
+      border-top: 1px solid var(--org-line);
+  }
+  .member-delete-form label {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      color: #6d3030;
+  }
+  .member-delete-form input { margin-top: 3px; }
   .campaign-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
@@ -179,7 +213,7 @@
 
   <div class="org-grid">
     {% if "organization_owner" in organization_user.roles or "records_admin" in organization_user.roles %}
-    <section class="org-panel wide">
+    <section class="org-panel wide" id="members">
       <h2>Flight records &amp; migration</h2>
       <p>
         Review this organization's flight records, import a legacy archive,
@@ -363,10 +397,19 @@
           <tbody>
           {% for member in organization_users %}
             <tr>
-              <td><strong>{{ member.display_name }}</strong><br>{{ member.email }}</td>
+              <td>
+                {% if can_manage_users %}
+                <a class="member-link" href="#member-{{ member.id }}">{{ member.display_name }}</a>
+                {% else %}
+                <strong>{{ member.display_name }}</strong>
+                {% endif %}
+                <br>{{ member.email }}
+              </td>
               <td>
                 {% if member.state == "invited" %}
                 Pending activation
+                {% elif member.state == "disabled" %}
+                Deleted
                 {% else %}
                 {{ member.state }}
                 {% endif %}
@@ -382,6 +425,59 @@
         </table>
       </div>
       {% if can_manage_users %}
+      {% for member in organization_users %}
+      <div class="member-editor" id="member-{{ member.id }}">
+        <div class="member-editor-header">
+          <h3>Edit {{ member.display_name }}</h3>
+          <a class="member-editor-close" href="#members">Close</a>
+        </div>
+        {% if "organization_owner" in member.roles %}
+        <p>
+          The organization owner's identity is managed from platform
+          administration so ownership and contact records stay synchronized.
+        </p>
+        {% else %}
+        <form class="org-form two-column" method="post"
+              action="/{{ organization.designator|lower }}/members/{{ member.id }}">
+          <input type="hidden" name="form_token" value="{{ csrf_token }}">
+          <label>
+            Member name
+            <input name="display_name" maxlength="160" required value="{{ member.display_name }}">
+          </label>
+          <label>
+            Email
+            <input type="email" name="email" maxlength="320" required value="{{ member.email }}">
+          </label>
+          <div class="role-grid span-all">
+            {% for role in ["billing_admin", "user_admin", "records_admin", "records_viewer", "video_requester"] %}
+            <label><input type="checkbox" name="roles" value="{{ role }}"{% if role in member.roles %} checked{% endif %}> {{ role }}</label>
+            {% endfor %}
+          </div>
+          <div class="span-all">
+            <button class="primary-button" type="submit">Save member</button>
+          </div>
+        </form>
+        {% if member.state == "disabled" %}
+        <form class="member-delete-form" method="post"
+              action="/{{ organization.designator|lower }}/members/{{ member.id }}/restore">
+          <input type="hidden" name="form_token" value="{{ csrf_token }}">
+          <button class="primary-button" type="submit">Restore as pending member</button>
+        </form>
+        {% elif "organization_owner" not in member.roles %}
+        <form class="member-delete-form" method="post"
+              action="/{{ organization.designator|lower }}/members/{{ member.id }}/delete">
+          <input type="hidden" name="form_token" value="{{ csrf_token }}">
+          <label>
+            <input type="checkbox" name="confirmation" value="delete" required>
+            Confirm deletion and revoke this member's access.
+          </label>
+          <button class="danger-button" type="submit">Delete member</button>
+        </form>
+        {% endif %}
+        {% endif %}
+      </div>
+      {% endfor %}
+      <h3>Add member</h3>
       <form class="org-form two-column" method="post"
             action="/{{ organization.designator|lower }}/members">
         <input type="hidden" name="form_token" value="{{ csrf_token }}">

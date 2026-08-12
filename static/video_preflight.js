@@ -26,6 +26,9 @@
   const statusUrl =
     `/${encodeURIComponent(designator)}/streams/requests/` +
     `${encodeURIComponent(requestId)}/preflight/status`;
+  const remoteApprovalUrl =
+    `/${encodeURIComponent(designator)}/streams/requests/` +
+    `${encodeURIComponent(requestId)}/remote-control/approve`;
   // Preflight deliberately uses TURN. This avoids spending several seconds
   // trying host/server-reflexive paths and gives the pilot a conservative
   // measurement for the route that works through incident firewalls.
@@ -80,6 +83,83 @@
   function show(message, state) {
     statusElement.textContent = message;
     statusElement.dataset.state = state;
+  }
+
+  function qualityLabel(choice) {
+    const capacity = choice.capacity === "enough"
+      ? "enough bandwidth"
+      : choice.capacity === "fallback"
+        ? "fallback — try lowest quality"
+        : choice.capacity;
+    return `${choice.preset} • ${choice.width}×${choice.height} • ` +
+      `${Number(choice.fps).toFixed(1)} fps • est. ` +
+      `${(Number(choice.bitrateBps) / 1000000).toFixed(1)} Mbps • ${capacity}`;
+  }
+
+  function renderRemoteQualityChooser(current) {
+    const choices = Array.isArray(current.qualityChoices)
+      ? current.qualityChoices
+      : [];
+    statusElement.replaceChildren();
+    const heading = document.createElement("strong");
+    const mbps = Number(current.estimatedUplinkBps || 0) / 1000000;
+    heading.textContent =
+      `${current.routeKind === "routed" ? "Routed" : "Direct"} link measured ` +
+      `at ${mbps.toFixed(1)} Mbps usable. Choose video quality:`;
+    statusElement.appendChild(heading);
+    const list = document.createElement("div");
+    list.className = "remote-quality-choices";
+    let selected = choices.find((choice) => choice.capacity !== "insufficient") || null;
+    const buttons = [];
+    choices.forEach((choice) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = `remote-quality-choice capacity-${choice.capacity}`;
+      button.disabled = choice.capacity === "insufficient";
+      button.textContent = qualityLabel(choice);
+      button.addEventListener("click", () => {
+        selected = choice;
+        buttons.forEach((item) => item.classList.remove("is-selected"));
+        button.classList.add("is-selected");
+      });
+      if (choice === selected) button.classList.add("is-selected");
+      buttons.push(button);
+      list.appendChild(button);
+    });
+    statusElement.appendChild(list);
+    const start = document.createElement("button");
+    start.type = "button";
+    start.className = "request-button remote-quality-start";
+    start.textContent = "Start video";
+    start.disabled = !selected;
+    start.addEventListener("click", async () => {
+      if (!selected) return;
+      try {
+        start.disabled = true;
+        show("Authorizing the selected video profile…", "starting");
+        const response = await fetch(remoteApprovalUrl, {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify({
+            form_token: formToken,
+            width: selected.width,
+            height: selected.height,
+            fps: selected.fps,
+            bitrate_bps: selected.bitrateBps,
+          }),
+        });
+        if (!response.ok) {
+          const detail = await response.json().catch(() => ({}));
+          throw new Error(detail.detail || "The selected video profile was rejected.");
+        }
+        window.location.reload();
+      } catch (error) {
+        show(error.message || "The selected video profile was rejected.", "error");
+      }
+    });
+    statusElement.appendChild(start);
+    statusElement.dataset.state = "complete";
   }
 
   function waitForRelayCandidate(timeoutMs) {
@@ -168,14 +248,18 @@
           current.routeKind === "routed" ? "Routed" : "Direct";
         const mbps =
           Number(current.estimatedUplinkBps || 0) / 1000000;
-        show(
-          `${route} link measured at ${mbps.toFixed(1)} Mbps usable. ` +
-          "Waiting for the pilot or visual observer to choose quality.",
-          "complete",
-        );
         finished = true;
         peer.close();
-        await waitForPilotDecision();
+        if (current.remoteControlEnabled) {
+          renderRemoteQualityChooser(current);
+        } else {
+          show(
+            `${route} link measured at ${mbps.toFixed(1)} Mbps usable. ` +
+            "Waiting for the pilot or visual observer to choose quality.",
+            "complete",
+          );
+          await waitForPilotDecision();
+        }
         return;
       }
       await new Promise((resolve) => window.setTimeout(resolve, 250));

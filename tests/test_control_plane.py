@@ -15,6 +15,7 @@ from control_plane import (
     UsageDaily,
     hash_password,
     is_emergency_video_fallback,
+    managed_video_quality_choices,
     normalize_designator,
     normalize_session_description,
     normalize_video_preflight_answer,
@@ -156,6 +157,25 @@ class ControlPlaneStoreTest(unittest.TestCase):
             height=540,
             fps_milli=5_000,
             bitrate_bps=180_000,
+        ))
+
+    def test_managed_video_quality_policy_preserves_emergency_fallback(self):
+        choices = managed_video_quality_choices(
+            source_width=1920,
+            source_height=1080,
+            source_fps=30,
+            usable_uplink_bps=100_000,
+        )
+
+        self.assertEqual(["High", "Balanced", "Low", "Emergency"], [
+            choice["preset"] for choice in choices
+        ])
+        self.assertEqual("fallback", choices[-1]["capacity"])
+        self.assertEqual((640, 360, 5.0, 200_000), (
+            choices[-1]["width"],
+            choices[-1]["height"],
+            choices[-1]["fps"],
+            choices[-1]["bitrateBps"],
         ))
         self.assertFalse(is_emergency_video_fallback(
             width=640,
@@ -516,6 +536,104 @@ class ControlPlaneStoreTest(unittest.TestCase):
         )
         self.assertIsNone(rejected)
 
+    def test_member_can_be_edited_deleted_and_restored_with_audit_history(self):
+        organization = self.create_organization()
+        owner = asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+                self.now,
+            )
+        )
+        member = asyncio.run(
+            self.store.add_user(
+                organization_id=organization.id,
+                display_name="Initial Member",
+                email="member@ncssar.example",
+                roles=("records_viewer",),
+                actor_id=owner.id,
+                now=self.now,
+            )
+        )
+
+        updated = asyncio.run(
+            self.store.update_user(
+                organization_id=organization.id,
+                user_id=member.id,
+                display_name="Updated Member",
+                email="updated@ncssar.example",
+                roles=("records_admin", "video_requester"),
+                actor_id=owner.id,
+                now=self.now + timedelta(minutes=1),
+            )
+        )
+        self.assertEqual("Updated Member", updated.display_name)
+        self.assertEqual("updated@ncssar.example", updated.email)
+        self.assertEqual(
+            {"records_admin", "video_requester"},
+            set(updated.roles),
+        )
+
+        deleted = asyncio.run(
+            self.store.delete_user(
+                organization_id=organization.id,
+                user_id=member.id,
+                actor_id=owner.id,
+                now=self.now + timedelta(minutes=2),
+            )
+        )
+        self.assertEqual("disabled", deleted.state)
+        self.assertIsNone(
+            asyncio.run(
+                self.store.authorize_google_user(
+                    organization.designator,
+                    updated.email,
+                    now=self.now + timedelta(minutes=3),
+                )
+            )
+        )
+
+        restored = asyncio.run(
+            self.store.restore_user(
+                organization_id=organization.id,
+                user_id=member.id,
+                actor_id=owner.id,
+                now=self.now + timedelta(minutes=4),
+            )
+        )
+        self.assertEqual("invited", restored.state)
+        invitation = asyncio.run(
+            self.store.get_invitation(organization.designator, restored.email)
+        )
+        self.assertIsNotNone(invitation)
+        audit_events = asyncio.run(self.store.list_audit_events())
+        self.assertEqual(
+            ["member.restored", "member.deleted", "member.updated"],
+            [event.event_type for event in audit_events[:3]],
+        )
+
+    def test_organization_owner_cannot_be_deleted_as_a_member(self):
+        organization = self.create_organization()
+        owner = asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+                self.now,
+            )
+        )
+
+        with self.assertRaisesRegex(ControlPlaneError, "cannot be deleted"):
+            asyncio.run(
+                self.store.delete_user(
+                    organization_id=organization.id,
+                    user_id=owner.id,
+                    actor_id=owner.id,
+                    now=self.now + timedelta(minutes=1),
+                )
+            )
+
     def test_enrollment_issues_revocable_device_token_stored_as_hash(self):
         organization = self.create_organization()
         invitation = asyncio.run(
@@ -649,6 +767,7 @@ class ControlPlaneStoreTest(unittest.TestCase):
         self.assertIsNone(streams[0].recorded_at)
         self.assertEqual(0, streams[0].duration_ms)
         self.assertEqual("", streams[0].thumbnail_revision)
+        self.assertFalse(streams[0].remote_control_enabled)
 
         retired = asyncio.run(
             self.store.reconcile_device_video_streams(
@@ -780,6 +899,7 @@ class ControlPlaneStoreTest(unittest.TestCase):
         )
         self.assertEqual("approved", media.state)
         self.assertEqual(streams[0].session_id, media.stream_session_id)
+
         pending_media = asyncio.run(
             self.store.list_pending_video_media_offers_for_device(
                 device_credential_id=device.id,
@@ -1044,6 +1164,115 @@ class ControlPlaneStoreTest(unittest.TestCase):
                 )
             ),
         )
+
+    def test_remote_control_lets_requester_select_quality_and_locks_tablet(self):
+        organization = self.create_organization()
+        invitation = asyncio.run(self.store.get_invitation(
+            organization.designator, organization.primary_admin_email
+        ))
+        owner = asyncio.run(self.store.activate_owner(
+            organization.designator,
+            organization.primary_admin_email,
+            "correct horse battery staple",
+            self.now,
+            activation_nonce=invitation.activation_nonce,
+        ))
+        campaign = asyncio.run(self.store.create_enrollment_campaign(
+            organization_id=organization.id,
+            label="Remote video tablet",
+            created_by_user_id=owner.id,
+            expires_in_hours=24,
+            max_redemptions=1,
+            now=self.now,
+        ))
+        device = asyncio.run(self.store.issue_device_credential(
+            campaign_id=campaign.id,
+            organization_id=organization.id,
+            device_name="Ken's iPad",
+            platform="ios",
+            now=self.now,
+        ))
+        stream = asyncio.run(self.store.advertise_video_stream(
+            organization_id=organization.id,
+            device_credential_id=device.id,
+            session_id="00000000-0000-0000-0000-000000000010",
+            incident_name="Remote control test",
+            drone_designator="NCS1",
+            source_width=1920,
+            source_height=1080,
+            source_fps=30,
+            source_bitrate_bps=4_000_000,
+            remote_control_enabled=True,
+            now=self.now,
+        ))
+        request = asyncio.run(self.store.create_video_stream_request(
+            organization_id=organization.id,
+            stream_session_id=stream.session_id,
+            requester_user_id=owner.id,
+            now=self.now + timedelta(seconds=1),
+        ))
+        asyncio.run(self.store.start_video_preflight(
+            request_id=request.id,
+            organization_id=organization.id,
+            requester_user_id=owner.id,
+            browser_offer_sdp="v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n",
+            now=self.now + timedelta(seconds=2),
+        ))
+        asyncio.run(self.store.record_video_preflight_result(
+            request_id=request.id,
+            device_credential_id=device.id,
+            route_kind="routed",
+            estimated_uplink_bps=1_500_000,
+            now=self.now + timedelta(seconds=3),
+        ))
+        with self.assertRaisesRegex(
+            ControlPlaneError,
+            "bandwidth-qualified video choices",
+        ):
+            asyncio.run(self.store.record_video_stream_decision(
+                request_id=request.id,
+                requester_user_id=owner.id,
+                organization_id=organization.id,
+                decision="approve",
+                selected_width=800,
+                selected_height=450,
+                selected_fps=12,
+                selected_bitrate_bps=900_000,
+                now=self.now + timedelta(milliseconds=3500),
+            ))
+        approved = asyncio.run(self.store.record_video_stream_decision(
+            request_id=request.id,
+            requester_user_id=owner.id,
+            organization_id=organization.id,
+            decision="approve",
+            selected_width=960,
+            selected_height=540,
+            selected_fps=15,
+            selected_bitrate_bps=1_200_000,
+            now=self.now + timedelta(seconds=4),
+        ))
+        self.assertEqual("approved", approved.state)
+        with self.assertRaisesRegex(ControlPlaneError, "already sharing"):
+            asyncio.run(self.store.create_video_stream_request(
+                organization_id=organization.id,
+                stream_session_id=stream.session_id,
+                requester_user_id=owner.id,
+                now=self.now + timedelta(seconds=5),
+            ))
+        media = asyncio.run(self.store.start_video_media(
+            request_id=request.id,
+            organization_id=organization.id,
+            requester_user_id=owner.id,
+            browser_offer_sdp="v=0\r\no=- 3 4 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n",
+            now=self.now + timedelta(seconds=6),
+        ))
+        self.assertEqual(owner.email, media.requester_email)
+        self.assertEqual((960, 540, 15.0, 1_200_000), (
+            media.selected_width,
+            media.selected_height,
+            media.selected_fps,
+            media.selected_bitrate_bps,
+        ))
 
     def test_video_request_decline_and_priority_replacement_are_device_scoped(self):
         organization = self.create_organization()

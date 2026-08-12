@@ -635,6 +635,7 @@ class ActiveVideoStream(Base):
     duration_ms: Mapped[int] = mapped_column(BigInteger, default=0)
     thumbnail_revision: Mapped[str] = mapped_column(String(64), default="")
     timezone_name: Mapped[str] = mapped_column(String(64), default="UTC")
+    remote_control_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     state: Mapped[str] = mapped_column(String(24), default="active")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
@@ -661,6 +662,7 @@ class VideoStreamRequest(Base):
         ForeignKey("organization_users.id"), index=True
     )
     requester_email: Mapped[str] = mapped_column(String(320), nullable=False)
+    remote_control_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     state: Mapped[str] = mapped_column(String(24), default="pending")
     status_message: Mapped[str] = mapped_column(String(400), default="")
     route_kind: Mapped[str] = mapped_column(String(16), default="unknown")
@@ -946,6 +948,7 @@ class ActiveVideoStreamRecord:
     duration_ms: int
     thumbnail_revision: str
     timezone_name: str
+    remote_control_enabled: bool
     last_seen_at: datetime
     expires_at: datetime
 
@@ -967,6 +970,7 @@ class VideoStreamRequestRecord:
     source_bitrate_bps: int
     source_codec: str
     timezone_name: str
+    remote_control_enabled: bool
     state: str
     status_message: str
     route_kind: str
@@ -1013,6 +1017,10 @@ class VideoPreflightExchangeRecord:
     status_message: str
     route_kind: str
     estimated_uplink_bps: int
+    remote_control_enabled: bool
+    source_width: int
+    source_height: int
+    source_fps: float
     browser_offer_sdp: str
     device_answer_sdp: str
     expires_at: datetime
@@ -1025,11 +1033,84 @@ class VideoMediaExchangeRecord:
     device_credential_id: str
     requester_user_id: str
     stream_session_id: str
+    requester_email: str
+    route_kind: str
+    selected_width: int
+    selected_height: int
+    selected_fps: float
+    selected_bitrate_bps: int
     state: str
     status_message: str
     browser_offer_sdp: str
     device_answer_sdp: str
     expires_at: datetime
+
+
+def managed_video_quality_choices(
+    *,
+    source_width: int,
+    source_height: int,
+    source_fps: float,
+    usable_uplink_bps: int,
+) -> tuple[dict, ...]:
+    """Return the cross-platform managed-video quality policy."""
+    width = source_width if source_width > 0 else 1280
+    height = source_height if source_height > 0 else 720
+    fps = source_fps if source_fps > 0 else 30.0
+    long_edge = max(width, height)
+    presets = (
+        ("High", 1280, 30.0, 2_500_000),
+        ("Balanced", 960, 15.0, 1_200_000),
+        ("Low", 640, 10.0, 500_000),
+        ("Emergency", 640, 5.0, 200_000),
+    )
+    choices = []
+    usable = max(0, int(usable_uplink_bps))
+    for name, preset_edge, preset_fps, preset_bitrate in presets:
+        target_edge = min(long_edge, preset_edge)
+        scale = target_edge / long_edge
+        selected_width = max(2, int(width * scale)) & ~1
+        selected_height = max(2, int(height * scale)) & ~1
+        selected_fps = min(fps, preset_fps)
+        reference_pixels = (
+            preset_edge * preset_edge * min(width, height) / long_edge
+        )
+        pixel_scale = min(
+            1.0,
+            selected_width * selected_height / max(1.0, reference_pixels),
+        )
+        rate_scale = min(1.0, selected_fps / preset_fps)
+        minimum_bitrate = 100_000 if name == "Emergency" else 150_000
+        bitrate = max(
+            minimum_bitrate,
+            min(preset_bitrate, int(preset_bitrate * pixel_scale * rate_scale)),
+        )
+        capacity = (
+            "enough"
+            if usable * 100 >= bitrate * 135
+            else "marginal"
+            if usable >= bitrate
+            else "insufficient"
+        )
+        choices.append({
+            "preset": name,
+            "width": selected_width,
+            "height": selected_height,
+            "fps": selected_fps,
+            "bitrateBps": bitrate,
+            "capacity": capacity,
+        })
+    if all(choice["capacity"] == "insufficient" for choice in choices):
+        fallback = min(
+            choices,
+            key=lambda choice: (
+                choice["bitrateBps"],
+                max(choice["width"], choice["height"]),
+                choice["fps"],
+            ),
+        )
+        fallback["capacity"] = "fallback"
+    return tuple(choices)
 
 
 def normalize_designator(value: str) -> str:
@@ -1287,6 +1368,12 @@ class ControlPlaneStore:
                     "ADD COLUMN thumbnail_revision VARCHAR(64) "
                     "DEFAULT '' NOT NULL"
                 ))
+            if "remote_control_enabled" not in columns:
+                await connection.execute(text(
+                    "ALTER TABLE active_video_streams "
+                    "ADD COLUMN remote_control_enabled BOOLEAN "
+                    "DEFAULT FALSE NOT NULL"
+                ))
             request_columns = await connection.run_sync(
                 lambda sync_connection: {
                     item["name"]
@@ -1309,6 +1396,12 @@ class ControlPlaneStore:
                 await connection.execute(text(
                     "ALTER TABLE video_stream_requests "
                     "ADD COLUMN status_message VARCHAR(400) DEFAULT '' NOT NULL"
+                ))
+            if "remote_control_enabled" not in request_columns:
+                await connection.execute(text(
+                    "ALTER TABLE video_stream_requests "
+                    "ADD COLUMN remote_control_enabled BOOLEAN "
+                    "DEFAULT FALSE NOT NULL"
                 ))
             for column_name in (
                 "audio_bytes_sent",
@@ -2632,6 +2725,40 @@ class ControlPlaneStore:
             state=user.state,
         )
 
+    async def list_active_users_by_email(
+        self,
+        email: str,
+    ) -> tuple[UserRecord, ...]:
+        """Return every active organization membership for one identity."""
+        clean_email = normalize_email(email)
+        async with self.sessions() as session:
+            users = (
+                await session.scalars(
+                    select(OrganizationUser)
+                    .join(
+                        Organization,
+                        Organization.id == OrganizationUser.organization_id,
+                    )
+                    .where(
+                        OrganizationUser.email == clean_email,
+                        OrganizationUser.state == "active",
+                        Organization.lifecycle_state != "archived",
+                    )
+                    .order_by(Organization.designator)
+                )
+            ).all()
+        return tuple(
+            UserRecord(
+                id=user.id,
+                organization_id=user.organization_id,
+                email=user.email,
+                display_name=user.display_name,
+                roles=user.roles,
+                state=user.state,
+            )
+            for user in users
+        )
+
     async def get_invitation(
         self,
         designator: str,
@@ -3147,6 +3274,181 @@ class ControlPlaneStore:
             roles=user.roles,
             state=user.state,
         )
+
+    async def update_user(
+        self,
+        *,
+        organization_id: str,
+        user_id: str,
+        display_name: str,
+        email: str,
+        roles: tuple[str, ...],
+        actor_id: str,
+        now: Optional[datetime] = None,
+    ) -> UserRecord:
+        updated_at = now or utc_now()
+        clean_name = display_name.strip()
+        clean_email = normalize_email(email)
+        if not clean_name or len(clean_name) > 160:
+            raise ControlPlaneError("Enter the member's name.")
+        if len(clean_email) > 320:
+            raise ControlPlaneError("Enter a valid member email address.")
+        async with self.sessions() as session:
+            user = await session.get(OrganizationUser, user_id)
+            if user is None or user.organization_id != organization_id:
+                raise ControlPlaneError("Member not found.")
+            if "organization_owner" in user.roles:
+                raise ControlPlaneError(
+                    "The organization owner must be edited from platform administration."
+                )
+            duplicate = await session.scalar(
+                select(OrganizationUser.id).where(
+                    OrganizationUser.organization_id == organization_id,
+                    OrganizationUser.email == clean_email,
+                    OrganizationUser.id != user_id,
+                )
+            )
+            if duplicate:
+                raise ControlPlaneError("That email is already an organization member.")
+            previous = {
+                "display_name": user.display_name,
+                "email": user.email,
+                "roles": list(user.roles),
+            }
+            user.display_name = clean_name
+            user.email = clean_email
+            user.set_roles(roles)
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=organization_id,
+                    actor_type="organization_user",
+                    actor_id=actor_id,
+                    event_type="member.updated",
+                    details_json=json.dumps(
+                        {
+                            "user_id": user.id,
+                            "previous": previous,
+                            "updated": {
+                                "display_name": user.display_name,
+                                "email": user.email,
+                                "roles": list(user.roles),
+                            },
+                        }
+                    ),
+                    created_at=updated_at,
+                )
+            )
+            try:
+                await session.commit()
+            except IntegrityError as exc:
+                await session.rollback()
+                raise ControlPlaneError(
+                    "That email is already an organization member."
+                ) from exc
+            return UserRecord(
+                id=user.id,
+                organization_id=user.organization_id,
+                email=user.email,
+                display_name=user.display_name,
+                roles=user.roles,
+                state=user.state,
+            )
+
+    async def delete_user(
+        self,
+        *,
+        organization_id: str,
+        user_id: str,
+        actor_id: str,
+        now: Optional[datetime] = None,
+    ) -> UserRecord:
+        deleted_at = now or utc_now()
+        async with self.sessions() as session:
+            user = await session.get(OrganizationUser, user_id)
+            if user is None or user.organization_id != organization_id:
+                raise ControlPlaneError("Member not found.")
+            if "organization_owner" in user.roles:
+                raise ControlPlaneError(
+                    "The organization owner cannot be deleted here. "
+                    "Replace the administrator from platform administration."
+                )
+            if user.state == "disabled":
+                raise ControlPlaneError("That member is already deleted.")
+            previous_state = user.state
+            user.state = "disabled"
+            user.password_hash = ""
+            user.activation_nonce = new_id()
+            user.activation_expires_at = None
+            await session.execute(
+                update(OrganizationPasswordResetToken)
+                .where(
+                    OrganizationPasswordResetToken.organization_id
+                    == organization_id,
+                    OrganizationPasswordResetToken.user_id == user_id,
+                    OrganizationPasswordResetToken.consumed_at.is_(None),
+                )
+                .values(consumed_at=deleted_at)
+            )
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=organization_id,
+                    actor_type="organization_user",
+                    actor_id=actor_id,
+                    event_type="member.deleted",
+                    details_json=json.dumps(
+                        {"user_id": user.id, "previous_state": previous_state}
+                    ),
+                    created_at=deleted_at,
+                )
+            )
+            await session.commit()
+            return UserRecord(
+                id=user.id,
+                organization_id=user.organization_id,
+                email=user.email,
+                display_name=user.display_name,
+                roles=user.roles,
+                state=user.state,
+            )
+
+    async def restore_user(
+        self,
+        *,
+        organization_id: str,
+        user_id: str,
+        actor_id: str,
+        now: Optional[datetime] = None,
+    ) -> UserRecord:
+        restored_at = now or utc_now()
+        async with self.sessions() as session:
+            user = await session.get(OrganizationUser, user_id)
+            if user is None or user.organization_id != organization_id:
+                raise ControlPlaneError("Member not found.")
+            if user.state != "disabled":
+                raise ControlPlaneError("Only a deleted member can be restored.")
+            user.state = "invited"
+            user.password_hash = ""
+            user.activation_nonce = new_id()
+            user.activation_expires_at = restored_at + timedelta(days=7)
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=organization_id,
+                    actor_type="organization_user",
+                    actor_id=actor_id,
+                    event_type="member.restored",
+                    details_json=json.dumps({"user_id": user.id}),
+                    created_at=restored_at,
+                )
+            )
+            await session.commit()
+            return UserRecord(
+                id=user.id,
+                organization_id=user.organization_id,
+                email=user.email,
+                display_name=user.display_name,
+                roles=user.roles,
+                state=user.state,
+            )
 
     async def update_settings(
         self,
@@ -4175,6 +4477,7 @@ class ControlPlaneStore:
         duration_ms: int = 0,
         thumbnail_revision: str = "",
         timezone_name: str = "UTC",
+        remote_control_enabled: bool = False,
         ttl_seconds: int = 45,
         now: Optional[datetime] = None,
     ) -> ActiveVideoStreamRecord:
@@ -4252,6 +4555,7 @@ class ControlPlaneStore:
                 stream.duration_ms != clean_duration_ms,
                 stream.thumbnail_revision != clean_thumbnail_revision,
                 stream.timezone_name != clean_timezone,
+                stream.remote_control_enabled != bool(remote_control_enabled),
             ))
             stream.incident_name = clean_incident[:160]
             stream.drone_designator = clean_drone[:160]
@@ -4271,6 +4575,7 @@ class ControlPlaneStore:
             stream.duration_ms = clean_duration_ms
             stream.thumbnail_revision = clean_thumbnail_revision
             stream.timezone_name = clean_timezone
+            stream.remote_control_enabled = bool(remote_control_enabled)
             stream.state = "active"
             stream.last_seen_at = seen_at
             stream.expires_at = expires_at
@@ -4435,12 +4740,31 @@ class ControlPlaneStore:
                     "A video request is already in progress and awaiting review "
                     "on this R2C app."
                 )
+            if stream.remote_control_enabled:
+                active_consumer = await session.scalar(
+                    select(VideoStreamRequest.id)
+                    .join(
+                        ActiveVideoStream,
+                        ActiveVideoStream.id == VideoStreamRequest.active_stream_id,
+                    )
+                    .where(
+                        ActiveVideoStream.device_credential_id
+                        == stream.device_credential_id,
+                        VideoStreamRequest.state.in_(("approved", "streaming")),
+                    )
+                    .with_for_update()
+                )
+                if active_consumer is not None:
+                    raise ControlPlaneError(
+                        "This R2C app is already sharing video with another member."
+                    )
             request = VideoStreamRequest(
                 id=new_id(),
                 organization_id=organization_id,
                 active_stream_id=stream.id,
                 requester_user_id=requester.id,
                 requester_email=requester.email,
+                remote_control_enabled=bool(stream.remote_control_enabled),
                 state="pending",
                 requested_at=requested_at,
                 expires_at=requested_at + timedelta(minutes=10),
@@ -5037,7 +5361,9 @@ class ControlPlaneStore:
         self,
         *,
         request_id: str,
-        device_credential_id: str,
+        device_credential_id: str = "",
+        requester_user_id: str = "",
+        organization_id: str = "",
         decision: str,
         selected_width: int = 0,
         selected_height: int = 0,
@@ -5067,7 +5393,16 @@ class ControlPlaneStore:
             if row is None:
                 raise ControlPlaneError("Video stream request not found.")
             request, stream = row
-            if stream.device_credential_id != device_credential_id:
+            if requester_user_id:
+                if (
+                    request.requester_user_id != requester_user_id
+                    or request.organization_id != organization_id
+                    or not request.remote_control_enabled
+                ):
+                    raise ControlPlaneError(
+                        "Remote video control is not enabled for this request."
+                    )
+            elif stream.device_credential_id != device_credential_id:
                 raise ControlPlaneError(
                     "Video stream request belongs to another device."
                 )
@@ -5099,6 +5434,28 @@ class ControlPlaneStore:
                     raise ControlPlaneError(
                         "An approved stream requires a frame rate and bitrate."
                     )
+                if requester_user_id:
+                    allowed_choices = managed_video_quality_choices(
+                        source_width=stream.source_width,
+                        source_height=stream.source_height,
+                        source_fps=stream.source_fps_milli / 1000.0,
+                        usable_uplink_bps=request.estimated_uplink_bps,
+                    )
+                    selected_choice = next((
+                        choice
+                        for choice in allowed_choices
+                        if choice["width"] == width
+                        and choice["height"] == height
+                        and int(round(choice["fps"] * 1000)) == fps_milli
+                        and choice["bitrateBps"] == bitrate
+                    ), None)
+                    if (
+                        selected_choice is None
+                        or selected_choice["capacity"] == "insufficient"
+                    ):
+                        raise ControlPlaneError(
+                            "Select one of the bandwidth-qualified video choices."
+                        )
                 if (
                     bitrate > request.estimated_uplink_bps
                     and not is_emergency_video_fallback(
@@ -5112,6 +5469,10 @@ class ControlPlaneStore:
                         "Selected bitrate exceeds the measured usable uplink; "
                         "only the 640 px, 5 fps, 0.2 Mbps emergency fallback "
                         "may override a failed-low preflight result."
+                    )
+                if request.remote_control_enabled and active_requests:
+                    raise ControlPlaneError(
+                        "This R2C app is already sharing video with another member."
                     )
                 request.state = "approved"
                 request.selected_width = width
@@ -5128,8 +5489,12 @@ class ControlPlaneStore:
                     displaced.stopped_at = decided_at
                     session.add(ControlPlaneAuditEvent(
                         organization_id=displaced.organization_id,
-                        actor_type="organization_device",
-                        actor_id=device_credential_id,
+                        actor_type=(
+                            "organization_user"
+                            if requester_user_id
+                            else "organization_device"
+                        ),
+                        actor_id=requester_user_id or device_credential_id,
                         event_type="video.redirected",
                         details_json=json.dumps({
                             "request_id": displaced.id,
@@ -5153,8 +5518,12 @@ class ControlPlaneStore:
             session.add(
                 ControlPlaneAuditEvent(
                     organization_id=request.organization_id,
-                    actor_type="organization_device",
-                    actor_id=device_credential_id,
+                    actor_type=(
+                        "organization_user"
+                        if requester_user_id
+                        else "organization_device"
+                    ),
+                    actor_id=requester_user_id or device_credential_id,
                     event_type=f"video.{request.state}",
                     details_json=json.dumps({"request_id": request.id}),
                     created_at=decided_at,
@@ -5589,6 +5958,10 @@ class ControlPlaneStore:
             status_message=request.status_message or "",
             route_kind=request.route_kind,
             estimated_uplink_bps=request.estimated_uplink_bps,
+            remote_control_enabled=bool(request.remote_control_enabled),
+            source_width=stream.source_width,
+            source_height=stream.source_height,
+            source_fps=stream.source_fps_milli / 1000.0,
             browser_offer_sdp=exchange.browser_offer_sdp,
             device_answer_sdp=exchange.device_answer_sdp,
             expires_at=as_utc(request.expires_at),
@@ -5606,6 +5979,12 @@ class ControlPlaneStore:
             device_credential_id=stream.device_credential_id,
             requester_user_id=request.requester_user_id,
             stream_session_id=stream.session_id,
+            requester_email=request.requester_email,
+            route_kind=request.route_kind,
+            selected_width=request.selected_width,
+            selected_height=request.selected_height,
+            selected_fps=request.selected_fps_milli / 1000.0,
+            selected_bitrate_bps=request.selected_bitrate_bps,
             state=request.state,
             status_message=request.status_message or "",
             browser_offer_sdp=exchange.browser_offer_sdp,
@@ -5635,6 +6014,7 @@ class ControlPlaneStore:
             duration_ms=max(0, stream.duration_ms),
             thumbnail_revision=stream.thumbnail_revision,
             timezone_name=stream.timezone_name or "UTC",
+            remote_control_enabled=bool(stream.remote_control_enabled),
             last_seen_at=as_utc(stream.last_seen_at),
             expires_at=as_utc(stream.expires_at),
         )
@@ -5660,6 +6040,7 @@ class ControlPlaneStore:
             source_bitrate_bps=stream.source_bitrate_bps,
             source_codec=stream.source_codec,
             timezone_name=stream.timezone_name or "UTC",
+            remote_control_enabled=bool(request.remote_control_enabled),
             state=request.state,
             status_message=request.status_message or "",
             route_kind=request.route_kind,
