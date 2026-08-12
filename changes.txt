@@ -1,4 +1,4 @@
-v1.4.31: pending review
+v1.4.31: deployed
 * Fixed the authenticated organization chooser so its dialog opens under the production Content Security Policy instead of relying on blocked inline JavaScript.
 
 v1.4.30: deployed
