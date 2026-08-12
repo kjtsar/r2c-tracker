@@ -1,4 +1,7 @@
-v1.4.30: pending review
+v1.4.31: pending review
+* Fixed the authenticated organization chooser so its dialog opens under the production Content Security Policy instead of relying on blocked inline JavaScript.
+
+v1.4.30: deployed
 * Added requester-controlled remote video for tablets that explicitly advertise the persistent Remote Video Control setting, while preserving pilot/VO approval when that setting is off.
 * Show the measured Direct/Routed link result and selectable bandwidth-safe frame sizes and rates to the requester, while continuing to enforce one viewer per RID2Caltopo device.
 * Show the current viewer on tablet session pages and disable additional Request Video actions while a remotely controlled stream is in use.

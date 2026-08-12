@@ -540,6 +540,14 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         )
         self.assertIn('action="/organizations/select"', authenticated_directory.text)
         self.assertIn('value="NCSSAR"', authenticated_directory.text)
+        self.assertIn(
+            'src="/static/organization_directory.js?v=20260812-1"',
+            authenticated_directory.text,
+        )
+        self.assertNotIn("picker.showModal()", authenticated_directory.text)
+        directory_script = self.client.get("/static/organization_directory.js")
+        self.assertEqual(200, directory_script.status_code)
+        self.assertIn("picker.showModal()", directory_script.text)
         billing_snapshot = SimpleNamespace(
             source_status="ready",
             source_message="Live billing data.",

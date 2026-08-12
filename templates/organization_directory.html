@@ -258,17 +258,5 @@
   {% endif %}
 </dialog>
 
-<script>
-  (function () {
-    const picker = document.getElementById("organization-picker");
-    const opener = document.getElementById("open-organization-picker");
-    if (!picker || !opener) return;
-    const showPicker = function () {
-      if (typeof picker.showModal === "function") picker.showModal();
-      else picker.setAttribute("open", "");
-    };
-    opener.addEventListener("click", showPicker);
-    showPicker();
-  })();
-</script>
+<script src="/static/organization_directory.js?v=20260812-1" defer></script>
 {% endblock %}
