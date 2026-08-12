@@ -1,4 +1,4 @@
-v1.4.32: pending review
+v1.4.32: deployed
 * Made organization entry role-aware: records viewers land on their organization dashboard, video-only requesters land on streams, administrative roles land on administration, and non-admin members are denied direct administration access.
 * Added visible signed-in or Guest identity on the organization directory, plus direct sign-in controls for guests on both the directory and organization pages.
 * Kept tablet-specific Remote Video Control guidance accurate during transient empty stream advertisements by retaining the setting on the authenticated live tablet connection.
