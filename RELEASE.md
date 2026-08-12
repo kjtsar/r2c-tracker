@@ -59,15 +59,20 @@ From the repository root:
 
 ```bash
 .venv/bin/python -m pip install -r requirements.lock
-./release_check.sh
-./scripts/security_checks.sh
+./qualify_release.sh
 ```
 
-`release_check.sh` creates an isolated test organization and device credential,
-runs the unit suite, isolated local HTTP checks, protected route checks, the
-organization-scoped R2C WebSocket smoke test, and migration compatibility checks.
-The security script adds authorization, dependency, static-analysis,
-secret-scanning, and SBOM checks.
+`qualify_release.sh` runs the complete unit suite once, then runs the independent
+runtime/migration and security gates in parallel. This preserves the checks from
+`release_check.sh` and `scripts/security_checks.sh` without running the same unit
+suite twice. The runtime gate creates an isolated test organization and device
+credential and performs local HTTP, protected-route, organization-scoped R2C
+WebSocket, and migration compatibility checks. The security gate adds dependency,
+static-analysis, secret-scanning, and SBOM checks.
+
+The two underlying scripts remain independently runnable. Their
+`--skip-unit-tests` option is reserved for `qualify_release.sh`; do not use it to
+qualify a release by hand.
 
 Investigate every failure. A rerun is acceptable only when the reason is
 understood and recorded; a passing rerun does not erase an unexplained failure.
@@ -101,18 +106,38 @@ Authenticate the named Google Cloud configuration, then run:
 ```bash
 R2C_MINIMUM_ANDROID_BUILD=126
 ./deploy_candidate.sh "${R2C_MINIMUM_ANDROID_BUILD}"
-./test_candidate.sh
 ```
 
 Replace the example with the minimum compatible Android build selected during
 release preparation.
 
+When an isolated staging instance from an earlier candidate is still inside its
+24-hour cleanup window, skip Cloud SQL provisioning with:
+
+```bash
+./deploy_candidate.sh "${R2C_MINIMUM_ANDROID_BUILD}" --reuse-staging
+```
+
+Reuse is never implicit. The command verifies the expected project, region,
+PostgreSQL version, machine tier, runtime state, databases, database roles,
+secrets, service account, and isolated bucket before proceeding. It then deletes
+the prior staging Cloud Run service, refreshes both database clones from
+production, deploys the new candidate, and reruns the complete hosted regression.
+This saves provisioning time without reusing database contents or test results.
+On failure, explicitly reused resources remain available for diagnosis and retry;
+they must still be removed with `./cleanup_pilot_staging.sh` within 24 hours of the
+latest clone. Reuse also requires the non-secret `.release-state/staging.json`
+refresh receipt created on this workstation after a successful clone, and is
+refused once that receipt is more than 24 hours old.
+
 `deploy_candidate.sh` refuses a dirty or untagged checkout and stops when the
 live activity gate reports operational use. It then:
 
-1. creates an ephemeral PostgreSQL 15 Cloud SQL staging instance and refreshes
+1. creates, or explicitly revalidates, an isolated PostgreSQL 15 Cloud SQL
+   staging instance and refreshes
    `r2c_stage_tracker` and `r2c_stage_control_plane` from production database
-   dumps transferred through authenticated IAP and Cloud SQL proxies;
+   dumps transferred through authenticated IAP and Cloud SQL proxies; the two
+   independent dumps and restores run in parallel, with each result checked;
 2. deploys the tagged source to the IAM-protected `r2c-tracker-staging` service
    with staging-only roles, secrets, and Cloud Storage;
 3. creates a one-use `RELEASECHECK` fixture only inside the cloned control-plane
@@ -122,6 +147,10 @@ live activity gate reports operational use. It then:
    `sha256` digest; and
 5. deploys that exact digest as a zero-traffic production candidate, verifies
    the digest match, and runs non-mutating production readiness checks.
+
+The successful deployment command already runs the candidate regression. Do
+not immediately repeat `test_candidate.sh`; use that command after focused
+browser checks and immediately before promotion, as described below.
 
 Production data is never used to create a test credential, staging is not
 publicly invokable, outbound email and payment integrations are disabled, and
@@ -208,7 +237,7 @@ use the incident and continuity runbooks rather than improvising a redeploy.
 - [ ] Production health, version, workflows, and logs verified
 - [ ] `/versions` and `changes.txt` marked and verified
 - [ ] Evidence recorded and observation window completed
-- [ ] Staging service and ephemeral Cloud SQL instance removed within 24 hours
+- [ ] Staging service and isolated Cloud SQL instance removed within 24 hours
 
 Related documentation: [pilot setup](PILOT_SETUP.md),
 [incident response](docs/INCIDENT_RESPONSE_RUNBOOK.md), and

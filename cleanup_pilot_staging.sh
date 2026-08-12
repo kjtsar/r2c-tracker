@@ -6,6 +6,8 @@ PROJECT="${GCLOUD_PROJECT:-r2c-tracker-pilot}"
 REGION="${REGION:-us-west1}"
 STAGING_SERVICE="r2c-tracker-staging"
 STAGING_INSTANCE="r2c-release-staging"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+STAGING_STATE_PATH="${SCRIPT_DIR}/.release-state/staging.json"
 
 if [ "${PROJECT}" != "r2c-tracker-pilot" ]; then
   echo "Refusing staging cleanup in unexpected project ${PROJECT}." >&2
@@ -26,6 +28,7 @@ if pilot_gcloud sql instances describe "${STAGING_INSTANCE}" \
   pilot_gcloud sql instances delete "${STAGING_INSTANCE}" \
     --project "${PROJECT}"
 fi
+rm -f "${STAGING_STATE_PATH}"
 
-echo "Staging Cloud Run service and ephemeral Cloud SQL instance removed."
+echo "Staging Cloud Run service and isolated Cloud SQL instance removed."
 echo "Staging secrets, service account, and empty bucket remain reusable."

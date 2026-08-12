@@ -42,13 +42,13 @@
 {% endblock %}
 {% block content %}
 <section class="activation-shell">
-  <h1>Activate organization administrator</h1>
+  <h1>Activate organization account</h1>
   {% if activation_error %}
   <div class="activation-error" role="alert">{{ activation_error }}</div>
   {% else %}
   <p>
     Verify <strong>{{ email }}</strong> with one of the available sign-in
-    providers to activate the administrator account for
+    providers to activate the organization account for
     <strong>{{ designator }}</strong>, or create an R2C Tracker password.
   </p>
   <p>

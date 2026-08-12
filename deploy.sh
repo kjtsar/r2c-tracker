@@ -31,11 +31,17 @@ export R2C_RECOMMENDED_APP_VERSION_CODE
 export R2C_UPDATE_URL
 CONTAINER_IMAGE="${CONTAINER_IMAGE:-}"
 export CONTAINER_IMAGE
+DEPLOY_SOURCE_DIR="${DEPLOY_SOURCE_DIR:-.}"
+export DEPLOY_SOURCE_DIR
 if [ -n "${CONTAINER_IMAGE}" ]; then
   python3 -c 'import os, re, sys; value=os.environ["CONTAINER_IMAGE"]; sys.exit(0 if re.fullmatch(r"[A-Za-z0-9._/-]+@sha256:[0-9a-f]{64}", value) else 1)' || {
     echo "CONTAINER_IMAGE must be an immutable Artifact Registry sha256 digest." >&2
     exit 2
   }
+fi
+if [ -z "${CONTAINER_IMAGE}" ] && [ ! -d "${DEPLOY_SOURCE_DIR}" ]; then
+  echo "DEPLOY_SOURCE_DIR does not exist or is not a directory: ${DEPLOY_SOURCE_DIR}" >&2
+  exit 2
 fi
 R2C_RECOMMENDED_IOS_APP_BUILD_NUMBER="${R2C_RECOMMENDED_IOS_APP_BUILD_NUMBER:-0}"
 R2C_IOS_UPDATE_URL="${R2C_IOS_UPDATE_URL:-}"
@@ -535,7 +541,7 @@ set -- run deploy "${SERVICE_NAME}" \
 if [ -n "${CONTAINER_IMAGE}" ]; then
   set -- "$@" --image "${CONTAINER_IMAGE}"
 else
-  set -- "$@" --source .
+  set -- "$@" --source "${DEPLOY_SOURCE_DIR}"
 fi
 
 if [ -n "${CLOUD_RUN_MEMORY}" ]; then

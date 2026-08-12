@@ -1,6 +1,9 @@
 import pathlib
 import importlib.util
+import json
+import tempfile
 import unittest
+from unittest import mock
 
 
 class GuardedReleaseTest(unittest.TestCase):
@@ -35,6 +38,13 @@ class GuardedReleaseTest(unittest.TestCase):
         self.assertIn("staging_regression(staging_url", guard)
         self.assertIn('"CONTAINER_IMAGE": image_digest', guard)
         self.assertIn("candidate_digest != image_digest", guard)
+        self.assertIn('setup_command.append("--reuse-existing")', guard)
+        self.assertIn('"reused_staging": reuse_staging', guard)
+        self.assertIn('"--reuse-staging"', guard)
+        self.assertIn("validate_staging_reuse_state()", guard)
+        self.assertIn("save_staging_refresh_state()", guard)
+        self.assertIn("committed_source_snapshot()", guard)
+        self.assertIn('staging_env["DEPLOY_SOURCE_DIR"]', guard)
         self.assertIn("websocket_smoke", guard)
         self.assertIn("Candidate preparation failed; removing ephemeral staging resources.", guard)
         self.assertIn("cleanup_pilot_staging.sh", guard)
@@ -64,16 +74,73 @@ class GuardedReleaseTest(unittest.TestCase):
         self.assertIn("r2c_pilot_tracker", refresh)
         self.assertIn("r2c_stage_tracker", refresh)
         self.assertIn('"${PG_DUMP}" --format=custom', refresh)
+        self.assertIn('tracker_dump_pid="$!"', refresh)
+        self.assertIn('control_dump_pid="$!"', refresh)
+        self.assertIn('wait "${tracker_dump_pid}"', refresh)
+        self.assertIn('wait "${control_dump_pid}"', refresh)
+        self.assertIn('tracker_restore_pid="$!"', refresh)
+        self.assertIn('control_restore_pid="$!"', refresh)
+        self.assertIn('wait "${tracker_restore_pid}"', refresh)
+        self.assertIn('wait "${control_restore_pid}"', refresh)
+        self.assertIn('if [ "${tracker_dump_status}" -ne 0 ]', refresh)
+        self.assertIn('if [ "${tracker_restore_status}" -ne 0 ]', refresh)
         self.assertIn("pg_dump_major", refresh)
         self.assertIn("compute start-iap-tunnel", refresh)
         self.assertIn("cloud-sql-proxy", refresh)
         self.assertIn("allow-iap-postgres-r2c-staging", refresh)
         self.assertIn("r2c-release-staging", cleanup)
+        self.assertIn('.release-state/staging.json', cleanup)
         self.assertNotIn("DROP DATABASE IF EXISTS r2c_pilot_tracker", cleanup)
         self.assertIn("r2c_stage_tracker_user", setup)
         self.assertIn("r2c_stage_control_user", setup)
         self.assertIn("POSTGRES_15", setup)
         self.assertIn("db-f1-micro", setup)
+        self.assertIn('if [ "${1:-}" = "--reuse-existing" ]', setup)
+        self.assertIn('instance_state', setup)
+        self.assertIn('"${instance_state}" != "RUNNABLE"', setup)
+        self.assertIn("Validated reusable isolated staging resources.", setup)
+
+    def test_staging_reuse_receipt_is_scoped_and_time_limited(self):
+        spec = importlib.util.spec_from_file_location(
+            "release_guard_reuse_test",
+            self.root / "scripts" / "release_guard.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        now = 2_000_000_000
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            receipt = pathlib.Path(temporary_dir) / "staging.json"
+            receipt.write_text(json.dumps({
+                "instance": "r2c-release-staging",
+                "project": module.PROJECT,
+                "refreshed_at_epoch": now - 60,
+                "region": module.REGION,
+            }))
+            with mock.patch.object(module, "STAGING_STATE_PATH", receipt), \
+                    mock.patch.object(module.time, "time", return_value=now):
+                self.assertEqual(
+                    now - 60,
+                    module.validate_staging_reuse_state()["refreshed_at_epoch"],
+                )
+                receipt.write_text(json.dumps({
+                    "instance": "r2c-release-staging",
+                    "project": module.PROJECT,
+                    "refreshed_at_epoch": now - module.STAGING_REUSE_MAX_AGE_SECONDS - 1,
+                    "region": module.REGION,
+                }))
+                with self.assertRaisesRegex(RuntimeError, "outside its 24-hour reuse window"):
+                    module.validate_staging_reuse_state()
+
+    def test_committed_source_snapshot_excludes_untracked_editor_artifacts(self):
+        spec = importlib.util.spec_from_file_location(
+            "release_guard_source_test",
+            self.root / "scripts" / "release_guard.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with module.committed_source_snapshot() as source_path:
+            self.assertTrue((source_path / "Dockerfile").is_file())
+            self.assertFalse((source_path / ".#tracker2.txt").exists())
 
     def test_bootstrap_recognizes_old_revision_http_status_wording(self):
         spec = importlib.util.spec_from_file_location(

@@ -55,8 +55,12 @@ fi
 temporary_dir="$(mktemp -d)"
 iap_pid=""
 proxy_pid=""
+tracker_job_pid=""
+control_job_pid=""
 created_firewall="0"
 cleanup() {
+  if [ -n "${tracker_job_pid}" ]; then kill "${tracker_job_pid}" >/dev/null 2>&1 || true; fi
+  if [ -n "${control_job_pid}" ]; then kill "${control_job_pid}" >/dev/null 2>&1 || true; fi
   if [ -n "${iap_pid}" ]; then kill "${iap_pid}" >/dev/null 2>&1 || true; fi
   if [ -n "${proxy_pid}" ]; then kill "${proxy_pid}" >/dev/null 2>&1 || true; fi
   if [ "${created_firewall}" = "1" ]; then
@@ -139,12 +143,33 @@ if [ "${ready}" != "1" ]; then
   exit 1
 fi
 
+echo "Dumping independent production databases in parallel."
 "${PG_DUMP}" --format=custom --no-owner --no-acl \
   --host 127.0.0.1 --port "${PROD_PORT}" --username r2c_pilot_app \
-  --dbname r2c_pilot_tracker --file "${temporary_dir}/tracker.dump"
+  --dbname r2c_pilot_tracker --file "${temporary_dir}/tracker.dump" \
+  >"${temporary_dir}/tracker-dump.log" 2>&1 &
+tracker_dump_pid="$!"
+tracker_job_pid="${tracker_dump_pid}"
 "${PG_DUMP}" --format=custom --no-owner --no-acl \
   --host 127.0.0.1 --port "${PROD_PORT}" --username r2c_pilot_app \
-  --dbname r2c_pilot_control_plane --file "${temporary_dir}/control.dump"
+  --dbname r2c_pilot_control_plane --file "${temporary_dir}/control.dump" \
+  >"${temporary_dir}/control-dump.log" 2>&1 &
+control_dump_pid="$!"
+control_job_pid="${control_dump_pid}"
+set +e
+wait "${tracker_dump_pid}"
+tracker_dump_status="$?"
+wait "${control_dump_pid}"
+control_dump_status="$?"
+tracker_job_pid=""
+control_job_pid=""
+set -e
+if [ "${tracker_dump_status}" -ne 0 ] || [ "${control_dump_status}" -ne 0 ]; then
+  cat "${temporary_dir}/tracker-dump.log" >&2
+  cat "${temporary_dir}/control-dump.log" >&2
+  echo "Staging database dump failed: tracker=${tracker_dump_status} control=${control_dump_status}." >&2
+  exit 1
+fi
 
 pilot_gcloud sql databases delete r2c_stage_tracker \
   --instance "${STAGING_INSTANCE}" --project "${PROJECT}"
@@ -155,12 +180,33 @@ pilot_gcloud sql databases create r2c_stage_tracker \
 pilot_gcloud sql databases create r2c_stage_control_plane \
   --instance "${STAGING_INSTANCE}" --project "${PROJECT}"
 
+echo "Restoring independent staging databases in parallel."
 "${PG_RESTORE}" --no-owner --no-acl --exit-on-error \
   --host 127.0.0.1 --port "${STAGE_PORT}" --username r2c_stage_tracker_user \
-  --dbname r2c_stage_tracker "${temporary_dir}/tracker.dump"
+  --dbname r2c_stage_tracker "${temporary_dir}/tracker.dump" \
+  >"${temporary_dir}/tracker-restore.log" 2>&1 &
+tracker_restore_pid="$!"
+tracker_job_pid="${tracker_restore_pid}"
 "${PG_RESTORE}" --no-owner --no-acl --exit-on-error \
   --host 127.0.0.1 --port "${STAGE_PORT}" --username r2c_stage_control_user \
-  --dbname r2c_stage_control_plane "${temporary_dir}/control.dump"
+  --dbname r2c_stage_control_plane "${temporary_dir}/control.dump" \
+  >"${temporary_dir}/control-restore.log" 2>&1 &
+control_restore_pid="$!"
+control_job_pid="${control_restore_pid}"
+set +e
+wait "${tracker_restore_pid}"
+tracker_restore_status="$?"
+wait "${control_restore_pid}"
+control_restore_status="$?"
+tracker_job_pid=""
+control_job_pid=""
+set -e
+if [ "${tracker_restore_status}" -ne 0 ] || [ "${control_restore_status}" -ne 0 ]; then
+  cat "${temporary_dir}/tracker-restore.log" >&2
+  cat "${temporary_dir}/control-restore.log" >&2
+  echo "Staging database restore failed: tracker=${tracker_restore_status} control=${control_restore_status}." >&2
+  exit 1
+fi
 
-echo "Staging database clones refreshed in ephemeral Cloud SQL."
+echo "Staging database clones refreshed in isolated Cloud SQL."
 echo "The isolated bucket gs://${STAGING_BUCKET} has no production objects copied."

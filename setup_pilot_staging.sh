@@ -14,6 +14,16 @@ TRACKER_ROLE="r2c_stage_tracker_user"
 CONTROL_ROLE="r2c_stage_control_user"
 TRACKER_DATABASE="r2c_stage_tracker"
 CONTROL_DATABASE="r2c_stage_control_plane"
+REUSE_EXISTING="0"
+
+if [ "${1:-}" = "--reuse-existing" ]; then
+  REUSE_EXISTING="1"
+  shift
+fi
+if [ "$#" -ne 0 ]; then
+  echo "Usage: $0 [--reuse-existing]" >&2
+  exit 2
+fi
 
 if [ "${PROJECT}" != "r2c-tracker-pilot" ]; then
   echo "Refusing staging setup in unexpected project ${PROJECT}." >&2
@@ -31,14 +41,88 @@ for command in gcloud "${PYTHON}"; do
   fi
 done
 
+service_exists="0"
+instance_exists="0"
 if pilot_gcloud run services describe "${STAGING_SERVICE}" \
     --project "${PROJECT}" --region "${REGION}" >/dev/null 2>&1; then
-  echo "Staging service already exists; run ./cleanup_pilot_staging.sh first." >&2
-  exit 1
+  service_exists="1"
 fi
 if pilot_gcloud sql instances describe "${STAGING_INSTANCE}" \
     --project "${PROJECT}" >/dev/null 2>&1; then
-  echo "Staging Cloud SQL instance already exists; run ./cleanup_pilot_staging.sh first." >&2
+  instance_exists="1"
+fi
+
+if [ "${REUSE_EXISTING}" = "1" ] && [ "${instance_exists}" = "1" ]; then
+  instance_version="$(pilot_gcloud sql instances describe "${STAGING_INSTANCE}" \
+    --project "${PROJECT}" --format='value(databaseVersion)')"
+  instance_region="$(pilot_gcloud sql instances describe "${STAGING_INSTANCE}" \
+    --project "${PROJECT}" --format='value(region)')"
+  instance_tier="$(pilot_gcloud sql instances describe "${STAGING_INSTANCE}" \
+    --project "${PROJECT}" --format='value(settings.tier)')"
+  instance_state="$(pilot_gcloud sql instances describe "${STAGING_INSTANCE}" \
+    --project "${PROJECT}" --format='value(state)')"
+  if [ "${instance_version}" != "POSTGRES_15" ] \
+      || [ "${instance_region}" != "${REGION}" ] \
+      || [ "${instance_tier}" != "db-f1-micro" ] \
+      || [ "${instance_state}" != "RUNNABLE" ]; then
+    echo "Refusing to reuse staging Cloud SQL with unexpected configuration: version=${instance_version} region=${instance_region} tier=${instance_tier} state=${instance_state}." >&2
+    exit 1
+  fi
+  for database_name in "${TRACKER_DATABASE}" "${CONTROL_DATABASE}"; do
+    if [ "$(pilot_gcloud sql databases list --instance "${STAGING_INSTANCE}" \
+        --project "${PROJECT}" --filter="name=${database_name}" --format='value(name)')" != "${database_name}" ]; then
+      echo "Refusing to reuse staging: database ${database_name} is missing." >&2
+      exit 1
+    fi
+  done
+  for role_name in "${TRACKER_ROLE}" "${CONTROL_ROLE}"; do
+    if [ "$(pilot_gcloud sql users list --instance "${STAGING_INSTANCE}" \
+        --project "${PROJECT}" --filter="name=${role_name}" --format='value(name)')" != "${role_name}" ]; then
+      echo "Refusing to reuse staging: database role ${role_name} is missing." >&2
+      exit 1
+    fi
+  done
+  for secret_name in \
+    r2c-staging-tracker-database-url \
+    r2c-staging-control-plane-database-url \
+    r2c-staging-tracker-admin-password \
+    r2c-staging-deployment-gate-key \
+    r2c-staging-secret-key \
+    r2c-staging-control-plane-signing-key; do
+    if ! pilot_gcloud secrets describe "${secret_name}" --project "${PROJECT}" >/dev/null 2>&1; then
+      echo "Refusing to reuse staging: secret ${secret_name} is missing." >&2
+      exit 1
+    fi
+  done
+  if ! pilot_gcloud iam service-accounts describe "${STAGING_SERVICE_ACCOUNT}" \
+      --project "${PROJECT}" >/dev/null 2>&1; then
+    echo "Refusing to reuse staging: service account ${STAGING_SERVICE_ACCOUNT} is missing." >&2
+    exit 1
+  fi
+  if ! pilot_gcloud storage buckets describe "gs://${STAGING_BUCKET}" \
+      --project "${PROJECT}" >/dev/null 2>&1; then
+    echo "Refusing to reuse staging: bucket gs://${STAGING_BUCKET} is missing." >&2
+    exit 1
+  fi
+  echo "Validated reusable isolated staging resources."
+  if [ "${service_exists}" = "1" ]; then
+    echo "The prior staging service will be removed before the database refresh."
+  fi
+  echo "Run ./scripts/refresh_staging_databases.sh before deploying a release candidate."
+  exit 0
+fi
+
+if [ "${REUSE_EXISTING}" = "1" ]; then
+  echo "Refusing staging reuse because ${STAGING_INSTANCE} does not exist; run without --reuse-existing for the first candidate." >&2
+  exit 1
+fi
+
+if [ "${service_exists}" = "1" ]; then
+  echo "Staging service already exists; run ./cleanup_pilot_staging.sh first or explicitly use --reuse-existing." >&2
+  exit 1
+fi
+if [ "${instance_exists}" = "1" ]; then
+  echo "Staging Cloud SQL instance already exists; run ./cleanup_pilot_staging.sh first or explicitly use --reuse-existing." >&2
   exit 1
 fi
 

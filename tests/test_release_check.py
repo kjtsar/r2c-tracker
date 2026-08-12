@@ -3,6 +3,30 @@ import unittest
 
 
 class ReleaseCheckScriptTest(unittest.TestCase):
+    def test_combined_qualification_runs_unit_suite_once_and_parallelizes_gates(self):
+        root = pathlib.Path(__file__).resolve().parents[1]
+        combined = (root / "qualify_release.sh").read_text()
+        release_check = (root / "release_check.sh").read_text()
+        security_check = (root / "scripts" / "security_checks.sh").read_text()
+
+        self.assertEqual(1, combined.count('unittest discover -s tests'))
+        self.assertIn("./release_check.sh --skip-unit-tests", combined)
+        self.assertIn("./scripts/security_checks.sh --skip-unit-tests", combined)
+        self.assertIn('RELEASE_PID="$!"', combined)
+        self.assertIn('SECURITY_PID="$!"', combined)
+        self.assertIn('wait "${RELEASE_PID}"', combined)
+        self.assertIn('wait "${SECURITY_PID}"', combined)
+        self.assertIn('if [ "${release_status}" -ne 0 ]', combined)
+        self.assertIn('if [ "${1:-}" = "--skip-unit-tests" ]', release_check)
+        self.assertIn('if [ "${1:-}" = "--skip-unit-tests" ]', security_check)
+        self.assertIn('AUDIT_PID="$!"', security_check)
+        self.assertIn('BANDIT_PID="$!"', security_check)
+        self.assertIn('SECRETS_PID="$!"', security_check)
+        self.assertIn('SBOM_PID="$!"', security_check)
+        self.assertIn('wait "${AUDIT_PID}"', security_check)
+        self.assertIn('wait "${SBOM_PID}"', security_check)
+        self.assertIn('if [ "${audit_status}" -ne 0 ]', security_check)
+
     def test_release_check_covers_local_server_and_protocol_smokes(self):
         script = (pathlib.Path(__file__).resolve().parents[1] / "release_check.sh").read_text()
 
@@ -17,6 +41,11 @@ class ReleaseCheckScriptTest(unittest.TestCase):
         self.assertIn("scripts/create_release_check_credential.py", script)
         self.assertIn("/{designator.lower()}/ws/r2c", script)
         self.assertIn("hello_ack", script)
+
+        main_source = (
+            pathlib.Path(__file__).resolve().parents[1] / "main.py"
+        ).read_text()
+        self.assertIn('client_message == "unsubscribe"', main_source)
 
         guard = (
             pathlib.Path(__file__).resolve().parents[1]

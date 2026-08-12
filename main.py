@@ -1009,6 +1009,7 @@ async def protect_control_plane_pages(request: Request, call_next):
     if (
         path.startswith("/platform-admin/")
         or path == "/google/callback"
+        or path == "/login"
         or path == "/organizations/select"
         or (
             path == "/"
@@ -1097,6 +1098,7 @@ class R2CZoneConnection:
         self.connected_at_ms: int = 0
         self.hello_received_at_ms: int = 0
         self.last_seen_ms: int = 0
+        self.remote_video_control_enabled: bool = False
         self.sent_confirmed_event_keys: set[str] = set()
 
 
@@ -1792,6 +1794,25 @@ class R2CCoordinationHub:
         )
         return matches
 
+    async def remote_video_control_enabled(
+        self,
+        *,
+        organization_id: str,
+        device_credential_id: str = "",
+    ) -> bool:
+        """Return the latest live Remote Video Control setting in scope."""
+        async with self._lock:
+            connections = (
+                self._device_connections_locked(device_credential_id)
+                if device_credential_id
+                else list(self._connections.values())
+            )
+            return any(
+                connection.organization_id == organization_id
+                and connection.remote_video_control_enabled
+                for connection in connections
+            )
+
     async def disconnect(self, websocket: WebSocket):
         confirmed_owner_expirations: list[tuple[str, str, str, str]] = []
         async with self._lock:
@@ -1936,9 +1957,14 @@ class R2CCoordinationHub:
         websocket: WebSocket,
         payload: dict,
     ):
+        remote_control_enabled = bool(
+            payload.get("remoteControlEnabled", False)
+        )
         async with self._lock:
             conn = self._connections.get(websocket)
             credential = conn.device_credential if conn is not None else None
+            if conn is not None:
+                conn.remote_video_control_enabled = remote_control_enabled
         if credential is None or control_plane_store is None:
             await websocket.send_text(
                 json.dumps(
@@ -1985,9 +2011,7 @@ class R2CCoordinationHub:
                         advertised.get("thumbnailRevision", "") or ""
                     ),
                     timezone_name=timezone_name,
-                    remote_control_enabled=bool(
-                        payload.get("remoteControlEnabled", False)
-                    ),
+                    remote_control_enabled=remote_control_enabled,
                 )
                 accepted_session_ids.append(stream.session_id)
                 await self.cache_video_thumbnail(
@@ -3772,7 +3796,7 @@ async def require_organization_user(
             )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Organization administrator login required.",
+            detail="Organization login required.",
         )
     user = await control_plane_store.get_user(user_id)
     if (
@@ -3792,7 +3816,7 @@ async def require_organization_user(
             )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Organization administrator login required.",
+            detail="Organization login required.",
         )
     if required_roles and not set(required_roles).intersection(user.roles):
         raise HTTPException(
@@ -4398,6 +4422,22 @@ def template_navigation(request, organization_designator=None):
     return {"scope": "legacy", "home_url": "/", "designator": ""}
 
 
+def organization_landing_path(organization, user) -> str:
+    """Choose a useful first page without sending viewers into administration."""
+    designator = organization.designator.lower()
+    administrative_roles = {
+        "organization_owner",
+        "billing_admin",
+        "user_admin",
+        "records_admin",
+    }
+    if administrative_roles.intersection(user.roles):
+        return f"/{designator}/admin"
+    if "video_requester" in user.roles and "records_viewer" not in user.roles:
+        return f"/{designator}/streams"
+    return f"/{designator}"
+
+
 templates.env.globals.update(
     get_flashed_messages=get_flashed_messages,
     template_navigation=template_navigation,
@@ -4872,6 +4912,7 @@ async def organization_directory(
             "authorized_organizations": authorized_organizations,
             "current_organization_designator": current_organization_designator,
             "organization_identity_name": organization_identity_name,
+            "directory_identity_name": organization_identity_name or "Guest",
             "organization_select_csrf_token": csrf_token(
                 request,
                 "organization_select",
@@ -4916,7 +4957,24 @@ async def select_authorized_organization(
     request.session["organization_user_id"] = membership.id
     request.session["organization_designator"] = organization.designator
     return RedirectResponse(
-        f"/{organization.designator.lower()}/admin",
+        organization_landing_path(organization, membership),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.get("/login", include_in_schema=False)
+async def organization_login_redirect(organization: str):
+    """Resolve a user-entered organization code without listing private tenants."""
+    if control_plane_store is None:
+        raise HTTPException(status_code=404, detail="Organization not found.")
+    try:
+        record = await control_plane_store.get_organization(organization)
+    except InvalidOrganizationError:
+        record = None
+    if record is None or record.lifecycle_state == "archived":
+        raise HTTPException(status_code=404, detail="Organization not found.")
+    return RedirectResponse(
+        f"/{record.designator.lower()}/login",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -6301,9 +6359,10 @@ async def organization_activate_with_password(
     clear_organization_session(request)
     request.session["organization_user_id"] = user.id
     request.session["organization_designator"] = claims.designator
-    flash(request, "Administrator account activated.", "success")
+    flash(request, "Organization account activated.", "success")
+    organization = await control_plane_store.get_organization(claims.designator)
     return RedirectResponse(
-        url=f"/{claims.designator.lower()}/admin",
+        url=organization_landing_path(organization, user),
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -6462,10 +6521,9 @@ async def organization_login(
     clear_organization_session(request)
     request.session["organization_user_id"] = user.id
     request.session["organization_designator"] = organization.designator
-    dashboard_path = f"/{organization.designator.lower()}"
     next_path = organization_safe_login_next(organization.designator, next)
     return RedirectResponse(
-        url=next_path or f"{dashboard_path}/admin",
+        url=next_path or organization_landing_path(organization, user),
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -6733,7 +6791,7 @@ async def organization_google_callback(
         )
         flash(
             request,
-            "That Google account is not an active administrator for this organization.",
+            "That Google account is not an active member of this organization.",
             "warning",
         )
         return RedirectResponse(
@@ -6745,14 +6803,13 @@ async def organization_google_callback(
     request.session["organization_designator"] = organization.designator
     request.session["organization_google_subject"] = google_identity.subject
     if flow.get("activation_nonce"):
-        flash(request, "Administrator account activated.", "success")
-    dashboard_path = f"/{organization.designator.lower()}"
+        flash(request, "Organization account activated.", "success")
     next_path = organization_safe_login_next(
         organization.designator,
         str(flow.get("next", "")),
     )
     return RedirectResponse(
-        url=next_path or f"{dashboard_path}/admin",
+        url=next_path or organization_landing_path(organization, user),
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -6775,6 +6832,12 @@ async def organization_admin(request: Request, designator: str):
     organization, user = await require_organization_user(
         request,
         designator,
+        required_roles=(
+            "organization_owner",
+            "billing_admin",
+            "user_admin",
+            "records_admin",
+        ),
         redirect_to_login=True,
     )
     invitation_url = request.session.pop("_organization_invitation_url", None)
@@ -7686,6 +7749,15 @@ async def organization_streams(
         streams,
         organization_requests,
     )
+    remote_control_enabled = (
+        any(stream.remote_control_enabled for stream in streams)
+        or await r2c_hub.remote_video_control_enabled(
+            organization_id=organization.id,
+            device_credential_id=(
+                tablet_device.id if tablet_device is not None else ""
+            ),
+        )
+    )
     return templates.TemplateResponse(
         request=request,
         name="organization_streams.html",
@@ -7722,9 +7794,7 @@ async def organization_streams(
                 request_in_progress_session_ids
             ),
             "active_consumers_by_device_id": active_consumers_by_device_id,
-            "remote_control_enabled": any(
-                stream.remote_control_enabled for stream in streams
-            ),
+            "remote_control_enabled": remote_control_enabled,
             "video_ice_servers": video_ice_servers,
             "stream_status_active": stream_status["active"],
             "stream_membership_revision": stream_status[
@@ -9541,10 +9611,13 @@ async def organization_stream_events(
                     ),
                 )
             try:
-                await asyncio.wait_for(
+                client_message = await asyncio.wait_for(
                     websocket.receive_text(),
                     timeout=timeout_seconds,
                 )
+                if client_message == "unsubscribe":
+                    await websocket.send_json({"type": "unsubscribed"})
+                    return
             except asyncio.TimeoutError:
                 current = await current_status()
                 if current["revision"] != status_snapshot["revision"]:

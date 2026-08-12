@@ -1,6 +1,16 @@
 #!/bin/sh
 set -eu
 
+SKIP_UNIT_TESTS=0
+if [ "${1:-}" = "--skip-unit-tests" ]; then
+  SKIP_UNIT_TESTS=1
+  shift
+fi
+if [ "$#" -ne 0 ]; then
+  echo "Usage: $0 [--skip-unit-tests]" >&2
+  exit 2
+fi
+
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 cd "${ROOT_DIR}"
 
@@ -48,7 +58,11 @@ echo "==> Python syntax check"
   scripts/release_guard.py
 
 echo "==> Unit tests"
-"${PYTHON}" -m unittest discover -s tests -p "test_*.py"
+if [ "${SKIP_UNIT_TESTS}" -eq 1 ]; then
+  echo "Already completed by the combined release qualification workflow."
+else
+  "${PYTHON}" -m unittest discover -s tests -p "test_*.py"
+fi
 
 echo "==> Rollback-compatible database migrations"
 "${PYTHON}" scripts/check_migration_compatibility.py

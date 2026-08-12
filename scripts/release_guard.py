@@ -5,12 +5,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
 import secrets
 import subprocess
 import sys
+import tarfile
+import tempfile
+import time
 from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -18,6 +22,8 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE_PATH = ROOT / ".release-state" / "pilot.json"
+STAGING_STATE_PATH = ROOT / ".release-state" / "staging.json"
+STAGING_REUSE_MAX_AGE_SECONDS = 24 * 60 * 60
 PROJECT = os.environ.get("GCLOUD_PROJECT", "r2c-tracker-pilot")
 REGION = os.environ.get("REGION", "us-west1")
 SERVICE = os.environ.get("SERVICE_NAME", "r2c-tracker-pilot")
@@ -39,6 +45,19 @@ def run(*args: str, capture: bool = False, env: dict[str, str] | None = None) ->
         capture_output=capture,
     )
     return completed.stdout.strip() if capture else ""
+
+
+@contextmanager
+def committed_source_snapshot():
+    with tempfile.TemporaryDirectory(prefix="r2c-release-source-") as temporary_dir:
+        temporary_path = Path(temporary_dir)
+        archive_path = temporary_path / "source.tar"
+        source_path = temporary_path / "source"
+        source_path.mkdir()
+        run("git", "archive", "--format=tar", f"--output={archive_path}", "HEAD")
+        with tarfile.open(archive_path) as archive:
+            archive.extractall(source_path, filter="data")
+        yield source_path
 
 
 def gcloud(*args: str, capture: bool = False, input_text: str | None = None) -> str:
@@ -282,7 +301,48 @@ def save_state(state: dict) -> None:
     STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
 
 
-def deploy_candidate(app_version_code: int, bootstrap: bool) -> None:
+def save_staging_refresh_state() -> None:
+    STAGING_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STAGING_STATE_PATH.write_text(json.dumps({
+        "instance": "r2c-release-staging",
+        "project": PROJECT,
+        "refreshed_at_epoch": int(time.time()),
+        "region": REGION,
+    }, indent=2, sort_keys=True) + "\n")
+
+
+def validate_staging_reuse_state() -> dict:
+    if not STAGING_STATE_PATH.exists():
+        raise RuntimeError(
+            "Staging reuse requires a refresh receipt from this workstation; "
+            "run the first candidate without --reuse-staging."
+        )
+    try:
+        state = json.loads(STAGING_STATE_PATH.read_text())
+        refreshed_at = int(state["refreshed_at_epoch"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("The staging refresh receipt is invalid; clean up and recreate staging.") from exc
+    expected = {
+        "instance": "r2c-release-staging",
+        "project": PROJECT,
+        "region": REGION,
+    }
+    for key, value in expected.items():
+        if state.get(key) != value:
+            raise RuntimeError(
+                f"The staging refresh receipt has unexpected {key}={state.get(key)!r}; "
+                "clean up and recreate staging."
+            )
+    age_seconds = int(time.time()) - refreshed_at
+    if age_seconds < 0 or age_seconds > STAGING_REUSE_MAX_AGE_SECONDS:
+        raise RuntimeError(
+            "The staging database clone is outside its 24-hour reuse window; "
+            "run ./cleanup_pilot_staging.sh and create fresh staging."
+        )
+    return state
+
+
+def deploy_candidate(app_version_code: int, bootstrap: bool, reuse_staging: bool) -> None:
     if run("git", "status", "--porcelain", capture=True):
         raise RuntimeError("Refusing to deploy an uncommitted or dirty worktree.")
     try:
@@ -291,6 +351,8 @@ def deploy_candidate(app_version_code: int, bootstrap: bool) -> None:
         )
     except subprocess.CalledProcessError as exc:
         raise RuntimeError("Refusing to deploy an untagged commit.") from exc
+    if reuse_staging:
+        validate_staging_reuse_state()
     ensure_gate_secret()
     description = service_description()
     previous_revision = serving_revision(description)
@@ -303,15 +365,21 @@ def deploy_candidate(app_version_code: int, bootstrap: bool) -> None:
         if not is_bootstrap_gate_unavailable(exc):
             raise
         print("Bootstrap acknowledged: the serving revision does not yet expose the deployment gate.")
-    run(str(ROOT / "setup_pilot_staging.sh"))
+    setup_command = [str(ROOT / "setup_pilot_staging.sh")]
+    if reuse_staging:
+        setup_command.append("--reuse-existing")
+    run(*setup_command)
     try:
         run(str(ROOT / "scripts" / "refresh_staging_databases.sh"))
+        save_staging_refresh_state()
         staging_env = dict(os.environ)
         staging_env.update({
             "ACTIVATE_LATEST_REVISION": "1",
             "REVISION_TAG": "staging",
         })
-        run(str(ROOT / "deploy_staging.sh"), str(app_version_code), env=staging_env)
+        with committed_source_snapshot() as source_path:
+            staging_env["DEPLOY_SOURCE_DIR"] = str(source_path)
+            run(str(ROOT / "deploy_staging.sh"), str(app_version_code), env=staging_env)
         active_accounts = gcloud(
             "auth", "list", "--filter=status:ACTIVE", "--format=value(account)",
             capture=True,
@@ -353,20 +421,31 @@ def deploy_candidate(app_version_code: int, bootstrap: bool) -> None:
             "staging_revision": staging_revision,
             "staging_url": staging_url,
             "bootstrap": bootstrap,
+            "reused_staging": reuse_staging,
             "status": "candidate",
         }
         save_state(state)
         regression(candidate_url, expected_version)
     except Exception:
-        print(
-            "Candidate preparation failed; removing ephemeral staging resources.",
-            file=sys.stderr,
-        )
-        subprocess.run(
-            [str(ROOT / "cleanup_pilot_staging.sh")],
-            cwd=ROOT,
-            check=False,
-        )
+        if reuse_staging:
+            print(
+                "Candidate preparation failed; preserving explicitly reused staging resources for diagnosis or retry.",
+                file=sys.stderr,
+            )
+            print(
+                "Run ./cleanup_pilot_staging.sh when finished and within 24 hours of the latest database refresh.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "Candidate preparation failed; removing ephemeral staging resources.",
+                file=sys.stderr,
+            )
+            subprocess.run(
+                [str(ROOT / "cleanup_pilot_staging.sh")],
+                cwd=ROOT,
+                check=False,
+            )
         raise
     print(f"Candidate ready: {candidate_revision}")
     print("Production traffic is unchanged. Run ./promote_candidate.sh to go live.")
@@ -437,13 +516,18 @@ def main() -> None:
     deploy_parser = subparsers.add_parser("deploy-candidate")
     deploy_parser.add_argument("app_version_code", type=int)
     deploy_parser.add_argument("--bootstrap", action="store_true")
+    deploy_parser.add_argument(
+        "--reuse-staging",
+        action="store_true",
+        help="reuse validated isolated staging resources and refresh their database clones",
+    )
     subparsers.add_parser("test-candidate")
     promote_parser = subparsers.add_parser("promote")
     promote_parser.add_argument("--bootstrap", action="store_true")
     subparsers.add_parser("rollback")
     args = parser.parse_args()
     if args.command == "deploy-candidate":
-        deploy_candidate(args.app_version_code, args.bootstrap)
+        deploy_candidate(args.app_version_code, args.bootstrap, args.reuse_staging)
     elif args.command == "test-candidate":
         test_candidate()
     elif args.command == "promote":

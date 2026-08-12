@@ -32,6 +32,21 @@
     justify-content: center;
     gap: 12px;
   }
+  .directory-sign-in {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 8px;
+    margin: 0 0 18px;
+  }
+  .directory-sign-in input {
+    min-height: 48px;
+    padding: 0 12px;
+    border: 1px solid #aab8c4;
+    border-radius: 6px;
+    font: inherit;
+    text-transform: uppercase;
+  }
   .directory-button,
   .directory-link {
     display: inline-flex;
@@ -193,6 +208,15 @@
     Select a participating organization to open its R2C flight dashboard.
     Restricted dashboards will ask you to sign in.
   </p>
+  {% if not organization_identity_name %}
+  <form class="directory-sign-in" method="get" action="/login">
+    <label>
+      <input name="organization" required maxlength="16" aria-label="Organization code"
+             autocomplete="organization" placeholder="Organization code">
+    </label>
+    <button class="directory-button" type="submit">Sign in</button>
+  </form>
+  {% endif %}
   <div class="directory-actions">
     <button class="directory-button" type="button" id="open-organization-picker">
       Choose an organization

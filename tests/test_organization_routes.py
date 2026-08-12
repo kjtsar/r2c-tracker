@@ -480,6 +480,9 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertNotIn('href="/docs"', guest_page.text)
 
         directory_page = self.client.get("/")
+        self.assertIn("User: Guest", directory_page.text)
+        self.assertIn('action="/login"', directory_page.text)
+        self.assertIn('name="organization"', directory_page.text)
         self.assertNotIn("Community-supported.", directory_page.text)
         self.assertNotIn('href="https://rid2caltopo.com/donations"', directory_page.text)
         self.assertNotIn("Support the project", directory_page.text)
@@ -534,6 +537,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         public_dashboard = self.client.get("/ncssar")
         self.assertIn("User: Primary Administrator", public_dashboard.text)
         authenticated_directory = self.client.get("/")
+        self.assertIn("User: Primary Administrator", authenticated_directory.text)
         self.assertIn(
             "You are signed in as <strong>Primary Administrator</strong>",
             authenticated_directory.text,
@@ -597,6 +601,94 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             Decimal("25.00"),
             fake_checkout.create_checkout.call_args.kwargs["amount"],
         )
+
+    def test_records_viewer_lands_on_dashboard_and_directory_shows_identity(self):
+        organization = asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Primary Administrator",
+                admin_email="admin@ncssar.example",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        owner = asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+            )
+        )
+        viewer = asyncio.run(
+            self.store.add_user(
+                organization_id=organization.id,
+                display_name="Records Viewer",
+                email="viewer@ncssar.example",
+                roles=("records_viewer",),
+                actor_id=owner.id,
+            )
+        )
+        invitation = asyncio.run(
+            self.store.get_invitation(
+                organization.designator,
+                viewer.email,
+            )
+        )
+        activation_url = self.tokens.activation_url(invitation)
+        activation_path = urlparse(activation_url).path + "?" + urlparse(
+            activation_url
+        ).query
+        activation_page = self.client.get(activation_path)
+        activated = self.client.post(
+            "/ncssar/activate",
+            data={
+                "form_token": self.form_token(activation_page),
+                "token": parse_qs(urlparse(activation_url).query)["token"][0],
+                "password": "correct horse battery staple",
+                "password_confirm": "correct horse battery staple",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(303, activated.status_code)
+        self.assertEqual("/ncssar", activated.headers["location"])
+
+        dashboard = self.client.get(activated.headers["location"])
+        self.assertEqual(200, dashboard.status_code)
+        self.assertIn("User: Records Viewer", dashboard.text)
+        self.assertEqual(403, self.client.get("/ncssar/admin").status_code)
+
+        directory = self.client.get("/")
+        self.assertIn("User: Records Viewer", directory.text)
+        self.assertIn(
+            "You are signed in as <strong>Records Viewer</strong>",
+            directory.text,
+        )
+        selected = self.client.post(
+            "/organizations/select",
+            data={
+                "form_token": self.form_token(directory),
+                "designator": "NCSSAR",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(303, selected.status_code)
+        self.assertEqual("/ncssar", selected.headers["location"])
+
+        self.client.cookies.clear()
+        guest_dashboard = self.client.get("/ncssar", follow_redirects=False)
+        self.assertEqual(303, guest_dashboard.status_code)
+        self.assertEqual(
+            "/ncssar/login?next=%2Fncssar",
+            guest_dashboard.headers["location"],
+        )
+        generic_login = self.client.get(
+            "/login?organization=ncssar",
+            follow_redirects=False,
+        )
+        self.assertEqual(303, generic_login.status_code)
+        self.assertEqual("/ncssar/login", generic_login.headers["location"])
 
     def test_google_identity_can_switch_memberships_but_password_identity_cannot(self):
         first = asyncio.run(
@@ -1744,7 +1836,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         with self.client.websocket_connect(
             "/ncssar/ws/r2c",
             headers={"X-SAR-Token": device.token},
-        ):
+        ) as live_websocket:
             short_link = self.client.get(
                 f"/t/{tablet_code}",
                 follow_redirects=False,
@@ -1813,6 +1905,60 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             self.assertEqual(200, captured_page.status_code)
             self.assertIn("<td>2B</td>", captured_page.text)
             self.assertNotIn("<td>10A</td>", captured_page.text)
+            live_websocket.send_json(
+                {
+                    "type": "video_stream_advertisement",
+                    "incidentName": "Alpha",
+                    "timeZone": "America/Los_Angeles",
+                    "remoteControlEnabled": True,
+                    "streams": [],
+                }
+            )
+            self.assertTrue(live_websocket.receive_json()["accepted"])
+            remote_control_page = self.client.get(
+                "/ncssar/streams/Android%20video%20tablet"
+            )
+            self.assertEqual(200, remote_control_page.status_code)
+            self.assertIn(
+                "Remote Video Control is enabled on this R2C device",
+                remote_control_page.text,
+            )
+            self.assertNotIn(
+                "A request identifies you to the drone team",
+                remote_control_page.text,
+            )
+            live_websocket.send_json(
+                {
+                    "type": "video_stream_advertisement",
+                    "incidentName": "Alpha",
+                    "timeZone": "America/Los_Angeles",
+                    "remoteControlEnabled": False,
+                    "streams": [
+                        {
+                            "sessionId": "00000000-0000-0000-0000-000000000001",
+                            "droneDesignator": "10A",
+                            "sourceWidth": 1920,
+                            "sourceHeight": 1080,
+                            "sourceFps": 30,
+                            "sourceBitrateBps": 4_000_000,
+                            "sourceCodec": "h264",
+                        },
+                        {
+                            "sessionId": "00000000-0000-0000-0000-000000000002",
+                            "droneDesignator": "2B",
+                            "sourceWidth": 1280,
+                            "sourceHeight": 720,
+                            "sourceFps": 30,
+                            "sourceBitrateBps": 2_000_000,
+                            "sourceCodec": "h264",
+                            "mediaKind": "recording",
+                            "recordedAt": "2026-08-10T19:30:00Z",
+                            "durationMs": 91_000,
+                        },
+                    ],
+                }
+            )
+            self.assertTrue(live_websocket.receive_json()["accepted"])
         unavailable_link = self.client.get(
             f"/t/{tablet_code}",
             follow_redirects=False,
@@ -1832,6 +1978,11 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             )
             self.assertEqual(
                 "streams_changed",
+                event_websocket.receive_json()["type"],
+            )
+            event_websocket.send_text("unsubscribe")
+            self.assertEqual(
+                "unsubscribed",
                 event_websocket.receive_json()["type"],
             )
         stream_form_token = html.unescape(
@@ -2044,6 +2195,11 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             )
             self.assertEqual(
                 "streams_changed",
+                event_websocket.receive_json()["type"],
+            )
+            event_websocket.send_text("unsubscribe")
+            self.assertEqual(
+                "unsubscribed",
                 event_websocket.receive_json()["type"],
             )
 

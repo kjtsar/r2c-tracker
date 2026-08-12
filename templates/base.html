@@ -91,6 +91,10 @@
           color: #183153;
           letter-spacing: 0.04em;
       }
+      .organization-identity a {
+          color: #0b63c9;
+          font-weight: 700;
+      }
       .caltopo-relationship {
           max-width: 1000px;
           margin: 28px auto 8px;
@@ -116,6 +120,14 @@
     <div class="organization-identity" aria-label="Current organization user">
       <strong>{{ organization_page_designator }}</strong>
       <span>User: {{ organization_identity_name | default("Guest") }}</span>
+      {% if organization_identity_name | default("Guest") == "Guest" %}
+      <a href="/{{ organization_page_designator | lower }}/login?next=/{{ organization_page_designator | lower }}">Sign in</a>
+      {% endif %}
+    </div>
+    {% elif directory_identity_name is defined %}
+    <div class="organization-identity" aria-label="Current organization user">
+      <strong>Organizations</strong>
+      <span>User: {{ directory_identity_name }}</span>
     </div>
     {% endif %}
     {% for msg in get_flashed_messages(request) %}

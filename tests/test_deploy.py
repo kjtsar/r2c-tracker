@@ -105,6 +105,8 @@ class DeployScriptTest(unittest.TestCase):
         self.assertIn('--no-traffic', script)
         self.assertIn('--tag "${REVISION_TAG}"', script)
         self.assertIn('--image "${CONTAINER_IMAGE}"', script)
+        self.assertIn('--source "${DEPLOY_SOURCE_DIR}"', script)
+        self.assertIn('DEPLOY_SOURCE_DIR="${DEPLOY_SOURCE_DIR:-.}"', script)
         self.assertIn("immutable Artifact Registry sha256 digest", script)
         self.assertIn("RELEASE_STAGING_MODE", script)
         self.assertIn('clean_line.endswith(": pending review")', script)
@@ -125,6 +127,13 @@ class DeployScriptTest(unittest.TestCase):
         ):
             with self.subTest(module=module):
                 self.assertIn(f"COPY {module} .", dockerfile)
+
+    def test_cloud_source_upload_ignore_rules_cover_editor_lock_files(self):
+        repo = pathlib.Path(__file__).resolve().parents[1]
+        ignore = (repo / ".gcloudignore").read_text().splitlines()
+
+        self.assertIn(".#*", ignore)
+        self.assertNotIn(r".\#*", ignore)
 
     def test_pilot_wrapper_refuses_other_projects_and_services(self):
         repo = pathlib.Path(__file__).resolve().parents[1]

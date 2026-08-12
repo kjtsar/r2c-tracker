@@ -1,3 +1,15 @@
+v1.4.32: pending review
+* Made organization entry role-aware: records viewers land on their organization dashboard, video-only requesters land on streams, administrative roles land on administration, and non-admin members are denied direct administration access.
+* Added visible signed-in or Guest identity on the organization directory, plus direct sign-in controls for guests on both the directory and organization pages.
+* Kept tablet-specific Remote Video Control guidance accurate during transient empty stream advertisements by retaining the setting on the authenticated live tablet connection.
+* Reduced local release qualification time without removing coverage by running the complete unit suite once and executing the independent runtime/migration and security gates in parallel.
+* Further reduced local qualification time by running dependency, static-analysis, secret-scanning, and SBOM security checks concurrently, while retaining separate results and failure handling for every check.
+* Removed the redundant immediate candidate retest from the release procedure; the candidate is still tested during deployment and freshly retested immediately before promotion.
+* Added explicit, validated reuse of isolated staging resources within a 24-hour refresh window while continuing to refresh both production database clones and rerun the complete hosted regression for every candidate.
+* Parallelized the independent tracker and control-plane database dump and restore operations, with separate failure checks and cleanup of interrupted jobs.
+* Added an explicit stream-events unsubscribe acknowledgement so release tests and clients can close long-lived organization event sessions promptly.
+* Made guarded Cloud Run builds use a clean archive of the exact tagged commit, reducing upload context and preventing local editor artifacts from aborting source enumeration.
+
 v1.4.31: deployed
 * Fixed the authenticated organization chooser so its dialog opens under the production Content Security Policy instead of relying on blocked inline JavaScript.
 
