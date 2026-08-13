@@ -292,6 +292,38 @@ class OrganizationUser(Base):
         self.roles_json = json.dumps(sorted(set(roles)))
 
 
+class OrganizationExternalIdentity(Base):
+    __tablename__ = "organization_external_identities"
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id",
+            "provider",
+            "issuer",
+            "subject",
+            name="uq_org_external_identity_subject",
+        ),
+        UniqueConstraint(
+            "user_id",
+            "provider",
+            name="uq_org_external_identity_user_provider",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id"), index=True
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("organization_users.id"), index=True
+    )
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    issuer: Mapped[str] = mapped_column(String(255), nullable=False)
+    subject: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+
+
 class OrganizationLoginThrottle(Base):
     __tablename__ = "organization_login_throttles"
     __table_args__ = (
@@ -2786,6 +2818,48 @@ class ControlPlaneStore:
             for user in users
         )
 
+    async def list_active_users_by_external_identity(
+        self,
+        *,
+        provider: str,
+        issuer: str,
+        subject: str,
+    ) -> tuple[UserRecord, ...]:
+        """Return active memberships explicitly bound to one OIDC identity."""
+        async with self.sessions() as session:
+            users = (
+                await session.scalars(
+                    select(OrganizationUser)
+                    .join(
+                        OrganizationExternalIdentity,
+                        OrganizationExternalIdentity.user_id == OrganizationUser.id,
+                    )
+                    .join(
+                        Organization,
+                        Organization.id == OrganizationUser.organization_id,
+                    )
+                    .where(
+                        OrganizationExternalIdentity.provider == provider,
+                        OrganizationExternalIdentity.issuer == issuer,
+                        OrganizationExternalIdentity.subject == subject,
+                        OrganizationUser.state == "active",
+                        Organization.lifecycle_state != "archived",
+                    )
+                    .order_by(Organization.designator)
+                )
+            ).all()
+        return tuple(
+            UserRecord(
+                id=user.id,
+                organization_id=user.organization_id,
+                email=user.email,
+                display_name=user.display_name,
+                roles=user.roles,
+                state=user.state,
+            )
+            for user in users
+        )
+
     async def get_invitation(
         self,
         designator: str,
@@ -3214,6 +3288,110 @@ class ControlPlaneStore:
                 )
             user.last_login_at = login_at
             await session.commit()
+            return UserRecord(
+                id=user.id,
+                organization_id=user.organization_id,
+                email=user.email,
+                display_name=user.display_name,
+                roles=user.roles,
+                state=user.state,
+            )
+
+    async def authorize_microsoft_user(
+        self,
+        designator: str,
+        email: str,
+        *,
+        issuer: str,
+        subject: str,
+        activation_nonce: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> Optional[UserRecord]:
+        """Authorize a bound Entra identity or bind it through an invitation."""
+        clean_designator = normalize_designator(designator)
+        clean_email = normalize_email(email)
+        clean_issuer = issuer.strip()
+        clean_subject = subject.strip()
+        if not clean_issuer or not clean_subject:
+            return None
+        login_at = now or utc_now()
+        async with self.sessions() as session:
+            user = await session.scalar(
+                select(OrganizationUser)
+                .join(
+                    Organization,
+                    Organization.id == OrganizationUser.organization_id,
+                )
+                .join(
+                    OrganizationExternalIdentity,
+                    OrganizationExternalIdentity.user_id == OrganizationUser.id,
+                )
+                .where(
+                    Organization.designator == clean_designator,
+                    OrganizationExternalIdentity.provider == "microsoft",
+                    OrganizationExternalIdentity.issuer == clean_issuer,
+                    OrganizationExternalIdentity.subject == clean_subject,
+                    OrganizationUser.state.in_(("active", "invited")),
+                )
+            )
+            if user is None:
+                if not activation_nonce:
+                    return None
+                user = await session.scalar(
+                    select(OrganizationUser)
+                    .join(
+                        Organization,
+                        Organization.id == OrganizationUser.organization_id,
+                    )
+                    .where(
+                        Organization.designator == clean_designator,
+                        OrganizationUser.email == clean_email,
+                        OrganizationUser.state == "invited",
+                    )
+                )
+                if user is None or not secrets.compare_digest(
+                    user.activation_nonce, activation_nonce
+                ):
+                    return None
+                session.add(
+                    OrganizationExternalIdentity(
+                        organization_id=user.organization_id,
+                        user_id=user.id,
+                        provider="microsoft",
+                        issuer=clean_issuer,
+                        subject=clean_subject,
+                        created_at=login_at,
+                    )
+                )
+            if user.state == "invited":
+                if not activation_nonce or not secrets.compare_digest(
+                    user.activation_nonce, activation_nonce
+                ):
+                    return None
+                activation_expires_at = as_utc(user.activation_expires_at)
+                if activation_expires_at is None or activation_expires_at < login_at:
+                    return None
+                user.state = "active"
+                user.activation_nonce = new_id()
+                await self._complete_organization_activation(
+                    session, user.organization_id, login_at
+                )
+                session.add(
+                    ControlPlaneAuditEvent(
+                        organization_id=user.organization_id,
+                        actor_type="organization_user",
+                        actor_id=user.id,
+                        event_type="administrator.microsoft_activated",
+                        details_json="{}",
+                        created_at=login_at,
+                    )
+                )
+            user.last_login_at = login_at
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                return None
             return UserRecord(
                 id=user.id,
                 organization_id=user.organization_id,

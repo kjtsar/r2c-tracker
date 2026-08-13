@@ -56,6 +56,13 @@
      href="{{ google_start_url }}">
     Continue with Google
   </a>
+  {% endif %}
+  {% if microsoft_login_enabled %}
+  <a class="auth-choice" href="{{ microsoft_start_url }}">
+    Continue with Microsoft
+  </a>
+  {% endif %}
+  {% if google_login_enabled or microsoft_login_enabled %}
   <div class="auth-divider">or use your R2C password</div>
   {% endif %}
   {% if password_login_enabled %}

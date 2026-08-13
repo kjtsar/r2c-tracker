@@ -43,6 +43,15 @@
   let videoBytesReceived = 0;
   let lastMetricsReportAt = 0;
   let trackAttachedAt = 0;
+  let videoTrackState = "";
+  let videoPacketsReceived = 0;
+  let videoFramesReceived = 0;
+  let videoFramesDecoded = 0;
+  let videoFramesPresented = 0;
+  let videoFramesDropped = 0;
+  let videoKeyFramesDecoded = 0;
+  let videoCodec = "";
+  let decoderImplementation = "";
   const metricsSessionId = window.crypto && typeof window.crypto.randomUUID === "function"
     ? window.crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -136,17 +145,41 @@
     }
   }
 
-  function metricsPayload() {
+  function metricsPayload(diagnosticEvent, diagnosticDetail) {
+    if (typeof video.getVideoPlaybackQuality === "function") {
+      videoFramesPresented = Number(
+        video.getVideoPlaybackQuality().totalVideoFrames || 0
+      );
+    }
     return {
       form_token: formToken,
       metrics_session_id: metricsSessionId,
       audio_bytes_sent: Math.max(0, Math.trunc(audioBytesSent)),
       audio_bytes_received: Math.max(0, Math.trunc(audioBytesReceived)),
       video_bytes_received: Math.max(0, Math.trunc(videoBytesReceived)),
+      diagnostic_event: String(diagnosticEvent || "sample").slice(0, 64),
+      diagnostic_detail: String(diagnosticDetail || "").slice(0, 400),
+      peer_connection_state: peer.connectionState || "",
+      ice_connection_state: peer.iceConnectionState || "",
+      ice_gathering_state: peer.iceGatheringState || "",
+      signaling_state: peer.signalingState || "",
+      video_track_state: videoTrackState,
+      video_element_ready_state: Number(video.readyState || 0),
+      video_element_paused: Boolean(video.paused),
+      video_element_width: Number(video.videoWidth || 0),
+      video_element_height: Number(video.videoHeight || 0),
+      video_packets_received: Math.max(0, Math.trunc(videoPacketsReceived)),
+      video_frames_received: Math.max(0, Math.trunc(videoFramesReceived)),
+      video_frames_decoded: Math.max(0, Math.trunc(videoFramesDecoded)),
+      video_frames_presented: Math.max(0, Math.trunc(videoFramesPresented)),
+      video_frames_dropped: Math.max(0, Math.trunc(videoFramesDropped)),
+      video_key_frames_decoded: Math.max(0, Math.trunc(videoKeyFramesDecoded)),
+      video_codec: videoCodec.slice(0, 120),
+      decoder_implementation: decoderImplementation.slice(0, 120),
     };
   }
 
-  async function reportMetrics(force, keepalive) {
+  async function reportMetrics(force, keepalive, diagnosticEvent, diagnosticDetail) {
     const now = Date.now();
     if (!force && now - lastMetricsReportAt < 5000) return;
     lastMetricsReportAt = now;
@@ -154,9 +187,13 @@
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify(metricsPayload()),
+      body: JSON.stringify(metricsPayload(diagnosticEvent, diagnosticDetail)),
       keepalive: Boolean(keepalive),
     });
+  }
+
+  function reportDiagnostic(event, detail) {
+    reportMetrics(true, false, event, detail).catch(function () {});
   }
 
   async function reportEnded(message) {
@@ -239,11 +276,18 @@
     const reports = await peer.getStats();
     let decodedFrames = 0;
     let inspectedVideoBytesReceived = 0;
+    let inspectedCodecId = "";
     reports.forEach(function (report) {
       if (report.type === "inbound-rtp" && !report.isRemote &&
           (report.kind === "video" || report.mediaType === "video")) {
-        decodedFrames += Number(report.framesDecoded || report.framesReceived || 0);
+        decodedFrames += Number(report.framesDecoded || 0);
         inspectedVideoBytesReceived += Number(report.bytesReceived || 0);
+        videoPacketsReceived = Number(report.packetsReceived || 0);
+        videoFramesReceived = Number(report.framesReceived || 0);
+        videoFramesDropped = Number(report.framesDropped || 0);
+        videoKeyFramesDecoded = Number(report.keyFramesDecoded || 0);
+        inspectedCodecId = String(report.codecId || "");
+        decoderImplementation = String(report.decoderImplementation || "");
       }
       if (report.type === "outbound-rtp" && !report.isRemote &&
           (report.kind === "audio" || report.mediaType === "audio")) {
@@ -254,6 +298,11 @@
         audioBytesReceived = Number(report.bytesReceived || 0);
       }
     });
+    if (inspectedCodecId) {
+      const codec = reports.get(inspectedCodecId);
+      videoCodec = String(codec?.mimeType || codec?.codec || "");
+    }
+    videoFramesDecoded = decodedFrames;
     videoBytesReceived = inspectedVideoBytesReceived;
     await reportMetrics(false, false).catch(function () {});
     const now = Date.now();
@@ -299,16 +348,33 @@
     video.srcObject = stream;
     video.style.display = "block";
     trackAttachedAt = Date.now();
+    videoTrackState = event.track.readyState || "live";
+    reportDiagnostic("video_track_attached", `muted=${Boolean(event.track.muted)}`);
+    event.track.addEventListener("mute", function () {
+      reportDiagnostic("video_track_muted", "");
+    });
+    event.track.addEventListener("unmute", function () {
+      reportDiagnostic("video_track_unmuted", "");
+    });
     event.track.addEventListener("ended", function () {
+      videoTrackState = event.track.readyState || "ended";
+      reportDiagnostic("video_track_ended", "");
       if (!pageLeaving) {
         reportEnded("Video source stopped; the last frame was cleared.").catch(function () {});
       }
     });
-    video.play().catch(function () {
+    video.play().then(function () {
+      reportDiagnostic("video_play_resolved", "");
+    }).catch(function (error) {
+      reportDiagnostic("video_play_rejected", error?.message || String(error || ""));
       show("Video arrived. Select Play if browser autoplay is disabled.", "playing");
     });
   });
+  video.addEventListener("loadedmetadata", function () {
+    reportDiagnostic("video_loadedmetadata", `${video.videoWidth}x${video.videoHeight}`);
+  });
   video.addEventListener("playing", function () {
+    reportDiagnostic("video_playing", `${video.videoWidth}x${video.videoHeight}`);
     show("Video track attached; waiting for the first video frame…", "connecting");
     if (!statsTimer) {
       statsTimer = window.setInterval(function () {
@@ -317,7 +383,30 @@
     }
     inspectFrameProgress().catch(function () {});
   });
+  video.addEventListener("waiting", function () {
+    reportDiagnostic("video_waiting", "");
+  });
+  video.addEventListener("stalled", function () {
+    reportDiagnostic("video_stalled", "");
+  });
+  video.addEventListener("error", function () {
+    const mediaError = video.error;
+    reportDiagnostic(
+      "video_element_error",
+      mediaError ? `code=${mediaError.code} message=${mediaError.message || ""}` : "unknown",
+    );
+  });
+  peer.addEventListener("iceconnectionstatechange", function () {
+    reportDiagnostic("ice_connection_state", peer.iceConnectionState || "");
+  });
+  peer.addEventListener("icegatheringstatechange", function () {
+    reportDiagnostic("ice_gathering_state", peer.iceGatheringState || "");
+  });
+  peer.addEventListener("signalingstatechange", function () {
+    reportDiagnostic("signaling_state", peer.signalingState || "");
+  });
   peer.addEventListener("connectionstatechange", function () {
+    reportDiagnostic("peer_connection_state", peer.connectionState || "");
     if (!pageLeaving && !endedReported &&
         (peer.connectionState === "failed" || peer.connectionState === "closed")) {
       reportEnded(`Video connection ${peer.connectionState}; the last frame was cleared.`).catch(function () {});
@@ -342,6 +431,7 @@
       if (current.answerSdp) {
         await peer.setRemoteDescription({ type: "answer", sdp: current.answerSdp });
         answerApplied = true;
+        reportDiagnostic("media_answer_applied", "");
         show("Media path negotiated; waiting for the first video frame…", "connecting");
         if (!serverStateTimer) {
           serverStateTimer = window.setInterval(function () {
@@ -357,6 +447,7 @@
 
   async function start() {
     if (!requestId || !designator || !formToken) throw new Error("Media request is incomplete.");
+    reportDiagnostic("media_page_started", "");
     show("Creating the authorized video receiver…", "starting");
     peer.addTransceiver("video", { direction: "recvonly" });
     audioTransceiver = peer.addTransceiver("audio", { direction: "sendrecv" });
@@ -369,8 +460,10 @@
       Math.round(performance.now() - gatheringStartedAt),
     );
     if (!peer.localDescription?.sdp.includes(" typ relay ")) {
+      reportDiagnostic("media_relay_candidate_missing", `waitedMs=${relayCandidateMs}`);
       throw new Error("A routed TURN candidate was not available for video.");
     }
+    reportDiagnostic("media_relay_candidate_ready", `waitedMs=${relayCandidateMs}`);
     const response = await fetch(`${base}/offer`, {
       method: "POST",
       credentials: "same-origin",
@@ -383,6 +476,7 @@
     });
     if (!response.ok) throw new Error("The tracker rejected the media offer.");
     const result = await response.json();
+    reportDiagnostic("media_offer_recorded", `delivered=${Boolean(result.delivered)}`);
     show(
       result.delivered
         ? "Media offer delivered to the tablet…"
@@ -409,6 +503,7 @@
     peer.close();
   });
   start().catch(function (error) {
+    reportDiagnostic("media_start_failed", error?.message || String(error || ""));
     show(error.message || "The video connection failed.", "error");
     peer.close();
   });

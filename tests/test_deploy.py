@@ -85,6 +85,15 @@ class DeployScriptTest(unittest.TestCase):
             script,
         )
         self.assertIn(
+            "MICROSOFT_OIDC_CLIENT_ID=${MICROSOFT_OIDC_CLIENT_ID_SECRET_NAME}:latest",
+            script,
+        )
+        self.assertIn(
+            "MICROSOFT_OIDC_CLIENT_SECRET=${MICROSOFT_OIDC_CLIENT_SECRET_SECRET_NAME}:latest",
+            script,
+        )
+        self.assertIn('"MICROSOFT_OIDC_TENANT": os.environ.get(', script)
+        self.assertIn(
             "PLATFORM_EMAIL_SMTP_PASSWORD=${PLATFORM_EMAIL_SMTP_PASSWORD_SECRET_NAME}:latest",
             script,
         )

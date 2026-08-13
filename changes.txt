@@ -1,3 +1,7 @@
+v1.4.34: pending review
+* Added Microsoft Entra OpenID Connect for invited organization members, with authorization-code PKCE, tenant-aware token verification, stable identity binding, and no automatic membership or role provisioning.
+* Added managed-video diagnostics across approval, browser offer delivery, WebRTC state, codec negotiation, packet receipt, frame decoding, and HTML video playback without changing the media path.
+
 v1.4.33: deployed
 * Allow an unexpired pending member to activate through ordinary organization Google sign-in when Google verifies the exact invited email, matching the guidance already shown on the member administration page.
 * Make newly archived CalTopo track descriptions point to one stable recording-session link instead of a drone-name filter that could list several videos; legacy broad stream links remain supported.

@@ -192,6 +192,12 @@ Do not commit `.env` files or place secret values in command arguments.
 
 - Google organization and platform login use `GOOGLE_OAUTH_CLIENT_ID` and
   `GOOGLE_OAUTH_CLIENT_SECRET`.
+- Microsoft organization login uses `MICROSOFT_OIDC_CLIENT_ID` and
+  `MICROSOFT_OIDC_CLIENT_SECRET`. `MICROSOFT_OIDC_TENANT` defaults to
+  `organizations`; set it to a tenant UUID to restrict sign-in to one Entra
+  tenant. Register `https://r2c-tracker.com/microsoft/callback` as a Web
+  redirect URI. Microsoft identities are linked only through a current R2C
+  member invitation; OIDC never creates memberships or assigns roles.
 - Hosted send-only Gmail uses `PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN` and
   `PLATFORM_EMAIL_FROM`; STARTTLS SMTP variables remain an optional fallback.
 - Live aggregate billing uses `PLATFORM_BILLING_SOURCE=bigquery`, an explicit

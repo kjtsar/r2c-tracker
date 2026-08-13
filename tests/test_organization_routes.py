@@ -34,7 +34,7 @@ from control_plane import (
 )
 from enrollment import ControlPlaneTokenService
 from platform_admin_identity import PlatformAdminIdentity
-from platform_admin_auth import GoogleIdentity
+from platform_admin_auth import GoogleIdentity, MicrosoftIdentity
 
 
 class StaticPlatformAdminIdentityProvider:
@@ -69,6 +69,33 @@ class FakeGoogleOidcClient:
             name="Primary Administrator",
         )
 
+
+class FakeMicrosoftOidcClient:
+    is_configured = True
+
+    def __init__(self, email="admin@ncssar.example"):
+        self.email = email
+
+    def authorization_request(self, redirect_uri):
+        return (
+            "https://login.microsoftonline.test/auth?state=microsoft-state",
+            {
+                "state": "microsoft-state",
+                "nonce": "microsoft-nonce",
+                "verifier": "microsoft-verifier",
+            },
+        )
+
+    def exchange_code(self, **_kwargs):
+        return MicrosoftIdentity(
+            issuer=(
+                "https://login.microsoftonline.com/"
+                "12345678-1234-1234-1234-123456789abc/v2.0"
+            ),
+            subject="abcdefab-1234-1234-1234-abcdefabcdef",
+            email=self.email,
+            name="Primary Administrator",
+        )
 
 class FakeOrganizationEmailSender:
     is_configured = True
@@ -279,6 +306,28 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn("waiting for decoder recovery", script)
         self.assertIn("now - lastPacketProgressAt >= 15000", script)
         self.assertNotIn("now - lastFrameProgressAt >= 6000", script)
+
+    def test_video_media_reports_browser_decode_and_render_diagnostics(self):
+        script = Path("static/video_media.js").read_text()
+        template = Path("templates/organization_streams.html").read_text()
+
+        for diagnostic in (
+            "video_frames_received",
+            "video_frames_decoded",
+            "video_frames_presented",
+            "video_key_frames_decoded",
+            "video_codec",
+            "decoder_implementation",
+            "video_element_ready_state",
+            "video_element_width",
+            "video_element_height",
+            'reportDiagnostic("media_page_started"',
+            'reportDiagnostic("media_offer_recorded"',
+            'reportDiagnostic("video_track_attached"',
+            'reportDiagnostic("video_play_rejected"',
+        ):
+            self.assertIn(diagnostic, script)
+        self.assertIn("video_media.js?v=20260813-1", template)
 
     def test_media_offer_posts_on_first_relay_candidate(self):
         script = Path("static/video_media.js").read_text()
@@ -1831,6 +1880,84 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertEqual(
             200,
             self.client.get("/ncssar/admin").status_code,
+        )
+
+    def test_microsoft_identity_must_be_linked_through_current_invitation(self):
+        organization = asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Primary Administrator",
+                admin_email="admin@ncssar.example",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        invitation = asyncio.run(
+            self.store.get_invitation(
+                organization.designator, organization.primary_admin_email
+            )
+        )
+        activation_url = self.tokens.activation_url(invitation)
+        activation_path = urlparse(activation_url).path + "?" + urlparse(
+            activation_url
+        ).query
+
+        with patch.object(
+            main, "microsoft_oidc_client", FakeMicrosoftOidcClient()
+        ):
+            login_page = self.client.get("/ncssar/login")
+            self.assertIn("Continue with Microsoft", login_page.text)
+            self.client.get("/ncssar/microsoft/start", follow_redirects=False)
+            unbound = self.client.get(
+                "/microsoft/callback?code=test-code&state=microsoft-state",
+                follow_redirects=False,
+            )
+            self.assertEqual("/ncssar/login", unbound.headers["location"])
+
+            activation_page = self.client.get(activation_path)
+            self.assertIn("Continue with Microsoft", activation_page.text)
+            start = self.client.post(
+                "/ncssar/activate/microsoft",
+                data={
+                    "form_token": self.form_token(activation_page),
+                    "token": parse_qs(urlparse(activation_url).query)["token"][0],
+                },
+                follow_redirects=False,
+            )
+            self.assertEqual(303, start.status_code)
+            self.assertTrue(
+                start.headers["location"].startswith(
+                    "https://login.microsoftonline.test/auth"
+                )
+            )
+            self.assertIn(
+                "https://login.microsoftonline.com",
+                start.headers["content-security-policy"],
+            )
+            activated = self.client.get(
+                "/microsoft/callback?code=test-code&state=microsoft-state",
+                follow_redirects=False,
+            )
+            self.assertEqual("/ncssar/admin", activated.headers["location"])
+            self.assertEqual(200, self.client.get("/ncssar/admin").status_code)
+
+            self.client.cookies.clear()
+            self.client.get("/ncssar/microsoft/start", follow_redirects=False)
+            signed_in = self.client.get(
+                "/microsoft/callback?code=test-code&state=microsoft-state",
+                follow_redirects=False,
+            )
+
+        self.assertEqual(303, signed_in.status_code)
+        self.assertEqual("/ncssar/admin", signed_in.headers["location"])
+        audit_events = asyncio.run(self.store.list_audit_events())
+        self.assertTrue(
+            any(
+                event.event_type == "administrator.microsoft_activated"
+                for event in audit_events
+            )
         )
 
     def test_video_requester_sees_sorted_streams_and_request_stays_pending(self):

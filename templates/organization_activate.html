@@ -65,6 +65,16 @@
     <input type="hidden" name="token" value="{{ token }}">
     <button type="submit">Continue with Google</button>
   </form>
+  {% endif %}
+  {% if microsoft_login_enabled %}
+  <form class="activation-form" method="post"
+        action="/{{ designator|lower }}/activate/microsoft">
+    <input type="hidden" name="form_token" value="{{ csrf_token }}">
+    <input type="hidden" name="token" value="{{ token }}">
+    <button type="submit">Continue with Microsoft</button>
+  </form>
+  {% endif %}
+  {% if google_login_enabled or microsoft_login_enabled %}
   <div class="auth-divider">or create an R2C password</div>
   {% endif %}
   <form class="activation-form" method="post"

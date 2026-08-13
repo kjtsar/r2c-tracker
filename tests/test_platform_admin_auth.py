@@ -8,12 +8,92 @@ from platform_admin_auth import (
     GMAIL_SEND_SCOPE,
     GmailApiPlatformAdminEmailSender,
     GoogleOidcClient,
+    MicrosoftOidcClient,
     PlatformAdminAuthError,
     SmtpPlatformAdminEmailSender,
 )
 
 
 class PlatformAdminAuthHelpersTest(unittest.TestCase):
+    def test_microsoft_authorization_uses_organizations_state_nonce_and_pkce(self):
+        client = MicrosoftOidcClient("client-id", "client-secret")
+
+        url, flow = client.authorization_request(
+            "https://r2c-tracker.com/microsoft/callback"
+        )
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query)
+        expected_challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(flow["verifier"].encode("ascii")).digest()
+        ).rstrip(b"=").decode("ascii")
+
+        self.assertEqual("login.microsoftonline.com", parsed.hostname)
+        self.assertEqual("/organizations/oauth2/v2.0/authorize", parsed.path)
+        self.assertEqual(["openid email profile"], query["scope"])
+        self.assertEqual([flow["state"]], query["state"])
+        self.assertEqual([flow["nonce"]], query["nonce"])
+        self.assertEqual([expected_challenge], query["code_challenge"])
+        self.assertEqual(["S256"], query["code_challenge_method"])
+
+    @patch("google.auth.jwt.decode")
+    @patch("platform_admin_auth.requests.get")
+    @patch("platform_admin_auth.requests.post")
+    def test_microsoft_exchange_validates_tenant_issuer_and_identity(
+        self, post, get, decode
+    ):
+        tenant = "12345678-1234-1234-1234-123456789abc"
+        issuer = f"https://login.microsoftonline.com/{tenant}/v2.0"
+        token_response = Mock()
+        token_response.json.return_value = {"id_token": "signed-token"}
+        token_response.raise_for_status.return_value = None
+        post.return_value = token_response
+        metadata_response = Mock()
+        metadata_response.json.return_value = {
+            "issuer": issuer,
+            "jwks_uri": (
+                f"https://login.microsoftonline.com/{tenant}/discovery/v2.0/keys"
+            ),
+        }
+        metadata_response.raise_for_status.return_value = None
+        keys_response = Mock()
+        keys_response.json.return_value = {
+            "keys": [{"kid": "signing-key", "x5c": ["certificate"]}]
+        }
+        keys_response.raise_for_status.return_value = None
+        get.side_effect = [metadata_response, keys_response]
+        claims = {
+            "aud": "client-id",
+            "iss": issuer,
+            "tid": tenant,
+            "oid": "ABCDEFAB-1234-1234-1234-ABCDEFABCDEF",
+            "preferred_username": "Responder@Example.org",
+            "name": "SAR Responder",
+            "nonce": "expected-nonce",
+            "ver": "2.0",
+        }
+        decode.side_effect = [{"tid": tenant}, claims]
+
+        identity = MicrosoftOidcClient(
+            "client-id", "client-secret"
+        ).exchange_code(
+            code="authorization-code",
+            redirect_uri="https://r2c-tracker.com/microsoft/callback",
+            verifier="pkce-verifier",
+            expected_nonce="expected-nonce",
+        )
+
+        self.assertEqual(issuer, identity.issuer)
+        self.assertEqual("abcdefab-1234-1234-1234-abcdefabcdef", identity.subject)
+        self.assertEqual("responder@example.org", identity.email)
+        self.assertEqual("SAR Responder", identity.name)
+        verified_call = decode.call_args_list[1]
+        self.assertEqual("client-id", verified_call.kwargs["audience"])
+        self.assertIn("signing-key", verified_call.kwargs["certs"])
+
+    def test_microsoft_tenant_rejects_consumer_authority(self):
+        with self.assertRaises(PlatformAdminAuthError):
+            MicrosoftOidcClient("client-id", "client-secret", "common")
+
     def test_google_authorization_uses_state_nonce_and_pkce(self):
         client = GoogleOidcClient("client-id", "client-secret")
 

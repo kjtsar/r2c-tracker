@@ -146,6 +146,34 @@ an exact match with the current infrastructure identity. The authenticated
 platform-account setup action additionally requests `gmail.send` and stores the
 offline credential directly in Secret Manager. The runtime cannot read Gmail.
 
+Microsoft organization sign-in uses a separate Microsoft Entra Web app
+registration. Configure the supported account type as **Accounts in any
+organizational directory** and register this exact redirect URI:
+
+```text
+https://r2c-tracker.com/microsoft/callback
+```
+
+Store the application client ID and client secret in these Secret Manager
+secrets:
+
+- `r2c-microsoft-oidc-client-id`
+- `r2c-microsoft-oidc-client-secret`
+
+Enable them for a pilot deployment by setting
+`MICROSOFT_OIDC_CLIENT_ID_SECRET_NAME` and
+`MICROSOFT_OIDC_CLIENT_SECRET_SECRET_NAME` to those names. They remain opt-in
+so an existing deployment is not blocked before its Entra app registration and
+secrets exist.
+
+The pilot defaults `MICROSOFT_OIDC_TENANT` to `organizations`, which excludes
+personal Microsoft accounts. A tenant UUID may be supplied to restrict the app
+to one Entra tenant. The callback validates the ID-token signature, audience,
+tenant-specific issuer, nonce, expiry, and v2 token version. The invitation's
+exact email is used only during initial linking; subsequent authorization uses
+the stable issuer and Entra object ID. A Microsoft identity never creates an
+R2C membership or grants roles.
+
 When provisioning a new environment, first use an isolated setup revision,
 sign in at `/platform-admin/account`, and select **Connect Gmail sender**. After
 consent, map the resulting Secret Manager version read-only into the runtime.

@@ -14,6 +14,7 @@ class SecurityAuthorizationInventoryTest(unittest.TestCase):
         "organization_activate_page",
         "organization_activate_with_password",
         "organization_activate_with_google",
+        "organization_activate_with_microsoft",
         "organization_login_page",
         "organization_login",
         "organization_forgot_password_page",
@@ -21,6 +22,7 @@ class SecurityAuthorizationInventoryTest(unittest.TestCase):
         "organization_reset_password_page",
         "organization_reset_password",
         "organization_google_start",
+        "organization_microsoft_start",
         "organization_logout",
         "organization_enrollment_landing",
     }

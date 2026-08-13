@@ -83,6 +83,7 @@ from platform_admin_identity import (
 from platform_admin_auth import (
     GmailApiPlatformAdminEmailSender,
     GoogleOidcClient,
+    MicrosoftOidcClient,
     PlatformAdminAuthError,
     SmtpPlatformAdminEmailSender,
 )
@@ -276,6 +277,25 @@ class BrowserVideoMediaMetrics(BrowserVideoMediaState):
     audio_bytes_sent: int = Field(ge=0, le=10_000_000_000_000)
     audio_bytes_received: int = Field(ge=0, le=10_000_000_000_000)
     video_bytes_received: int = Field(ge=0, le=10_000_000_000_000)
+    diagnostic_event: str = Field(default="sample", max_length=64)
+    diagnostic_detail: str = Field(default="", max_length=400)
+    peer_connection_state: str = Field(default="", max_length=32)
+    ice_connection_state: str = Field(default="", max_length=32)
+    ice_gathering_state: str = Field(default="", max_length=32)
+    signaling_state: str = Field(default="", max_length=32)
+    video_track_state: str = Field(default="", max_length=32)
+    video_element_ready_state: int = Field(default=0, ge=0, le=4)
+    video_element_paused: bool = True
+    video_element_width: int = Field(default=0, ge=0, le=16_384)
+    video_element_height: int = Field(default=0, ge=0, le=16_384)
+    video_packets_received: int = Field(default=0, ge=0, le=10_000_000_000_000)
+    video_frames_received: int = Field(default=0, ge=0, le=10_000_000_000_000)
+    video_frames_decoded: int = Field(default=0, ge=0, le=10_000_000_000_000)
+    video_frames_presented: int = Field(default=0, ge=0, le=10_000_000_000_000)
+    video_frames_dropped: int = Field(default=0, ge=0, le=10_000_000_000_000)
+    video_key_frames_decoded: int = Field(default=0, ge=0, le=10_000_000_000_000)
+    video_codec: str = Field(default="", max_length=120)
+    decoder_implementation: str = Field(default="", max_length=120)
 
 
 def optional_iso_datetime(value: object) -> Optional[datetime]:
@@ -318,6 +338,7 @@ platform_admin_identity_provider = (
     else None
 )
 google_oidc_client = GoogleOidcClient.from_environment()
+microsoft_oidc_client = MicrosoftOidcClient.from_environment()
 gmail_email_sender = GmailApiPlatformAdminEmailSender.from_environment()
 smtp_email_sender = SmtpPlatformAdminEmailSender.from_environment()
 platform_admin_email_sender = (
@@ -997,8 +1018,8 @@ async def protect_control_plane_pages(request: Request, call_next):
         response.headers["Cache-Control"] = "no-cache, max-age=0"
     organization_page = re.fullmatch(
         r"/[a-z0-9]{2,16}/(?:"
-        r"activate(?:/google)?|login|forgot-password|reset-password|"
-        r"google/start|logout|admin(?:/.*)?|settings|members|"
+        r"activate(?:/(?:google|microsoft))?|login|forgot-password|reset-password|"
+        r"(?:google|microsoft)/start|logout|admin(?:/.*)?|settings|members|"
         r"billing/checkout|"
         r"streams(?:/status|/[^/]+/request|/requests/[^/]+/"
         r"(?:cancel|preflight/(?:offer|status)))?|"
@@ -1010,6 +1031,7 @@ async def protect_control_plane_pages(request: Request, call_next):
     if (
         path.startswith("/platform-admin/")
         or path == "/google/callback"
+        or path == "/microsoft/callback"
         or path == "/login"
         or path == "/organizations/select"
         or (
@@ -1026,7 +1048,8 @@ async def protect_control_plane_pages(request: Request, call_next):
             "default-src 'self'; "
             "style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data:; "
-            "form-action 'self' https://accounts.google.com; "
+            "form-action 'self' https://accounts.google.com "
+            "https://login.microsoftonline.com; "
             "frame-ancestors 'none'; "
             "base-uri 'none'"
         )
@@ -2277,7 +2300,24 @@ class R2CCoordinationHub:
                 "accepted": True,
                 "state": result.state,
             }))
+            logger.info(
+                "Managed video decision accepted: request=%s device=%s "
+                "state=%s profile=%sx%s@%s bitrate=%s",
+                result.id,
+                credential.id,
+                result.state,
+                getattr(result, "selected_width", 0),
+                getattr(result, "selected_height", 0),
+                getattr(result, "selected_fps", 0.0),
+                getattr(result, "selected_bitrate_bps", 0),
+            )
         except (ControlPlaneError, TypeError, ValueError) as exc:
+            logger.warning(
+                "Managed video decision rejected: request=%s device=%s error=%s",
+                request_id,
+                getattr(credential, "id", ""),
+                exc,
+            )
             await websocket.send_text(json.dumps({
                 "type": "video_stream_decision_ack",
                 "requestId": request_id,
@@ -2346,7 +2386,19 @@ class R2CCoordinationHub:
                 "requestId": result.request_id,
                 "accepted": True,
             }))
+            logger.info(
+                "Managed video media answer accepted: request=%s device=%s sdpBytes=%s",
+                result.request_id,
+                credential.id,
+                len(str(payload.get("sdp", "") or "").encode("utf-8")),
+            )
         except (ControlPlaneError, TypeError, ValueError) as exc:
+            logger.warning(
+                "Managed video media answer rejected: request=%s device=%s error=%s",
+                request_id,
+                getattr(credential, "id", ""),
+                exc,
+            )
             await websocket.send_text(json.dumps({
                 "type": "video_media_answer_ack",
                 "requestId": request_id,
@@ -3746,6 +3798,25 @@ def clear_organization_session(request: Request) -> None:
             request.session.pop(key, None)
 
 
+async def organization_session_memberships(
+        request: Request, current_user):
+    """Resolve memberships from the externally verified session identity."""
+    external_identity = request.session.get("organization_external_identity")
+    if isinstance(external_identity, dict):
+        provider = str(external_identity.get("provider", ""))
+        issuer = str(external_identity.get("issuer", ""))
+        subject = str(external_identity.get("subject", ""))
+        if provider and issuer and subject:
+            return await control_plane_store.list_active_users_by_external_identity(
+                provider=provider,
+                issuer=issuer,
+                subject=subject,
+            )
+    if request.session.get("organization_google_subject"):
+        return await control_plane_store.list_active_users_by_email(current_user.email)
+    return (current_user,)
+
+
 def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
     if not LEGACY_ADMIN_ENABLED:
         raise HTTPException(
@@ -4910,12 +4981,8 @@ async def organization_directory(
             and current_organization is not None
             and session_designator == current_organization.designator
         ):
-            memberships = (
-                await control_plane_store.list_active_users_by_email(
-                    current_user.email
-                )
-                if request.session.get("organization_google_subject")
-                else (current_user,)
+            memberships = await organization_session_memberships(
+                request, current_user
             )
             authorized_ids = {membership.organization_id for membership in memberships}
             authorized_organizations = tuple(
@@ -4991,11 +5058,7 @@ async def select_authorized_organization(
         session_designator,
     )
     organization = await control_plane_store.get_organization(designator)
-    memberships = (
-        await control_plane_store.list_active_users_by_email(current_user.email)
-        if request.session.get("organization_google_subject")
-        else (current_user,)
-    )
+    memberships = await organization_session_memberships(request, current_user)
     membership = next(
         (
             candidate
@@ -6370,6 +6433,7 @@ async def organization_activate_page(
             "token": token,
             "csrf_token": csrf_token(request, "organization_activation"),
             "google_login_enabled": google_oidc_client.is_configured,
+            "microsoft_login_enabled": microsoft_oidc_client.is_configured,
             "organization_page_designator": claims.designator,
             "organization_identity_name": identity_name,
         },
@@ -6484,6 +6548,65 @@ async def organization_activate_with_google(
     )
 
 
+@app.post("/{designator}/activate/microsoft")
+async def organization_activate_with_microsoft(
+        request: Request,
+        designator: str,
+        token: Annotated[str, Form()],
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_activation", form_token)
+    if not organization_site_ready():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Organization administration is not configured.",
+        )
+    try:
+        claims = control_plane_tokens.decode_activation(token)
+        if claims.designator.lower() != designator.lower():
+            raise ControlPlaneError("The activation link is invalid.")
+        invitation = await control_plane_store.get_invitation(
+            claims.designator, claims.email
+        )
+        if (
+            invitation is None
+            or invitation.user_id != claims.user_id
+            or invitation.organization_id != claims.organization_id
+            or not secrets.compare_digest(invitation.activation_nonce, claims.nonce)
+        ):
+            raise ControlPlaneError(
+                "The administrator invitation is invalid or already used."
+            )
+        authorization_url, flow = microsoft_oidc_client.authorization_request(
+            organization_microsoft_redirect_uri()
+        )
+    except (
+        ControlPlaneError,
+        EnrollmentTokenError,
+        InvalidOrganizationError,
+        PlatformAdminAuthError,
+        ValueError,
+    ) as exc:
+        flash(request, str(exc), "warning")
+        return RedirectResponse(
+            url=(
+                f"/{designator.lower()}/activate?"
+                f"{urlencode({'token': token})}"
+            ),
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    request.session["organization_microsoft_flow"] = {
+        **flow,
+        "organization_id": claims.organization_id,
+        "designator": claims.designator,
+        "activation_email": claims.email,
+        "activation_nonce": claims.nonce,
+    }
+    return RedirectResponse(
+        url=authorization_url,
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
 def organization_safe_login_next(designator: str, requested: str) -> str:
     organization_path = f"/{designator.lower()}"
     if requested == organization_path:
@@ -6527,9 +6650,14 @@ async def organization_login_page(
             "organization": organization,
             "csrf_token": csrf_token(request, "organization_login"),
             "google_login_enabled": google_oidc_client.is_configured,
+            "microsoft_login_enabled": microsoft_oidc_client.is_configured,
             "password_login_enabled": True,
             "google_start_url": (
                 f"/{organization.designator.lower()}/google/start"
+                + ("?" + urlencode({"next": next_path}) if next_path else "")
+            ),
+            "microsoft_start_url": (
+                f"/{organization.designator.lower()}/microsoft/start"
                 + ("?" + urlencode({"next": next_path}) if next_path else "")
             ),
             "next_path": next_path,
@@ -6733,6 +6861,48 @@ def organization_google_redirect_uri() -> str:
     )
 
 
+def organization_microsoft_redirect_uri() -> str:
+    return CONTROL_PLANE_PUBLIC_URL.rstrip("/") + "/microsoft/callback"
+
+
+@app.get("/{designator}/microsoft/start")
+async def organization_microsoft_start(
+        request: Request,
+        designator: str,
+        next: str = ""):
+    if not organization_site_ready():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Organization administration is not configured.",
+        )
+    try:
+        organization = await control_plane_store.get_organization(designator)
+    except InvalidOrganizationError:
+        organization = None
+    if organization is None:
+        raise HTTPException(status_code=404, detail="Organization not found.")
+    try:
+        authorization_url, flow = microsoft_oidc_client.authorization_request(
+            organization_microsoft_redirect_uri()
+        )
+    except PlatformAdminAuthError as exc:
+        flash(request, str(exc), "warning")
+        return RedirectResponse(
+            url=f"/{organization.designator.lower()}/login",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    request.session["organization_microsoft_flow"] = {
+        **flow,
+        "organization_id": organization.id,
+        "designator": organization.designator,
+        "next": organization_safe_login_next(organization.designator, next),
+    }
+    return RedirectResponse(
+        url=authorization_url,
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
 @app.get("/{designator}/google/start")
 async def organization_google_start(
         request: Request,
@@ -6863,6 +7033,104 @@ async def organization_google_callback(
     next_path = organization_safe_login_next(
         organization.designator,
         str(flow.get("next", "")),
+    )
+    return RedirectResponse(
+        url=next_path or organization_landing_path(organization, user),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.get("/microsoft/callback")
+async def organization_microsoft_callback(
+        request: Request,
+        code: str = "",
+        state: str = "",
+        error: str = ""):
+    flow = request.session.pop("organization_microsoft_flow", None)
+    fallback_designator = (
+        str(flow.get("designator", "")).lower()
+        if isinstance(flow, dict)
+        else ""
+    )
+    fallback_url = f"/{fallback_designator}/login" if fallback_designator else "/"
+    if (
+        error
+        or not isinstance(flow, dict)
+        or not code
+        or not state
+        or not secrets.compare_digest(state, str(flow.get("state", "")))
+    ):
+        flash(
+            request,
+            "Microsoft sign-in was canceled or could not be verified.",
+            "warning",
+        )
+        return RedirectResponse(url=fallback_url, status_code=status.HTTP_303_SEE_OTHER)
+    try:
+        organization = await control_plane_store.get_organization(
+            str(flow.get("designator", ""))
+        )
+    except InvalidOrganizationError:
+        organization = None
+    if (
+        organization is None
+        or not secrets.compare_digest(
+            organization.id, str(flow.get("organization_id", ""))
+        )
+    ):
+        flash(request, "The organization changed. Sign in again.", "warning")
+        return RedirectResponse(url=fallback_url, status_code=status.HTTP_303_SEE_OTHER)
+    try:
+        identity = await asyncio.to_thread(
+            microsoft_oidc_client.exchange_code,
+            code=code,
+            redirect_uri=organization_microsoft_redirect_uri(),
+            verifier=str(flow.get("verifier", "")),
+            expected_nonce=str(flow.get("nonce", "")),
+        )
+        activation_nonce = (
+            str(flow.get("activation_nonce", ""))
+            if secrets.compare_digest(
+                identity.email, str(flow.get("activation_email", ""))
+            )
+            else None
+        )
+        user = await control_plane_store.authorize_microsoft_user(
+            organization.designator,
+            identity.email,
+            issuer=identity.issuer,
+            subject=identity.subject,
+            activation_nonce=activation_nonce,
+        )
+    except (PlatformAdminAuthError, InvalidOrganizationError) as exc:
+        logging.warning("Microsoft organization login failed: %s", exc)
+        user = None
+    if user is None:
+        logging.warning("Microsoft organization login rejected for unbound identity")
+        flash(
+            request,
+            (
+                "That Microsoft account is not linked to an active member of "
+                "this organization. Use the current invitation link to connect it."
+            ),
+            "warning",
+        )
+        return RedirectResponse(
+            url=f"/{organization.designator.lower()}/login",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    clear_organization_session(request)
+    request.session["organization_user_id"] = user.id
+    request.session["organization_designator"] = organization.designator
+    request.session["organization_external_identity"] = {
+        "provider": "microsoft",
+        "issuer": identity.issuer,
+        "subject": identity.subject,
+    }
+    if flow.get("activation_nonce"):
+        flash(request, "Organization account activated.", "success")
+    next_path = organization_safe_login_next(
+        organization.designator, str(flow.get("next", ""))
     )
     return RedirectResponse(
         url=next_path or organization_landing_path(organization, user),
@@ -8204,8 +8472,25 @@ async def organization_remote_control_video_selection(
             selected_fps=payload.fps,
             selected_bitrate_bps=payload.bitrate_bps,
         )
+        logger.info(
+            "Managed video remote decision accepted: request=%s user=%s "
+            "state=%s profile=%sx%s@%s bitrate=%s",
+            result.id,
+            user.id,
+            result.state,
+            payload.width,
+            payload.height,
+            payload.fps,
+            payload.bitrate_bps,
+        )
         return {"accepted": True, "state": result.state}
     except ControlPlaneError as exc:
+        logger.warning(
+            "Managed video remote decision rejected: request=%s user=%s error=%s",
+            request_id,
+            user.id,
+            exc,
+        )
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
@@ -8218,6 +8503,14 @@ async def organization_start_video_media(
         request, designator, ("video_requester",)
     )
     try:
+        logger.info(
+            "Managed video browser offer received: request=%s user=%s "
+            "relayCandidateMs=%s sdpBytes=%s",
+            request_id,
+            user.id,
+            payload.relay_candidate_ms,
+            len(payload.sdp.encode("utf-8")),
+        )
         exchange = await control_plane_store.start_video_media(
             request_id=request_id,
             organization_id=organization.id,
@@ -8226,8 +8519,22 @@ async def organization_start_video_media(
             relay_candidate_ms=payload.relay_candidate_ms,
         )
         delivered = await r2c_hub.send_video_media_offer(exchange)
+        logger.info(
+            "Managed video browser offer recorded: request=%s user=%s "
+            "state=%s delivered=%s",
+            request_id,
+            user.id,
+            exchange.state,
+            delivered,
+        )
         return {"accepted": True, "delivered": delivered, "state": exchange.state}
     except ControlPlaneError as exc:
+        logger.warning(
+            "Managed video browser offer rejected: request=%s user=%s error=%s",
+            request_id,
+            user.id,
+            exc,
+        )
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
@@ -8314,6 +8621,36 @@ async def organization_video_media_metrics(
             audio_bytes_sent=payload.audio_bytes_sent,
             audio_bytes_received=payload.audio_bytes_received,
             video_bytes_received=payload.video_bytes_received,
+        )
+        logger.info(
+            "Managed video browser diagnostics: request=%s session=%s event=%s "
+            "detail=%s peer=%s ice=%s gathering=%s signaling=%s track=%s "
+            "elementReady=%s paused=%s element=%sx%s packets=%s bytes=%s "
+            "framesReceived=%s framesDecoded=%s framesPresented=%s "
+            "framesDropped=%s keyFrames=%s "
+            "codec=%s decoder=%s",
+            request_id,
+            payload.metrics_session_id,
+            payload.diagnostic_event,
+            payload.diagnostic_detail,
+            payload.peer_connection_state,
+            payload.ice_connection_state,
+            payload.ice_gathering_state,
+            payload.signaling_state,
+            payload.video_track_state,
+            payload.video_element_ready_state,
+            payload.video_element_paused,
+            payload.video_element_width,
+            payload.video_element_height,
+            payload.video_packets_received,
+            payload.video_bytes_received,
+            payload.video_frames_received,
+            payload.video_frames_decoded,
+            payload.video_frames_presented,
+            payload.video_frames_dropped,
+            payload.video_key_frames_decoded,
+            payload.video_codec,
+            payload.decoder_implementation,
         )
         return {"accepted": True, "totalBytes": result.total_media_bytes}
     except ControlPlaneError as exc:

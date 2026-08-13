@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import os
+import re
 import secrets
 import smtplib
 import ssl
@@ -15,6 +16,11 @@ GOOGLE_AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 GMAIL_SEND_ENDPOINT = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
 GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
+MICROSOFT_LOGIN_HOST = "login.microsoftonline.com"
+MICROSOFT_TENANT_RE = re.compile(
+    r"^(?:organizations|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
+)
 
 
 class PlatformAdminAuthError(RuntimeError):
@@ -23,6 +29,14 @@ class PlatformAdminAuthError(RuntimeError):
 
 @dataclass(frozen=True)
 class GoogleIdentity:
+    subject: str
+    email: str
+    name: str
+
+
+@dataclass(frozen=True)
+class MicrosoftIdentity:
+    issuer: str
     subject: str
     email: str
     name: str
@@ -208,6 +222,182 @@ class GoogleOidcClient:
         if not subject or not email:
             raise PlatformAdminAuthError("Google identity was incomplete.")
         return GoogleIdentity(
+            subject=subject,
+            email=email,
+            name=str(claims.get("name", "")).strip(),
+        )
+
+
+class MicrosoftOidcClient:
+    """Microsoft Entra OIDC authorization-code client for organization login."""
+
+    def __init__(
+        self,
+        client_id: str = "",
+        client_secret: str = "",
+        tenant: str = "organizations",
+    ):
+        self.client_id = client_id.strip()
+        self.client_secret = client_secret.strip()
+        self.tenant = tenant.strip() or "organizations"
+        if not MICROSOFT_TENANT_RE.fullmatch(self.tenant):
+            raise PlatformAdminAuthError(
+                "Microsoft OIDC tenant must be 'organizations' or a tenant UUID."
+            )
+
+    @classmethod
+    def from_environment(cls):
+        return cls(
+            os.environ.get("MICROSOFT_OIDC_CLIENT_ID", ""),
+            os.environ.get("MICROSOFT_OIDC_CLIENT_SECRET", ""),
+            os.environ.get("MICROSOFT_OIDC_TENANT", "organizations"),
+        )
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.client_id and self.client_secret)
+
+    def _tenant_base(self, tenant: str | None = None) -> str:
+        return f"https://{MICROSOFT_LOGIN_HOST}/{tenant or self.tenant}"
+
+    def _issuer(self, tenant: str) -> str:
+        return self._tenant_base(tenant) + "/v2.0"
+
+    def authorization_request(self, redirect_uri: str) -> tuple[str, dict[str, str]]:
+        if not self.is_configured:
+            raise PlatformAdminAuthError("Microsoft sign-in is not configured.")
+        state = secrets.token_urlsafe(32)
+        nonce = secrets.token_urlsafe(32)
+        verifier = secrets.token_urlsafe(64)
+        challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(verifier.encode("ascii")).digest()
+        ).rstrip(b"=").decode("ascii")
+        url = self._tenant_base() + "/oauth2/v2.0/authorize?" + urlencode(
+            {
+                "client_id": self.client_id,
+                "redirect_uri": redirect_uri,
+                "response_type": "code",
+                "response_mode": "query",
+                "scope": "openid email profile",
+                "state": state,
+                "nonce": nonce,
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "prompt": "select_account",
+            }
+        )
+        return url, {"state": state, "nonce": nonce, "verifier": verifier}
+
+    def exchange_code(
+        self,
+        *,
+        code: str,
+        redirect_uri: str,
+        verifier: str,
+        expected_nonce: str,
+    ) -> MicrosoftIdentity:
+        if not self.is_configured:
+            raise PlatformAdminAuthError("Microsoft sign-in is not configured.")
+        try:
+            response = requests.post(
+                self._tenant_base() + "/oauth2/v2.0/token",
+                data={
+                    "code": code,
+                    "client_id": self.client_id,
+                    "client_secret": self.client_secret,
+                    "redirect_uri": redirect_uri,
+                    "grant_type": "authorization_code",
+                    "code_verifier": verifier,
+                    "scope": "openid email profile",
+                },
+                timeout=15,
+            )
+            response.raise_for_status()
+            id_token_value = str(response.json().get("id_token", ""))
+            if not id_token_value:
+                raise PlatformAdminAuthError(
+                    "Microsoft did not return an identity token."
+                )
+
+            from google.auth import jwt as google_jwt
+
+            unverified = google_jwt.decode(id_token_value, verify=False)
+            tenant_id = str(unverified.get("tid", "")).lower()
+            if not MICROSOFT_TENANT_RE.fullmatch(tenant_id) or tenant_id == "organizations":
+                raise PlatformAdminAuthError("Microsoft identity tenant was invalid.")
+            if self.tenant != "organizations" and not secrets.compare_digest(
+                tenant_id, self.tenant.lower()
+            ):
+                raise PlatformAdminAuthError("Microsoft identity tenant did not match.")
+
+            metadata_response = requests.get(
+                self._tenant_base(tenant_id)
+                + "/v2.0/.well-known/openid-configuration",
+                timeout=15,
+            )
+            metadata_response.raise_for_status()
+            metadata = metadata_response.json()
+            expected_issuer = self._issuer(tenant_id)
+            if not secrets.compare_digest(
+                str(metadata.get("issuer", "")).rstrip("/"), expected_issuer
+            ):
+                raise PlatformAdminAuthError("Microsoft OIDC issuer was invalid.")
+            expected_jwks_uri = (
+                self._tenant_base(tenant_id) + "/discovery/v2.0/keys"
+            )
+            jwks_uri = str(metadata.get("jwks_uri", ""))
+            if not secrets.compare_digest(jwks_uri, expected_jwks_uri):
+                raise PlatformAdminAuthError("Microsoft OIDC signing-key URI was invalid.")
+
+            keys_response = requests.get(jwks_uri, timeout=15)
+            keys_response.raise_for_status()
+            certificates = {}
+            for key in keys_response.json().get("keys", []):
+                key_id = str(key.get("kid", ""))
+                chain = key.get("x5c", [])
+                if key_id and isinstance(chain, list) and chain:
+                    certificate = str(chain[0])
+                    certificates[key_id] = (
+                        "-----BEGIN CERTIFICATE-----\n"
+                        + "\n".join(
+                            certificate[index:index + 64]
+                            for index in range(0, len(certificate), 64)
+                        )
+                        + "\n-----END CERTIFICATE-----\n"
+                    )
+            if not certificates:
+                raise PlatformAdminAuthError("Microsoft signing keys were unavailable.")
+            claims = google_jwt.decode(
+                id_token_value,
+                certs=certificates,
+                audience=self.client_id,
+                clock_skew_in_seconds=60,
+            )
+        except PlatformAdminAuthError:
+            raise
+        except Exception as exc:
+            raise PlatformAdminAuthError(
+                "Microsoft sign-in could not be verified."
+            ) from exc
+
+        if not secrets.compare_digest(
+            str(claims.get("iss", "")).rstrip("/"), expected_issuer
+        ):
+            raise PlatformAdminAuthError("Microsoft identity issuer did not match.")
+        if not secrets.compare_digest(str(claims.get("tid", "")).lower(), tenant_id):
+            raise PlatformAdminAuthError("Microsoft identity tenant did not match.")
+        if not secrets.compare_digest(str(claims.get("nonce", "")), expected_nonce):
+            raise PlatformAdminAuthError("Microsoft sign-in nonce did not match.")
+        if str(claims.get("ver", "")) != "2.0":
+            raise PlatformAdminAuthError("Microsoft identity token version was invalid.")
+        subject = str(claims.get("oid", "")).strip().lower()
+        email = str(
+            claims.get("email") or claims.get("preferred_username") or ""
+        ).strip().lower()
+        if not subject or not email or "@" not in email:
+            raise PlatformAdminAuthError("Microsoft identity was incomplete.")
+        return MicrosoftIdentity(
+            issuer=expected_issuer,
             subject=subject,
             email=email,
             name=str(claims.get("name", "")).strip(),
