@@ -1,4 +1,4 @@
-v1.4.34: pending review
+v1.4.34: deployed
 * Added Microsoft Entra OpenID Connect for invited organization members, with authorization-code PKCE, tenant-aware token verification, stable identity binding, and no automatic membership or role provisioning.
 * Added managed-video diagnostics across approval, browser offer delivery, WebRTC state, codec negotiation, packet receipt, frame decoding, and HTML video playback without changing the media path.
 
