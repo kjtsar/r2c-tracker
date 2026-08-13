@@ -1,4 +1,4 @@
-v1.4.33: pending review
+v1.4.33: deployed
 * Allow an unexpired pending member to activate through ordinary organization Google sign-in when Google verifies the exact invited email, matching the guidance already shown on the member administration page.
 * Make newly archived CalTopo track descriptions point to one stable recording-session link instead of a drone-name filter that could list several videos; legacy broad stream links remain supported.
 * Show each recording's incident-local start date and time.
