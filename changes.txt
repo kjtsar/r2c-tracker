@@ -1,4 +1,4 @@
-v1.4.35:
+v1.4.35: deployed
 * Show the tablet's actual managed-video stop or source-attachment reason after signaling ends instead of replacing it with a generic unavailable-status message.
 * Refresh stale viewer and Request in progress controls as soon as a managed-video request reaches a terminal state.
 
