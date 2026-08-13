@@ -734,6 +734,28 @@ class VideoStreamRequest(Base):
     video_bytes_received: Mapped[int] = mapped_column(BigInteger, default=0)
 
 
+class RecordingDownloadRequest(Base):
+    __tablename__ = "recording_download_requests"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), index=True)
+    active_stream_id: Mapped[str] = mapped_column(ForeignKey("active_video_streams.id"), index=True)
+    requester_user_id: Mapped[str] = mapped_column(ForeignKey("organization_users.id"), index=True)
+    requester_email: Mapped[str] = mapped_column(String(320), nullable=False)
+    device_credential_id: Mapped[str] = mapped_column(ForeignKey("device_credentials.id"), index=True)
+    remote_control_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    state: Mapped[str] = mapped_column(String(24), default="awaiting_approval", index=True)
+    status_message: Mapped[str] = mapped_column(String(400), default="")
+    filename: Mapped[str] = mapped_column(String(240), default="")
+    media_type: Mapped[str] = mapped_column(String(120), default="video/mp4")
+    byte_count: Mapped[int] = mapped_column(BigInteger, default=0)
+    sha256: Mapped[str] = mapped_column(String(64), default="")
+    storage_relpath: Mapped[str] = mapped_column(String(500), default="")
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
 class VideoPreflightExchange(Base):
     __tablename__ = "video_preflight_exchanges"
 
@@ -1064,6 +1086,28 @@ class VideoStreamRequestRecord:
     @property
     def total_media_bytes(self) -> int:
         return max(0, self.audio_bytes_sent) + max(0, self.audio_bytes_received) + max(0, self.video_bytes_received)
+
+
+@dataclass(frozen=True)
+class RecordingDownloadRequestRecord:
+    id: str
+    organization_id: str
+    device_credential_id: str
+    stream_session_id: str
+    drone_designator: str
+    requester_user_id: str
+    requester_email: str
+    remote_control_enabled: bool
+    state: str
+    status_message: str
+    filename: str
+    media_type: str
+    byte_count: int
+    sha256: str
+    storage_relpath: str
+    requested_at: datetime
+    expires_at: datetime
+    completed_at: Optional[datetime]
 
 
 @dataclass(frozen=True)
@@ -5075,6 +5119,156 @@ class ControlPlaneStore:
             await session.commit()
             return self._video_stream_request_record(request, stream)
 
+    async def create_recording_download_request(
+        self, *, organization_id: str, stream_session_id: str,
+        requester_user_id: str, now: Optional[datetime] = None,
+    ) -> RecordingDownloadRequestRecord:
+        requested_at = now or utc_now()
+        async with self.sessions() as session:
+            row = (await session.execute(
+                select(ActiveVideoStream, OrganizationUser)
+                .join(OrganizationUser, OrganizationUser.id == requester_user_id)
+                .where(
+                    ActiveVideoStream.organization_id == organization_id,
+                    ActiveVideoStream.session_id == stream_session_id,
+                    ActiveVideoStream.media_kind == "recording",
+                    ActiveVideoStream.state == "active",
+                    ActiveVideoStream.expires_at >= requested_at,
+                    OrganizationUser.organization_id == organization_id,
+                    OrganizationUser.state == "active",
+                ).with_for_update()
+            )).first()
+            if row is None or "video_requester" not in row[1].roles:
+                raise ControlPlaneError("Captured recording is unavailable or unauthorized.")
+            stream, requester = row
+            ready = await session.scalar(select(RecordingDownloadRequest).where(
+                RecordingDownloadRequest.active_stream_id == stream.id,
+                RecordingDownloadRequest.state == "ready",
+            ).order_by(RecordingDownloadRequest.completed_at.desc()))
+            if ready is not None:
+                return self._recording_download_request_record(ready, stream)
+            pending = await session.scalar(select(RecordingDownloadRequest).where(
+                RecordingDownloadRequest.active_stream_id == stream.id,
+                RecordingDownloadRequest.requester_user_id == requester.id,
+                RecordingDownloadRequest.state.in_(("awaiting_approval", "approved", "uploading")),
+                RecordingDownloadRequest.expires_at >= requested_at,
+            ))
+            if pending is not None:
+                return self._recording_download_request_record(pending, stream)
+            item = RecordingDownloadRequest(
+                id=new_id(), organization_id=organization_id,
+                active_stream_id=stream.id, requester_user_id=requester.id,
+                requester_email=requester.email,
+                device_credential_id=stream.device_credential_id,
+                remote_control_enabled=bool(stream.remote_control_enabled),
+                state=("approved" if stream.remote_control_enabled else "awaiting_approval"),
+                requested_at=requested_at,
+                expires_at=requested_at + timedelta(minutes=15),
+            )
+            session.add(item)
+            session.add(ControlPlaneAuditEvent(
+                organization_id=organization_id, actor_type="organization_user",
+                actor_id=requester.id, event_type="recording.download_requested",
+                details_json=json.dumps({"request_id": item.id}), created_at=requested_at,
+            ))
+            if self.engine.dialect.name == "postgresql":
+                await session.execute(select(func.pg_notify("r2c_recording_download", item.id)))
+            await self._notify_video_stream_change(session, organization_id)
+            await session.commit()
+            return self._recording_download_request_record(item, stream)
+
+    async def get_recording_download_request(
+        self, *, request_id: str, organization_id: Optional[str] = None,
+        requester_user_id: Optional[str] = None,
+        device_credential_id: Optional[str] = None,
+    ) -> RecordingDownloadRequestRecord:
+        statement = (select(RecordingDownloadRequest, ActiveVideoStream)
+            .join(ActiveVideoStream, ActiveVideoStream.id == RecordingDownloadRequest.active_stream_id)
+            .where(RecordingDownloadRequest.id == request_id))
+        if organization_id is not None:
+            statement = statement.where(RecordingDownloadRequest.organization_id == organization_id)
+        if requester_user_id is not None:
+            statement = statement.where(RecordingDownloadRequest.requester_user_id == requester_user_id)
+        if device_credential_id is not None:
+            statement = statement.where(RecordingDownloadRequest.device_credential_id == device_credential_id)
+        async with self.sessions() as session:
+            row = (await session.execute(statement)).first()
+        if row is None:
+            raise ControlPlaneError("Recording download request was not found.")
+        return self._recording_download_request_record(*row)
+
+    async def list_recording_download_requests(
+        self, *, organization_id: str, requester_user_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> tuple[RecordingDownloadRequestRecord, ...]:
+        statement = (select(RecordingDownloadRequest, ActiveVideoStream)
+            .join(ActiveVideoStream, ActiveVideoStream.id == RecordingDownloadRequest.active_stream_id)
+            .where(RecordingDownloadRequest.organization_id == organization_id))
+        if requester_user_id is not None:
+            statement = statement.where(
+                RecordingDownloadRequest.requester_user_id == requester_user_id
+            )
+        async with self.sessions() as session:
+            rows = (await session.execute(statement
+                .order_by(RecordingDownloadRequest.requested_at.desc())
+                .limit(max(1, min(limit, 200))))).all()
+        return tuple(self._recording_download_request_record(*row) for row in rows)
+
+    async def decide_recording_download_request(
+        self, *, request_id: str, device_credential_id: str, approved: bool,
+    ) -> RecordingDownloadRequestRecord:
+        async with self.sessions() as session:
+            row = (await session.execute(
+                select(RecordingDownloadRequest, ActiveVideoStream)
+                .join(ActiveVideoStream, ActiveVideoStream.id == RecordingDownloadRequest.active_stream_id)
+                .where(RecordingDownloadRequest.id == request_id).with_for_update()
+            )).first()
+            if row is None or row[0].device_credential_id != device_credential_id:
+                raise ControlPlaneError("Recording download request was not found.")
+            item, stream = row
+            if item.state not in {"awaiting_approval", "approved"}:
+                raise ControlPlaneError("Recording download request is no longer awaiting a decision.")
+            item.state = "approved" if approved else "declined"
+            item.status_message = "" if approved else "Tablet operator declined the transfer."
+            await self._notify_video_stream_change(session, item.organization_id)
+            await session.commit()
+            return self._recording_download_request_record(item, stream)
+
+    async def complete_recording_download_upload(
+        self, *, request_id: str, device_credential_id: str, filename: str,
+        media_type: str, byte_count: int, sha256: str, storage_relpath: str,
+    ) -> RecordingDownloadRequestRecord:
+        completed_at = utc_now()
+        async with self.sessions() as session:
+            row = (await session.execute(
+                select(RecordingDownloadRequest, ActiveVideoStream)
+                .join(ActiveVideoStream, ActiveVideoStream.id == RecordingDownloadRequest.active_stream_id)
+                .where(RecordingDownloadRequest.id == request_id).with_for_update()
+            )).first()
+            if row is None or row[0].device_credential_id != device_credential_id:
+                raise ControlPlaneError("Recording download request was not found.")
+            item, stream = row
+            if item.state not in {"approved", "uploading"}:
+                raise ControlPlaneError("Recording transfer is not authorized.")
+            item.state = "ready"
+            item.status_message = "Recording is ready to download."
+            item.filename = filename[:240]
+            item.media_type = media_type[:120]
+            item.byte_count = max(0, byte_count)
+            item.sha256 = sha256[:64]
+            item.storage_relpath = storage_relpath[:500]
+            item.completed_at = completed_at
+            item.expires_at = completed_at + timedelta(days=3650)
+            session.add(ControlPlaneAuditEvent(
+                organization_id=item.organization_id, actor_type="organization_device",
+                actor_id=device_credential_id, event_type="recording.download_ready",
+                details_json=json.dumps({"request_id": item.id, "bytes": item.byte_count}),
+                created_at=completed_at,
+            ))
+            await self._notify_video_stream_change(session, item.organization_id)
+            await session.commit()
+            return self._recording_download_request_record(item, stream)
+
     async def get_pending_video_stream_request(
         self,
         request_id: str,
@@ -6326,6 +6520,32 @@ class ControlPlaneStore:
             remote_control_enabled=bool(stream.remote_control_enabled),
             last_seen_at=as_utc(stream.last_seen_at),
             expires_at=as_utc(stream.expires_at),
+        )
+
+    @staticmethod
+    def _recording_download_request_record(
+        item: RecordingDownloadRequest,
+        stream: ActiveVideoStream,
+    ) -> RecordingDownloadRequestRecord:
+        return RecordingDownloadRequestRecord(
+            id=item.id,
+            organization_id=item.organization_id,
+            device_credential_id=item.device_credential_id,
+            stream_session_id=stream.session_id,
+            drone_designator=stream.drone_designator,
+            requester_user_id=item.requester_user_id,
+            requester_email=item.requester_email,
+            remote_control_enabled=bool(item.remote_control_enabled),
+            state=item.state,
+            status_message=item.status_message or "",
+            filename=item.filename or "",
+            media_type=item.media_type or "video/mp4",
+            byte_count=max(0, item.byte_count),
+            sha256=item.sha256 or "",
+            storage_relpath=item.storage_relpath or "",
+            requested_at=as_utc(item.requested_at),
+            expires_at=as_utc(item.expires_at),
+            completed_at=as_utc(item.completed_at),
         )
 
     @staticmethod

@@ -330,6 +330,7 @@
         <tbody>
         {% for stream in streams %}
           {% set active_consumer = active_consumers_by_device_id.get(stream.device_credential_id) %}
+          {% set recording_download = recording_downloads_by_session.get(stream.session_id) %}
           <tr data-stream-session-id="{{ stream.session_id }}">
             <td>
               {% if stream.thumbnail_revision %}
@@ -367,6 +368,26 @@
               {% endif %}
               {% else %}
               <span class="secondary">Preview pending</span>
+              {% endif %}
+              {% if stream.media_kind == "recording" %}
+                {% if recording_download and recording_download.state == "ready" %}
+                <a class="request-button"
+                   style="margin-top:8px;background:#246b2e;border-color:#246b2e"
+                   href="/{{ organization.designator|lower }}/streams/downloads/{{ recording_download.id }}">
+                  Download recording
+                </a>
+                {% elif recording_download and recording_download.state in ("awaiting_approval", "approved", "uploading") %}
+                <button class="request-button" type="button" disabled style="margin-top:8px">
+                  {% if recording_download.state == "awaiting_approval" %}Awaiting transfer approval{% else %}Preparing download{% endif %}
+                </button>
+                {% else %}
+                <form method="post"
+                      action="/{{ organization.designator|lower }}/streams/{{ stream.session_id }}/download-request"
+                      style="margin-top:8px">
+                  <input type="hidden" name="form_token" value="{{ csrf_token }}">
+                  <button class="request-button" type="submit">Download recording</button>
+                </form>
+                {% endif %}
               {% endif %}
             </td>
             <td>
@@ -573,7 +594,14 @@
      data-membership-revision="{{ stream_membership_revision }}"
      data-in-progress-session-ids="{{ request_in_progress_session_ids | list | sort | tojson | forceescape }}"
      data-status-url="/{{ organization.designator|lower }}/streams/live-status"></div>
-<script src="/static/organization_streams_live.js?v=20260813-1" defer></script>
+<script src="/static/organization_streams_live.js?v=20260813-2" defer></script>
+{% for recording_download in recording_downloads_by_session.values() %}
+{% if recording_download.state in ("awaiting_approval", "approved", "uploading") %}
+<div class="recording-download-status" hidden
+     data-status-url="/{{ organization.designator|lower }}/streams/downloads/{{ recording_download.id }}/status"></div>
+{% endif %}
+{% endfor %}
+<script src="/static/recording_download_status.js?v=20260813-1" defer></script>
 {% if active_preflight_request_id %}
 <script src="/static/video_preflight.js?v=20260812-1" defer></script>
 {% endif %}
@@ -584,6 +612,6 @@
      data-designator="{{ organization.designator|lower }}"
      data-form-token="{{ csrf_token }}"
      data-ice-servers='{{ video_ice_servers|tojson }}'></div>
-<script src="/static/video_media.js?v=20260813-2" defer></script>
+<script src="/static/video_media.js?v=20260813-3" defer></script>
 {% endif %}
 {% endblock %}

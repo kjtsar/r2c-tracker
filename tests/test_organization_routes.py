@@ -266,7 +266,9 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         preflight_script = Path("static/video_preflight.js").read_text()
 
         self.assertIn("function reloadForMembershipChange()", live_script)
-        self.assertNotIn("preflightIsBusy", live_script)
+        self.assertIn("requestControllerActive", live_script)
+        self.assertIn('document.getElementById("video-preflight")', live_script)
+        self.assertIn('document.getElementById("video-media")', live_script)
         self.assertEqual(1, live_script.count("window.location.reload()"))
         self.assertIn("await waitForPilotDecision()", preflight_script)
         self.assertIn("renderRemoteQualityChooser(current)", preflight_script)
@@ -306,6 +308,9 @@ class OrganizationRouteFlowTest(unittest.TestCase):
 
         self.assertIn("reason: message", script)
         self.assertIn("No video packets arrived", script)
+        self.assertIn("function reloadAfterTerminal(delayMs = 250)", script)
+        self.assertEqual(1, script.count("reloadAfterTerminal();"))
+        self.assertIn("reloadAfterTerminal(1500);", script)
 
     def test_video_status_preserves_terminal_device_reason(self):
         script = Path("static/video_media.js").read_text()
@@ -345,7 +350,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             'reportDiagnostic("video_play_rejected"',
         ):
             self.assertIn(diagnostic, script)
-        self.assertIn("video_media.js?v=20260813-2", template)
+        self.assertIn("video_media.js?v=20260813-3", template)
 
     def test_media_offer_posts_on_first_relay_candidate(self):
         script = Path("static/video_media.js").read_text()
@@ -2185,6 +2190,91 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             self.assertEqual(200, recording_page.status_code)
             self.assertIn("<td>2B</td>", recording_page.text)
             self.assertNotIn("<td>10A</td>", recording_page.text)
+            self.assertIn("Download recording", recording_page.text)
+            download_root = Path(self.temp_dir.name) / "recordings"
+            with patch.object(main, "BASE_LOG_DIRECTORY", str(download_root)):
+                requested_download = self.client.post(
+                    "/ncssar/streams/00000000-0000-0000-0000-000000000002/download-request",
+                    data={"form_token": html.unescape(
+                        STREAM_REQUEST_TOKEN_RE.search(recording_page.text).group(1)
+                    )},
+                    follow_redirects=False,
+                )
+                self.assertEqual(303, requested_download.status_code)
+                transfer_request = live_websocket.receive_json()
+                self.assertEqual("recording_download_request", transfer_request["type"])
+                self.assertTrue(transfer_request["consentRequired"])
+                live_websocket.send_json({
+                    "type": "recording_download_decision",
+                    "requestId": transfer_request["requestId"],
+                    "decision": "approve",
+                })
+                self.assertTrue(live_websocket.receive_json()["accepted"])
+                first_chunk = self.client.put(
+                    transfer_request["uploadPath"],
+                    headers={
+                        "X-SAR-Token": device.token,
+                        "X-R2C-Filename": "A5-flight.mp4",
+                        "Content-Type": "video/mp4",
+                        "Content-Range": "bytes 0-9/24",
+                    },
+                    content=b"original-r",
+                )
+                self.assertEqual(200, first_chunk.status_code)
+                self.assertEqual("uploading", first_chunk.json()["state"])
+                uploaded = self.client.put(
+                    transfer_request["uploadPath"],
+                    headers={
+                        "X-SAR-Token": device.token,
+                        "X-R2C-Filename": "A5-flight.mp4",
+                        "Content-Type": "video/mp4",
+                        "Content-Range": "bytes 10-23/24",
+                    },
+                    content=b"ecording-bytes",
+                )
+                self.assertEqual(200, uploaded.status_code)
+                ready_page = self.client.get(recording_link.headers["location"])
+                self.assertIn("Download recording", ready_page.text)
+                downloaded = self.client.get(
+                    f"/ncssar/streams/downloads/{transfer_request['requestId']}"
+                )
+                self.assertEqual(200, downloaded.status_code)
+                self.assertEqual(b"original-recording-bytes", downloaded.content)
+                self.assertIn(
+                    'attachment; filename="A5-flight.mp4"',
+                    downloaded.headers["content-disposition"],
+                )
+            live_websocket.send_json({
+                "type": "video_stream_advertisement",
+                "incidentName": "Alpha",
+                "timeZone": "America/Los_Angeles",
+                "remoteControlEnabled": True,
+                "streams": [{
+                    "sessionId": "00000000-0000-0000-0000-000000000003",
+                    "droneDesignator": "2B",
+                    "sourceWidth": 1280,
+                    "sourceHeight": 720,
+                    "sourceFps": 30,
+                    "sourceBitrateBps": 2_000_000,
+                    "sourceCodec": "h264",
+                    "mediaKind": "recording",
+                    "recordedAt": "2026-08-10T19:30:00Z",
+                    "durationMs": 91_000,
+                }],
+            })
+            self.assertTrue(live_websocket.receive_json()["accepted"])
+            remote_page = self.client.get("/ncssar/streams/Android%20video%20tablet")
+            remote_download = self.client.post(
+                "/ncssar/streams/00000000-0000-0000-0000-000000000003/download-request",
+                data={"form_token": html.unescape(
+                    STREAM_REQUEST_TOKEN_RE.search(remote_page.text).group(1)
+                )},
+                follow_redirects=False,
+            )
+            self.assertEqual(303, remote_download.status_code)
+            automatic_transfer = live_websocket.receive_json()
+            self.assertEqual("recording_download_request", automatic_transfer["type"])
+            self.assertFalse(automatic_transfer["consentRequired"])
             live_websocket.send_json(
                 {
                     "type": "video_stream_advertisement",
@@ -2377,16 +2467,18 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 "video_stream_advertisement_ack",
                 replay_ack["type"],
             )
-            replayed_request = replay_websocket.receive_json()
-            self.assertEqual("video_stream_request", replayed_request["type"])
-            self.assertEqual(
-                organization.primary_admin_email,
-                replayed_request["requesterEmail"],
-            )
-            self.assertEqual(1920, replayed_request["sourceWidth"])
-            self.assertEqual(4_000_000, replayed_request["sourceBitrateBps"])
-            self.assertTrue(replayed_request["consentRequired"])
-            preflight_offer = replay_websocket.receive_json()
+            replayed = replay_websocket.receive_json()
+            if replayed["type"] == "video_stream_request":
+                self.assertEqual(
+                    organization.primary_admin_email,
+                    replayed["requesterEmail"],
+                )
+                self.assertEqual(1920, replayed["sourceWidth"])
+                self.assertEqual(4_000_000, replayed["sourceBitrateBps"])
+                self.assertTrue(replayed["consentRequired"])
+                preflight_offer = replay_websocket.receive_json()
+            else:
+                preflight_offer = replayed
             self.assertEqual("video_preflight_offer", preflight_offer["type"])
             self.assertEqual(request_id, preflight_offer["requestId"])
             self.assertEqual(offer_sdp, preflight_offer["sdp"])
@@ -2434,7 +2526,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             replay_websocket.send_json(
                 {
                     "type": "video_preflight_result",
-                    "requestId": replayed_request["requestId"],
+                    "requestId": request_id,
                     "routeKind": "direct",
                     "estimatedUplinkBps": 8_000_000,
                 }

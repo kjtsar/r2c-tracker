@@ -1,3 +1,9 @@
+v1.4.36: pending review
+* Let authorized organization video users download a tablet recording as an ordinary browser file, with tablet approval when Remote Video Control is off and automatic transfer when it is on.
+* Transfer recordings from Android and iOS in resumable chunks, retain completed tracker copies for later authorized downloads, and leave the tablet's original recording untouched.
+* Keep active WebRTC requests intact while tablet stream membership changes, and promptly clear completed, failed, or pilot-terminated requests from the current-session page.
+* Publish completed tablet recordings from the recorder's file-closed event so newly captured video appears without relying on a timing delay or manual refresh.
+
 v1.4.35: deployed
 * Show the tablet's actual managed-video stop or source-attachment reason after signaling ends instead of replacing it with a generic unavailable-status message.
 * Refresh stale viewer and Request in progress controls as soon as a managed-video request reaches a terminal state.

@@ -52,6 +52,7 @@
   let videoKeyFramesDecoded = 0;
   let videoCodec = "";
   let decoderImplementation = "";
+  let terminalReloadTimer = null;
   const metricsSessionId = window.crypto && typeof window.crypto.randomUUID === "function"
     ? window.crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -113,6 +114,14 @@
   function show(message, kind) {
     status.textContent = message;
     state.dataset.state = kind;
+  }
+
+  function reloadAfterTerminal(delayMs = 250) {
+    if (pageLeaving || terminalReloadTimer) return;
+    terminalReloadTimer = window.setTimeout(function () {
+      pageLeaving = true;
+      window.location.reload();
+    }, delayMs);
   }
 
   function waitForRelayCandidate(timeoutMs) {
@@ -221,7 +230,8 @@
       credentials: "same-origin",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify({ form_token: formToken, reason: message }),
-    });
+    }).catch(function () {});
+    reloadAfterTerminal(1500);
   }
 
   async function endFromServer(message) {
@@ -244,6 +254,7 @@
     video.style.display = "none";
     show(message, "ended");
     peer.close();
+    reloadAfterTerminal();
   }
 
   function terminalStatusMessage(current) {
@@ -499,6 +510,7 @@
 
   window.addEventListener("pagehide", function () {
     pageLeaving = true;
+    window.clearTimeout(terminalReloadTimer);
     window.clearInterval(statsTimer);
     window.clearInterval(serverStateTimer);
     reportMetrics(true, true).catch(function () {});

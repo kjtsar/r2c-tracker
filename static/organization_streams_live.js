@@ -7,6 +7,14 @@
   const designator = state.dataset.designator || "";
   const deviceId = state.dataset.deviceId || "";
   const streamFilter = state.dataset.streamFilter || "";
+  // Preflight and media controllers own their request lifecycle. Reloading an
+  // active controller because the tablet's advertised stream set changes can
+  // destroy an otherwise healthy WebRTC session (for example, during a brief
+  // decoder/UI transition on the tablet).
+  const requestControllerActive = Boolean(
+    document.getElementById("video-preflight") ||
+    document.getElementById("video-media")
+  );
   const renderedMembershipRevision = state.dataset.membershipRevision || "";
   let renderedInProgressSessionIds = [];
   try {
@@ -92,14 +100,16 @@
     });
     if (!response.ok) throw new Error(`Stream status ${response.status}`);
     const status = await response.json();
-    if (status.membershipRevision !== renderedMembershipRevision) {
+    if (!requestControllerActive &&
+        status.membershipRevision !== renderedMembershipRevision) {
       reloadForMembershipChange();
       return;
     }
     const currentInProgressSessionIds = (status.inProgressSessionIds || [])
       .map(String)
       .sort();
-    if (JSON.stringify(currentInProgressSessionIds) !==
+    if (!requestControllerActive &&
+        JSON.stringify(currentInProgressSessionIds) !==
         JSON.stringify(renderedInProgressSessionIds)) {
       reloadForMembershipChange();
       return;

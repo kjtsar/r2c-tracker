@@ -16,6 +16,7 @@ import traceback
 import logging
 import secrets
 import hashlib
+import anyio
 from dataclasses import replace
 from decimal import Decimal
 import numpy as np
@@ -1447,6 +1448,10 @@ class R2CCoordinationHub:
                     asyncio.create_task(
                         self._deliver_notified_video_media_offer(payload)
                     )
+                elif channel == "r2c_recording_download":
+                    asyncio.create_task(
+                        self._deliver_notified_recording_download(payload)
+                    )
                 else:
                     asyncio.create_task(
                         self._deliver_notified_video_stream_request(payload)
@@ -1472,6 +1477,10 @@ class R2CCoordinationHub:
                 )
                 await connection.add_listener(
                     "r2c_video_thumbnail_preview",
+                    receive_notification,
+                )
+                await connection.add_listener(
+                    "r2c_recording_download",
                     receive_notification,
                 )
                 retry_seconds = 1
@@ -1543,6 +1552,17 @@ class R2CCoordinationHub:
             remote_control_enabled=stream_request.remote_control_enabled,
             expires_at=stream_request.expires_at,
         )
+
+    async def _deliver_notified_recording_download(self, request_id: str):
+        if control_plane_store is None:
+            return
+        try:
+            item = await control_plane_store.get_recording_download_request(
+                request_id=request_id.strip()
+            )
+        except ControlPlaneError:
+            return
+        await self.send_recording_download_request(item)
 
     async def _deliver_notified_video_preflight_offer(
         self,
@@ -2030,6 +2050,31 @@ class R2CCoordinationHub:
             await self._handle_video_media_answer(websocket, payload)
         elif mtype == "video_stream_terminated":
             await self._handle_video_stream_terminated(websocket, payload)
+        elif mtype == "recording_download_decision":
+            await self._handle_recording_download_decision(websocket, payload)
+
+    async def _handle_recording_download_decision(self, websocket: WebSocket, payload: dict):
+        async with self._lock:
+            connection = self._connections.get(websocket)
+            credential = connection.device_credential if connection is not None else None
+        request_id = str(payload.get("requestId", "") or "").strip()
+        try:
+            if credential is None or control_plane_store is None:
+                raise ControlPlaneError("Organization device credential required.")
+            result = await control_plane_store.decide_recording_download_request(
+                request_id=request_id,
+                device_credential_id=credential.id,
+                approved=str(payload.get("decision", "")).lower() == "approve",
+            )
+            await websocket.send_text(json.dumps({
+                "type": "recording_download_decision_ack", "requestId": result.id,
+                "accepted": True, "state": result.state,
+            }))
+        except ControlPlaneError as exc:
+            await websocket.send_text(json.dumps({
+                "type": "recording_download_decision_ack", "requestId": request_id,
+                "accepted": False, "error": str(exc),
+            }))
 
     async def _handle_video_stream_advertisement(
         self,
@@ -2608,6 +2653,29 @@ class R2CCoordinationHub:
             connection = connections[0] if connections else None
             websocket = connection.websocket if connection is not None else None
         if websocket is None:
+            return False
+
+    async def send_recording_download_request(self, item) -> bool:
+        async with self._lock:
+            connections = self._device_connections_locked(item.device_credential_id)
+            websocket = connections[0].websocket if connections else None
+        if websocket is None:
+            return False
+        try:
+            await websocket.send_text(json.dumps({
+                "type": "recording_download_request",
+                "requestId": item.id,
+                "requesterEmail": item.requester_email,
+                "streamSessionId": item.stream_session_id,
+                "droneDesignator": item.drone_designator,
+                "uploadPath": f"/recording-downloads/{item.id}/content",
+                "expiresAt": item.expires_at.isoformat(),
+                "consentRequired": not item.remote_control_enabled,
+                "remoteControlEnabled": item.remote_control_enabled,
+            }))
+            return True
+        except Exception:
+            logger.warning("Recording download request delivery failed", exc_info=True)
             return False
         try:
             await websocket.send_text(
@@ -7994,6 +8062,7 @@ async def organization_streams(
         organization_requests,
         video_ice_servers,
         connected_tablets,
+        recording_download_requests,
     ) = await asyncio.gather(
             control_plane_store.list_active_video_streams(organization.id),
             control_plane_store.list_video_stream_requests(
@@ -8005,6 +8074,9 @@ async def organization_streams(
             ),
             video_ice_server_provider.get_ice_servers(),
             r2c_hub.list_connected_tablets(organization.id),
+            control_plane_store.list_recording_download_requests(
+                organization_id=organization.id,
+            ),
         )
     if tablet_device is not None:
         streams = tuple(
@@ -8134,6 +8206,10 @@ async def organization_streams(
             ),
             "active_consumers_by_device_id": active_consumers_by_device_id,
             "remote_control_enabled": remote_control_enabled,
+            "recording_downloads_by_session": {
+                item.stream_session_id: item
+                for item in recording_download_requests
+            },
             "video_ice_servers": video_ice_servers,
             "stream_status_active": stream_status["active"],
             "stream_membership_revision": stream_status[
@@ -8277,42 +8353,187 @@ async def organization_request_stream(
             "designator": organization.designator,
             "request_id": stream_request.id,
         }
-        flash(
-            request,
-            (
-                "Stream request sent to the drone team. "
-                if delivered
-                else "Stream request recorded; device delivery is pending. "
-            )
-            + (
-                "You will choose the measured video quality."
-                if stream_request.remote_control_enabled
-                else "Video will remain off until the pilot or visual observer approves it."
-            ),
-            "success",
-        )
+        flash(request, (
+            "Stream request sent to the drone team. " if delivered
+            else "Stream request recorded; device delivery is pending. "
+        ) + (
+            "You will choose the measured video quality."
+            if stream_request.remote_control_enabled
+            else "Video will remain off until the pilot or visual observer approves it."
+        ), "success")
     except ControlPlaneError as exc:
         flash(request, str(exc), "warning")
     return RedirectResponse(
-        url=(
-            (
-                f"/{organization.designator.lower()}/streams/"
-                f"{quote(stream_request.device_name, safe='')}"
-                + (
-                    f"/{quote(stream.strip(), safe='')}"
-                    if stream.strip()
-                    else ""
-                )
-                if preflight_request_id
-                else f"/{organization.designator.lower()}/streams"
-            )
-            + (
-                f"?{urlencode({'preflight': preflight_request_id})}"
-                if preflight_request_id
-                else ""
-            )
-        ),
+        url=((
+            f"/{organization.designator.lower()}/streams/"
+            f"{quote(stream_request.device_name, safe='')}"
+            + (f"/{quote(stream.strip(), safe='')}" if stream.strip() else "")
+            if preflight_request_id else f"/{organization.designator.lower()}/streams"
+        ) + (f"?{urlencode({'preflight': preflight_request_id})}" if preflight_request_id else "")),
         status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post("/{designator}/streams/{session_id}/download-request")
+async def organization_request_recording_download(
+        request: Request, designator: str, session_id: str,
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_streams", form_token)
+    organization, user = await require_organization_user(
+        request, designator, ("video_requester",)
+    )
+    try:
+        item = await control_plane_store.create_recording_download_request(
+            organization_id=organization.id,
+            stream_session_id=session_id,
+            requester_user_id=user.id,
+        )
+        delivered = (
+            True if item.state == "ready"
+            else await r2c_hub.send_recording_download_request(item)
+        )
+        flash(request, (
+            "Recording is already available to download."
+            if item.state == "ready"
+            else "Recording transfer authorized and sent to the tablet."
+            if item.remote_control_enabled
+            else "Recording transfer requested; the tablet operator must approve it."
+        ) if delivered else "Recording transfer queued for the tablet.", "success")
+    except ControlPlaneError as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(
+        url=f"/{organization.designator.lower()}/streams",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.put("/recording-downloads/{request_id}/content")
+async def upload_recording_download(
+        request: Request, request_id: str,
+        credential: Optional[DeviceCredentialRecord] = Depends(get_api_key)):
+    if credential is None:
+        raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="Device credential required")
+    try:
+        item = await control_plane_store.get_recording_download_request(
+            request_id=request_id, device_credential_id=credential.id,
+        )
+    except ControlPlaneError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if item.state == "awaiting_approval":
+        item = await control_plane_store.decide_recording_download_request(
+            request_id=request_id, device_credential_id=credential.id, approved=True,
+        )
+    if item.state not in {"approved", "uploading"}:
+        raise HTTPException(status_code=409, detail="Recording transfer is not authorized.")
+    raw_filename = request.headers.get("X-R2C-Filename", "recording.mp4")
+    filename = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(raw_filename))[:240]
+    if not filename:
+        filename = "recording.mp4"
+    media_type = (request.headers.get("Content-Type", "video/mp4") or "video/mp4")[:120]
+    relative_dir = os.path.join(
+        "organizations", credential.designator.lower(), "recordings", item.stream_session_id,
+    )
+    destination_dir = os.path.join(BASE_LOG_DIRECTORY, relative_dir)
+    os.makedirs(destination_dir, exist_ok=True)
+    destination = os.path.join(destination_dir, filename)
+    max_bytes = 16 * 1024 * 1024 * 1024
+    content_range = request.headers.get("Content-Range", "").strip()
+    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range)
+    if content_range and match is None:
+        raise HTTPException(status_code=400, detail="Invalid Content-Range header.")
+    range_start, range_end, total_bytes = (
+        tuple(map(int, match.groups())) if match else (0, -1, -1)
+    )
+    if match and (
+        range_end < range_start or total_bytes <= range_end or total_bytes > max_bytes
+        or range_end - range_start + 1 > 16 * 1024 * 1024
+    ):
+        raise HTTPException(status_code=400, detail="Invalid recording chunk range.")
+    partial_path = os.path.join(destination_dir, f".{request_id}.part")
+    if range_start > 0 and not os.path.isfile(partial_path):
+        raise HTTPException(status_code=409, detail="Recording upload must restart at byte zero.")
+    mode = "wb" if range_start == 0 else "r+b"
+    received = 0
+    async with await anyio.open_file(partial_path, mode) as output:
+        if range_start:
+            await output.seek(range_start)
+        async for chunk in request.stream():
+            if not chunk:
+                continue
+            received += len(chunk)
+            if (match and received > range_end - range_start + 1) or (
+                not match and received > max_bytes
+            ):
+                raise HTTPException(status_code=413, detail="Recording chunk is too large.")
+            await output.write(chunk)
+    if received == 0:
+        raise HTTPException(status_code=400, detail="Recording upload was empty.")
+    if match and received != range_end - range_start + 1:
+        raise HTTPException(status_code=400, detail="Recording chunk length did not match Content-Range.")
+    if match and range_end + 1 < total_bytes:
+        await meter_organization_usage(credential, network_bytes=received)
+        return {"accepted": True, "state": "uploading", "bytes": range_end + 1}
+    byte_count = total_bytes if match else received
+    os.replace(partial_path, destination)
+    digest = hashlib.sha256()
+    async with await anyio.open_file(destination, "rb") as completed_file:
+        while chunk := await completed_file.read(1024 * 1024):
+            digest.update(chunk)
+    storage_relpath = os.path.join(relative_dir, filename)
+    try:
+        completed = await control_plane_store.complete_recording_download_upload(
+            request_id=request_id, device_credential_id=credential.id,
+            filename=filename, media_type=media_type, byte_count=byte_count,
+            sha256=digest.hexdigest(), storage_relpath=storage_relpath,
+        )
+    except ControlPlaneError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    await meter_organization_usage(credential, network_bytes=received)
+    return {"accepted": True, "state": completed.state, "bytes": completed.byte_count}
+
+
+@app.get("/{designator}/streams/downloads/{request_id}", response_class=FileResponse)
+async def organization_recording_download(
+        request: Request, designator: str, request_id: str):
+    organization, user = await require_organization_user(
+        request, designator, ("video_requester",)
+    )
+    try:
+        item = await control_plane_store.get_recording_download_request(
+            request_id=request_id, organization_id=organization.id,
+        )
+    except ControlPlaneError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if item.state != "ready" or not item.storage_relpath:
+        raise HTTPException(status_code=409, detail="Recording is not ready to download.")
+    normalized = os.path.normpath(item.storage_relpath)
+    scope = os.path.join("organizations", organization.designator.lower(), "recordings") + os.sep
+    if os.path.isabs(normalized) or not normalized.startswith(scope):
+        raise HTTPException(status_code=404, detail="Recording file not found.")
+    path = os.path.join(BASE_LOG_DIRECTORY, normalized)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Recording file not found.")
+    return FileResponse(
+        path, media_type=item.media_type, filename=item.filename,
+        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+@app.get("/{designator}/streams/downloads/{request_id}/status")
+async def organization_recording_download_status(
+        request: Request, designator: str, request_id: str):
+    organization, user = await require_organization_user(
+        request, designator, ("video_requester",)
+    )
+    try:
+        item = await control_plane_store.get_recording_download_request(
+            request_id=request_id, organization_id=organization.id,
+        )
+    except ControlPlaneError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return JSONResponse(
+        {"requestId": item.id, "state": item.state, "statusMessage": item.status_message},
+        headers={"Cache-Control": "private, no-store"},
     )
 
 
