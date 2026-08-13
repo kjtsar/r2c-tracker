@@ -1109,6 +1109,23 @@ class ControlPlaneStoreTest(unittest.TestCase):
         self.assertEqual("stopped", stopped.state)
         self.assertEqual(4, stopped.duration_seconds)
         self.assertEqual(6_007_500, stopped.total_media_bytes)
+        durable_status = asyncio.run(
+            self.store.get_video_stream_request_for_requester(
+                request_id=request.id,
+                organization_id=organization.id,
+                requester_user_id=owner.id,
+            )
+        )
+        self.assertEqual("stopped", durable_status.state)
+        self.assertEqual("source_ended", durable_status.status_message)
+        with self.assertRaises(ControlPlaneError):
+            asyncio.run(
+                self.store.get_video_media_exchange_for_requester(
+                    request_id=request.id,
+                    organization_id=organization.id,
+                    requester_user_id=owner.id,
+                )
+            )
         with self.assertRaises(ControlPlaneError):
             asyncio.run(
                 self.store.record_video_preflight_result(

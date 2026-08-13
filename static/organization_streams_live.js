@@ -8,6 +8,14 @@
   const deviceId = state.dataset.deviceId || "";
   const streamFilter = state.dataset.streamFilter || "";
   const renderedMembershipRevision = state.dataset.membershipRevision || "";
+  let renderedInProgressSessionIds = [];
+  try {
+    renderedInProgressSessionIds = JSON.parse(
+      state.dataset.inProgressSessionIds || "[]"
+    ).map(String).sort();
+  } catch (_error) {
+    renderedInProgressSessionIds = [];
+  }
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const query = new URLSearchParams();
   if (deviceId) query.set("device", deviceId);
@@ -85,6 +93,14 @@
     if (!response.ok) throw new Error(`Stream status ${response.status}`);
     const status = await response.json();
     if (status.membershipRevision !== renderedMembershipRevision) {
+      reloadForMembershipChange();
+      return;
+    }
+    const currentInProgressSessionIds = (status.inProgressSessionIds || [])
+      .map(String)
+      .sort();
+    if (JSON.stringify(currentInProgressSessionIds) !==
+        JSON.stringify(renderedInProgressSessionIds)) {
       reloadForMembershipChange();
       return;
     }

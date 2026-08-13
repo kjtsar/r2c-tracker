@@ -5144,6 +5144,26 @@ class ControlPlaneStore:
             for request, stream in rows
         )
 
+    async def get_video_stream_request_for_requester(
+        self, *, request_id: str, organization_id: str, requester_user_id: str
+    ) -> VideoStreamRequestRecord:
+        async with self.sessions() as session:
+            row = (await session.execute(
+                select(VideoStreamRequest, ActiveVideoStream)
+                .join(
+                    ActiveVideoStream,
+                    ActiveVideoStream.id == VideoStreamRequest.active_stream_id,
+                )
+                .where(
+                    VideoStreamRequest.id == request_id,
+                    VideoStreamRequest.organization_id == organization_id,
+                    VideoStreamRequest.requester_user_id == requester_user_id,
+                )
+            )).first()
+        if row is None:
+            raise ControlPlaneError("Video stream request was not found.")
+        return self._video_stream_request_record(*row)
+
     async def list_pending_video_stream_requests_for_device(
         self,
         *,
@@ -6203,7 +6223,11 @@ class ControlPlaneStore:
                 clean_reason = str(reason or "device_terminated").strip()[:400]
                 redirected = clean_reason.startswith("Stream redirected to ")
                 request.state = "redirected" if redirected else "stopped"
-                request.status_message = clean_reason if redirected else ""
+                # Preserve the device's bounded terminal reason after the SDP
+                # exchange is deleted so the requesting browser can explain
+                # an attach/source failure instead of showing a generic status
+                # error.
+                request.status_message = clean_reason
                 request.stopped_at = stopped_at
                 if not redirected:
                     exchange = await session.get(VideoMediaExchange, request.id)

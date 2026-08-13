@@ -421,8 +421,13 @@
         headers: { Accept: "application/json" },
         cache: "no-store",
       });
-      if (!response.ok) throw new Error("Media signaling status is unavailable.");
-      const current = await response.json();
+      const current = await response.json().catch(function () { return null; });
+      if (!response.ok || !current) {
+        const detail = current && typeof current.detail === "string"
+          ? current.detail
+          : "Media signaling status is unavailable.";
+        throw new Error(detail);
+      }
       const terminalMessage = terminalStatusMessage(current);
       if (terminalMessage) {
         await endFromServer(terminalMessage);

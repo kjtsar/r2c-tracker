@@ -274,6 +274,14 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn('["approved", "streaming"]', preflight_script)
         self.assertEqual(2, preflight_script.count("window.location.reload()"))
 
+    def test_stream_refresh_reloads_when_request_in_progress_state_clears(self):
+        live_script = Path("static/organization_streams_live.js").read_text()
+        template = Path("templates/organization_streams.html").read_text()
+
+        self.assertIn("data-in-progress-session-ids", template)
+        self.assertIn("status.inProgressSessionIds", live_script)
+        self.assertIn("renderedInProgressSessionIds", live_script)
+
     def test_video_start_marker_retries_until_the_server_acknowledges_it(self):
         script = Path("static/video_media.js").read_text()
 
@@ -298,6 +306,16 @@ class OrganizationRouteFlowTest(unittest.TestCase):
 
         self.assertIn("reason: message", script)
         self.assertIn("No video packets arrived", script)
+
+    def test_video_status_preserves_terminal_device_reason(self):
+        script = Path("static/video_media.js").read_text()
+
+        parse_index = script.index(
+            "const current = await response.json().catch"
+        )
+        status_index = script.index("if (!response.ok || !current)")
+        self.assertLess(parse_index, status_index)
+        self.assertIn("current.detail", script)
 
     def test_video_decoder_stall_keeps_live_packet_flow_connected(self):
         script = Path("static/video_media.js").read_text()
@@ -327,7 +345,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             'reportDiagnostic("video_play_rejected"',
         ):
             self.assertIn(diagnostic, script)
-        self.assertIn("video_media.js?v=20260813-1", template)
+        self.assertIn("video_media.js?v=20260813-2", template)
 
     def test_media_offer_posts_on_first_relay_candidate(self):
         script = Path("static/video_media.js").read_text()

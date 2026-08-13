@@ -8545,17 +8545,31 @@ async def organization_video_media_status(
         request, designator, ("video_requester",)
     )
     try:
-        exchange = await control_plane_store.get_video_media_exchange_for_requester(
+        stream_request = await control_plane_store.get_video_stream_request_for_requester(
             request_id=request_id,
             organization_id=organization.id,
             requester_user_id=user.id,
         )
+        try:
+            exchange = await control_plane_store.get_video_media_exchange_for_requester(
+                request_id=request_id,
+                organization_id=organization.id,
+                requester_user_id=user.id,
+            )
+            answer_sdp = exchange.device_answer_sdp
+            expires_at = exchange.expires_at
+        except ControlPlaneError:
+            # Terminal transitions intentionally delete the SDP exchange. Keep
+            # the durable request state available so the browser can display
+            # the device's actual stop reason instead of a generic 409.
+            answer_sdp = ""
+            expires_at = stream_request.expires_at
         return {
-            "requestId": exchange.request_id,
-            "state": exchange.state,
-            "statusMessage": exchange.status_message,
-            "answerSdp": exchange.device_answer_sdp,
-            "expiresAt": exchange.expires_at.isoformat(),
+            "requestId": stream_request.id,
+            "state": stream_request.state,
+            "statusMessage": stream_request.status_message,
+            "answerSdp": answer_sdp,
+            "expiresAt": expires_at.isoformat(),
         }
     except ControlPlaneError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -9955,14 +9969,21 @@ async def organization_stream_live_status(
         designator,
         ("video_requester",),
     )
-    streams = await control_plane_store.list_active_video_streams(
-        organization.id
+    streams, organization_requests = await asyncio.gather(
+        control_plane_store.list_active_video_streams(organization.id),
+        control_plane_store.list_video_stream_requests(
+            organization_id=organization.id,
+        ),
     )
     clean_device_id = device.strip()
     clean_stream = stream.strip().lower()
     if clean_device_id:
         streams = tuple(
             item for item in streams
+            if item.device_credential_id == clean_device_id
+        )
+        organization_requests = tuple(
+            item for item in organization_requests
             if item.device_credential_id == clean_device_id
         )
     if clean_stream:
@@ -9995,6 +10016,18 @@ async def organization_stream_live_status(
     return JSONResponse(
         {
             "membershipRevision": stream_membership_revision(streams),
+            "inProgressSessionIds": sorted({
+                item.stream_session_id
+                for item in organization_requests
+                if item.state in {
+                    "pending",
+                    "probing",
+                    "awaiting_approval",
+                    "approved",
+                    "streaming",
+                }
+                and item.expires_at >= datetime.now(UTC)
+            }),
             "streams": values,
         },
         headers={

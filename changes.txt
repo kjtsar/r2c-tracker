@@ -1,3 +1,7 @@
+v1.4.35:
+* Show the tablet's actual managed-video stop or source-attachment reason after signaling ends instead of replacing it with a generic unavailable-status message.
+* Refresh stale viewer and Request in progress controls as soon as a managed-video request reaches a terminal state.
+
 v1.4.34: deployed
 * Added Microsoft Entra OpenID Connect for invited organization members, with authorization-code PKCE, tenant-aware token verification, stable identity binding, and no automatic membership or role provisioning.
 * Added managed-video diagnostics across approval, browser offer delivery, WebRTC state, codec negotiation, packet receipt, frame decoding, and HTML video playback without changing the media path.
