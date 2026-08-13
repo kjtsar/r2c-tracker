@@ -58,6 +58,7 @@ from control_plane import (
     normalize_video_preflight_answer,
     require_separate_database,
     stream_link_code,
+    recording_link_code,
     tablet_link_code,
 )
 from enrollment import (
@@ -1190,6 +1191,26 @@ class R2CCoordinationHub:
                 return None
             return next(iter(matches.values()))
 
+    async def list_connected_tablets(
+        self,
+        organization_id: str,
+    ) -> tuple["DeviceCredentialRecord", ...]:
+        """List authenticated live R2C tablets for one organization."""
+        async with self._lock:
+            matches = {
+                connection.device_credential.id: connection.device_credential
+                for connection in self._connections.values()
+                if connection.device_credential is not None
+                and connection.organization_id == organization_id
+            }
+        return tuple(sorted(
+            matches.values(),
+            key=lambda credential: (
+                credential.device_name.casefold(),
+                credential.id,
+            ),
+        ))
+
     async def resolve_stream_link_code(self, code: str):
         """Resolve one captured stream alias from live tablet advertisements."""
         clean_code = code.strip()
@@ -1232,6 +1253,41 @@ class R2CCoordinationHub:
                 )
             return None
         return next(iter(unique.values()))
+
+    async def resolve_recording_link_code(self, code: str):
+        """Resolve a short alias to exactly one advertised recording."""
+        clean_code = code.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{6}", clean_code):
+            return None
+        async with self._lock:
+            credentials = {
+                connection.device_credential.id: connection.device_credential
+                for connection in self._connections.values()
+                if connection.device_credential is not None
+            }
+        matches = []
+        for credential in credentials.values():
+            streams = await control_plane_store.list_active_video_streams(
+                credential.organization_id
+            )
+            for stream in streams:
+                if (
+                    stream.device_credential_id != credential.id
+                    or stream.media_kind != "recording"
+                ):
+                    continue
+                expected = recording_link_code(
+                    credential.designator,
+                    credential.device_name,
+                    stream.session_id,
+                )
+                if secrets.compare_digest(clean_code, expected):
+                    matches.append((credential, stream))
+        unique = {
+            (credential.id, stream.session_id): (credential, stream)
+            for credential, stream in matches
+        }
+        return next(iter(unique.values())) if len(unique) == 1 else None
 
     async def cache_video_thumbnail(
         self,
@@ -7629,9 +7685,11 @@ async def organization_streams(
         request: Request,
         designator: str,
         tablet: str = "",
-        stream: str = ""):
+        stream: str = "",
+        session: str = ""):
     clean_tablet_code = tablet.strip()
     clean_stream = stream.strip()
+    clean_session = session.strip()
     tablet_device = None
     if clean_tablet_code:
         tablet_device = await r2c_hub.resolve_tablet_link_code(
@@ -7662,8 +7720,13 @@ async def organization_streams(
         ):
             raise HTTPException(status_code=404, detail="R2C tablet not found.")
 
-    streams, requests, organization_requests, video_ice_servers = (
-        await asyncio.gather(
+    (
+        streams,
+        requests,
+        organization_requests,
+        video_ice_servers,
+        connected_tablets,
+    ) = await asyncio.gather(
             control_plane_store.list_active_video_streams(organization.id),
             control_plane_store.list_video_stream_requests(
                 organization_id=organization.id,
@@ -7673,8 +7736,8 @@ async def organization_streams(
                 organization_id=organization.id,
             ),
             video_ice_server_provider.get_ice_servers(),
+            r2c_hub.list_connected_tablets(organization.id),
         )
-    )
     if tablet_device is not None:
         streams = tuple(
             stream for stream in streams
@@ -7695,6 +7758,13 @@ async def organization_streams(
         )
         if not streams:
             raise HTTPException(status_code=404, detail="Captured stream not found.")
+    if clean_session:
+        streams = tuple(
+            item for item in streams
+            if item.session_id == clean_session and item.media_kind == "recording"
+        )
+        if not streams:
+            raise HTTPException(status_code=404, detail="Captured recording not found.")
     session_preflight = request.session.pop(
         "organization_video_preflight_request", None
     )
@@ -7782,6 +7852,7 @@ async def organization_streams(
             "organization_page_designator": organization.designator,
             "organization_identity_name": user.display_name,
             "tablet_device": tablet_device,
+            "connected_tablets": connected_tablets,
             "tablet_code": clean_tablet_code,
             "tablet_device_id": (
                 tablet_device.id if tablet_device is not None else ""
@@ -8309,6 +8380,31 @@ async def organization_update_settings(
     )
 
 
+async def deliver_organization_member_activation(
+        request: Request,
+        organization,
+        member) -> bool:
+    invitation = await control_plane_store.get_invitation(
+        organization.designator,
+        member.email,
+    )
+    if invitation is None:
+        raise ControlPlaneError("Member activation invitation is unavailable.")
+    activation_url = control_plane_tokens.activation_url(invitation)
+    if CONTROL_PLANE_SIMULATION:
+        request.session["_organization_invitation_url"] = activation_url
+        return False
+    await asyncio.to_thread(
+        platform_admin_email_sender.send_organization_member_activation,
+        recipient=member.email,
+        member_name=member.display_name,
+        organization_name=organization.legal_name,
+        designator=organization.designator,
+        activation_url=activation_url,
+    )
+    return True
+
+
 @app.post("/{designator}/members")
 async def organization_add_member(
         request: Request,
@@ -8331,23 +8427,29 @@ async def organization_add_member(
             roles=tuple(roles),
             actor_id=user.id,
         )
-        invitation = await control_plane_store.get_invitation(
-            organization.designator,
-            member.email,
+        activation_sent = await deliver_organization_member_activation(
+            request,
+            organization,
+            member,
         )
-        if CONTROL_PLANE_SIMULATION and invitation is not None:
-            request.session["_organization_invitation_url"] = (
-                control_plane_tokens.activation_url(invitation)
-            )
         flash(
             request,
             (
                 f"Added pending member {member.email}. "
-                "They can activate with the matching verified Google account."
+                + (
+                    "A seven-day activation invitation was emailed to them."
+                    if activation_sent
+                    else "They can activate using the generated invitation."
+                )
             ),
             "success",
         )
-    except (ControlPlaneError, InvalidOrganizationError, ValueError) as exc:
+    except (
+        ControlPlaneError,
+        InvalidOrganizationError,
+        PlatformAdminAuthError,
+        ValueError,
+    ) as exc:
         flash(request, str(exc), "warning")
     return RedirectResponse(
         url=f"/{organization.designator.lower()}/admin#members",
@@ -8456,20 +8558,78 @@ async def organization_restore_member(
             user_id=member_id,
             actor_id=user.id,
         )
-        invitation = await control_plane_store.get_invitation(
-            organization.designator,
-            member.email,
+        activation_sent = await deliver_organization_member_activation(
+            request,
+            organization,
+            member,
         )
-        if CONTROL_PLANE_SIMULATION and invitation is not None:
-            request.session["_organization_invitation_url"] = (
-                control_plane_tokens.activation_url(invitation)
+        flash(
+            request,
+            (
+                f"Restored {member.email} as a pending member. "
+                + (
+                    "A seven-day activation invitation was emailed to them."
+                    if activation_sent
+                    else "They can activate using the generated invitation."
+                )
+            ),
+            "success",
+        )
+    except (
+        ControlPlaneError,
+        InvalidOrganizationError,
+        PlatformAdminAuthError,
+    ) as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(
+        url=f"/{organization.designator.lower()}/admin#members",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post("/{designator}/members/{member_id}/invitation")
+async def organization_send_member_invitation(
+        request: Request,
+        designator: str,
+        member_id: str,
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_admin", form_token)
+    organization, user = await require_organization_user(
+        request,
+        designator,
+        ("organization_owner", "user_admin"),
+    )
+    try:
+        member = await control_plane_store.renew_member_invitation(
+            organization_id=organization.id,
+            user_id=member_id,
+            actor_id=user.id,
+        )
+        activation_sent = await deliver_organization_member_activation(
+            request,
+            organization,
+            member,
+        )
+        if activation_sent:
+            await control_plane_store.mark_member_invitation_sent(
+                organization_id=organization.id,
+                user_id=member.id,
+                actor_id=user.id,
             )
         flash(
             request,
-            f"Restored {member.email} as a pending member.",
+            (
+                f"Sent a fresh seven-day activation invitation to {member.email}."
+                if activation_sent
+                else f"Generated a fresh activation invitation for {member.email}."
+            ),
             "success",
         )
-    except (ControlPlaneError, InvalidOrganizationError) as exc:
+    except (
+        ControlPlaneError,
+        InvalidOrganizationError,
+        PlatformAdminAuthError,
+    ) as exc:
         flash(request, str(exc), "warning")
     return RedirectResponse(
         url=f"/{organization.designator.lower()}/admin#members",
@@ -9754,6 +9914,59 @@ async def connected_captured_stream_short_link(stream_code: str):
         ),
         status_code=status.HTTP_303_SEE_OTHER,
         headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/v/{recording_code}")
+async def connected_recording_short_link(recording_code: str):
+    """Resolve a stable recording alias to one exact captured video."""
+    resolved = await r2c_hub.resolve_recording_link_code(recording_code)
+    if resolved is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Captured recording is not available.",
+        )
+    tablet, stream = resolved
+    return RedirectResponse(
+        url=(
+            f"/{tablet.designator.lower()}/streams/"
+            f"{quote(tablet.device_name, safe='')}/session/"
+            f"{quote(stream.session_id, safe='')}"
+        ),
+        status_code=status.HTTP_303_SEE_OTHER,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get(
+    "/{designator}/streams/{device_name}/session/{session_id}",
+    response_class=HTMLResponse,
+)
+async def organization_recording_session(
+        request: Request,
+        designator: str,
+        device_name: str,
+        session_id: str):
+    """Render exactly one stable recording from a connected R2C tablet."""
+    tablet = await r2c_hub.resolve_connected_tablet(designator, device_name)
+    if tablet is None:
+        raise HTTPException(status_code=404, detail="R2C tablet not found.")
+    await require_organization_user(
+        request,
+        tablet.designator,
+        ("video_requester",),
+        redirect_to_login=True,
+        login_next=(
+            f"/{tablet.designator.lower()}/streams/"
+            f"{quote(tablet.device_name, safe='')}/session/"
+            f"{quote(session_id, safe='')}"
+        ),
+    )
+    return await organization_streams(
+        request=request,
+        designator=tablet.designator,
+        tablet=tablet_link_code(tablet.designator, tablet.device_name),
+        session=session_id,
     )
 
 

@@ -408,8 +408,18 @@
               <td>
                 {% if member.state == "invited" %}
                 Pending activation
+                {% if can_manage_users and "organization_owner" not in member.roles %}
+                <form method="post"
+                      action="/{{ organization.designator|lower }}/members/{{ member.id }}/invitation"
+                      style="display:inline; margin-left:8px">
+                  <input type="hidden" name="form_token" value="{{ csrf_token }}">
+                  <button class="primary-button" type="submit">Send invitation</button>
+                </form>
+                {% endif %}
                 {% elif member.state == "disabled" %}
                 Deleted
+                {% elif member.state == "archived" %}
+                Archived (inactive)
                 {% else %}
                 {{ member.state }}
                 {% endif %}
@@ -457,11 +467,13 @@
             <button class="primary-button" type="submit">Save member</button>
           </div>
         </form>
-        {% if member.state == "disabled" %}
+        {% if member.state in ["disabled", "archived"] %}
         <form class="member-delete-form" method="post"
               action="/{{ organization.designator|lower }}/members/{{ member.id }}/restore">
           <input type="hidden" name="form_token" value="{{ csrf_token }}">
-          <button class="primary-button" type="submit">Restore as pending member</button>
+          <button class="primary-button" type="submit">
+            {% if member.state == "archived" %}Restore archived member{% else %}Restore as pending member{% endif %}
+          </button>
         </form>
         {% elif "organization_owner" not in member.roles %}
         <form class="member-delete-form" method="post"

@@ -1,3 +1,12 @@
+v1.4.33: pending review
+* Allow an unexpired pending member to activate through ordinary organization Google sign-in when Google verifies the exact invited email, matching the guidance already shown on the member administration page.
+* Make newly archived CalTopo track descriptions point to one stable recording-session link instead of a drone-name filter that could list several videos; legacy broad stream links remain supported.
+* Show each recording's incident-local start date and time.
+* List every authenticated connected R2C tablet on the organization streams page, with a direct tablet link even when the device currently advertises no live or recorded streams.
+* Let organization user administrators restore legacy archived members directly while preserving their assigned roles, issuing a fresh seven-day activation, and emailing the member-specific activation link.
+* Send activation invitations when ordinary organization members are added so pending accounts can complete password or Google activation.
+* Add a Send invitation control beside pending members that renews the single-use link for seven days, emails it to the member, and records the action in the organization audit history.
+
 v1.4.32: deployed
 * Made organization entry role-aware: records viewers land on their organization dashboard, video-only requesters land on streams, administrative roles land on administration, and non-admin members are denied direct administration access.
 * Added visible signed-in or Guest identity on the organization directory, plus direct sign-in controls for guests on both the directory and organization pages.

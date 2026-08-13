@@ -12,6 +12,7 @@ from control_plane import (
     DuplicateOrganizationError,
     InvalidOrganizationError,
     MANAGED_ACCESS_TERMS_VERSION,
+    OrganizationUser,
     UsageDaily,
     hash_password,
     is_emergency_video_fallback,
@@ -613,7 +614,108 @@ class ControlPlaneStoreTest(unittest.TestCase):
             [event.event_type for event in audit_events[:3]],
         )
 
-    def test_organization_owner_cannot_be_deleted_as_a_member(self):
+    def test_archived_member_can_be_restored_without_losing_roles(self):
+        organization = self.create_organization()
+        owner = asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+                self.now,
+            )
+        )
+        member = asyncio.run(
+            self.store.add_user(
+                organization_id=organization.id,
+                display_name="Archived Member",
+                email="archived@ncssar.example",
+                roles=("records_admin", "records_viewer", "video_requester"),
+                actor_id=owner.id,
+                now=self.now,
+            )
+        )
+
+        async def archive_member():
+            async with self.store.sessions() as session:
+                stored = await session.get(OrganizationUser, member.id)
+                stored.state = "archived"
+                stored.password_hash = ""
+                await session.commit()
+
+        asyncio.run(archive_member())
+        restored = asyncio.run(
+            self.store.restore_user(
+                organization_id=organization.id,
+                user_id=member.id,
+                actor_id=owner.id,
+                now=self.now + timedelta(minutes=1),
+            )
+        )
+
+        self.assertEqual("invited", restored.state)
+        self.assertEqual(set(member.roles), set(restored.roles))
+        invitation = asyncio.run(
+            self.store.get_invitation(organization.designator, member.email)
+        )
+        self.assertIsNotNone(invitation)
+        event = asyncio.run(self.store.list_audit_events())[0]
+        self.assertEqual("member.restored", event.event_type)
+        self.assertEqual("archived", event.details["previous_state"])
+
+    def test_pending_member_invitation_can_be_renewed_and_audited(self):
+        organization = self.create_organization()
+        owner = asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+                self.now,
+            )
+        )
+        member = asyncio.run(
+            self.store.add_user(
+                organization_id=organization.id,
+                display_name="Pending Member",
+                email="pending@ncssar.example",
+                roles=("records_viewer",),
+                actor_id=owner.id,
+                now=self.now,
+            )
+        )
+        original = asyncio.run(
+            self.store.get_invitation(organization.designator, member.email)
+        )
+
+        renewed_member = asyncio.run(
+            self.store.renew_member_invitation(
+                organization_id=organization.id,
+                user_id=member.id,
+                actor_id=owner.id,
+                now=self.now + timedelta(days=1),
+            )
+        )
+        renewed = asyncio.run(
+            self.store.get_invitation(organization.designator, member.email)
+        )
+        self.assertEqual("invited", renewed_member.state)
+        self.assertNotEqual(original.activation_nonce, renewed.activation_nonce)
+        self.assertEqual(self.now + timedelta(days=8), renewed.expires_at)
+
+        asyncio.run(
+            self.store.mark_member_invitation_sent(
+                organization_id=organization.id,
+                user_id=member.id,
+                actor_id=owner.id,
+                now=self.now + timedelta(days=1, seconds=1),
+            )
+        )
+        events = asyncio.run(self.store.list_audit_events())[:2]
+        self.assertEqual(
+            ["member.invitation_sent", "member.invitation_renewed"],
+            [event.event_type for event in events],
+        )
+
+    def test_organization_owner_cannot_be_deleted_or_restored_as_a_member(self):
         organization = self.create_organization()
         owner = asyncio.run(
             self.store.activate_owner(
@@ -631,6 +733,23 @@ class ControlPlaneStoreTest(unittest.TestCase):
                     user_id=owner.id,
                     actor_id=owner.id,
                     now=self.now + timedelta(minutes=1),
+                )
+            )
+
+        async def archive_owner():
+            async with self.store.sessions() as session:
+                stored = await session.get(OrganizationUser, owner.id)
+                stored.state = "archived"
+                await session.commit()
+
+        asyncio.run(archive_owner())
+        with self.assertRaisesRegex(ControlPlaneError, "cannot be restored"):
+            asyncio.run(
+                self.store.restore_user(
+                    organization_id=organization.id,
+                    user_id=owner.id,
+                    actor_id=owner.id,
+                    now=self.now + timedelta(minutes=2),
                 )
             )
 
@@ -1585,28 +1704,20 @@ class ControlPlaneStoreTest(unittest.TestCase):
 
     def test_verified_google_email_activates_exact_pending_organization_user(self):
         organization = self.create_organization()
-        invitation = asyncio.run(
-            self.store.get_invitation(
-                organization.designator,
-                organization.primary_admin_email,
-            )
-        )
-
-        without_invitation = asyncio.run(
+        expired = asyncio.run(
             self.store.authorize_google_user(
                 organization.designator,
                 organization.primary_admin_email,
-                self.now,
+                self.now + timedelta(days=8),
             )
         )
-        self.assertIsNone(without_invitation)
+        self.assertIsNone(expired)
 
         authorized = asyncio.run(
             self.store.authorize_google_user(
                 organization.designator.lower(),
                 organization.primary_admin_email.upper(),
                 self.now + timedelta(minutes=1),
-                activation_nonce=invitation.activation_nonce,
             )
         )
 

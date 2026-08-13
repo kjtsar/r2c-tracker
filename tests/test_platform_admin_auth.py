@@ -178,6 +178,36 @@ class PlatformAdminAuthHelpersTest(unittest.TestCase):
         self.assertIn("existing password has not been changed", message.get_content())
 
     @patch("platform_admin_auth.smtplib.SMTP")
+    def test_member_activation_email_describes_role_scoped_access(self, smtp):
+        sender = SmtpPlatformAdminEmailSender(
+            host="smtp.example.org",
+            port=587,
+            username="tracker@example.org",
+            password="secret manager value",
+            from_address="tracker@example.org",
+        )
+
+        sender.send_organization_member_activation(
+            recipient="viewer@ncssar.example",
+            member_name="Records Viewer",
+            organization_name="North County SAR",
+            designator="NCSSAR",
+            activation_url="https://r2c-tracker.com/ncssar/activate?token=signed",
+        )
+
+        message = smtp.return_value.__enter__.return_value.send_message.call_args.args[0]
+        content = message.get_content()
+        self.assertEqual(
+            "Activate your NCSSAR R2C Tracker membership",
+            message["Subject"],
+        )
+        self.assertIn("Hello Records Viewer", content)
+        self.assertIn("single-use link within seven days", content)
+        self.assertIn("page permitted by your assigned roles", content)
+        self.assertNotIn("trial", content.lower())
+        self.assertNotIn("administrator", content.lower())
+
+    @patch("platform_admin_auth.smtplib.SMTP")
     def test_active_organization_access_email_points_to_google_login(self, smtp):
         sender = SmtpPlatformAdminEmailSender(
             host="smtp.example.org",

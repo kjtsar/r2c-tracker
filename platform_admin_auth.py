@@ -262,6 +262,34 @@ def _organization_activation_message(
     return message
 
 
+def _organization_member_activation_message(
+    from_address: str,
+    recipient: str,
+    member_name: str,
+    organization_name: str,
+    designator: str,
+    activation_url: str,
+) -> EmailMessage:
+    message = EmailMessage()
+    message["Subject"] = f"Activate your {designator} R2C Tracker membership"
+    message["From"] = from_address
+    message["To"] = recipient
+    message.set_content(
+        f"Hello {member_name},\n\n"
+        f"You have been invited to access {organization_name} ({designator}) "
+        "in R2C Tracker.\n\n"
+        "Use this single-use link within seven days to activate your membership "
+        "and verify your identity with one of the sign-in providers offered by "
+        "R2C Tracker:\n"
+        f"{activation_url}\n\n"
+        "After activation, R2C Tracker will sign you in and open the page "
+        "permitted by your assigned roles.\n\n"
+        "If you were not expecting this invitation, ignore this message. "
+        "Do not forward the activation link."
+    )
+    return message
+
+
 def _organization_password_reset_message(
     from_address: str,
     recipient: str,
@@ -480,6 +508,17 @@ class GmailApiPlatformAdminEmailSender:
         )
         self._send(message, "Organization activation email could not be sent.")
 
+    def send_organization_member_activation(self, **kwargs) -> None:
+        message = _organization_member_activation_message(
+            self.from_address,
+            kwargs["recipient"],
+            kwargs["member_name"],
+            kwargs["organization_name"],
+            kwargs["designator"],
+            kwargs["activation_url"],
+        )
+        self._send(message, "Organization member activation email could not be sent.")
+
     def send_organization_password_reset(self, **kwargs) -> None:
         message = _organization_password_reset_message(
             self.from_address,
@@ -623,6 +662,36 @@ class SmtpPlatformAdminEmailSender:
         except Exception as exc:
             raise PlatformAdminAuthError(
                 "Organization activation email could not be sent."
+            ) from exc
+
+    def send_organization_member_activation(
+        self,
+        *,
+        recipient: str,
+        member_name: str,
+        organization_name: str,
+        designator: str,
+        activation_url: str,
+    ) -> None:
+        if not self.is_configured:
+            raise PlatformAdminAuthError("Administrator email is not configured.")
+        message = _organization_member_activation_message(
+            self.from_address,
+            recipient,
+            member_name,
+            organization_name,
+            designator,
+            activation_url,
+        )
+        try:
+            with smtplib.SMTP(self.host, self.port, timeout=15) as smtp:
+                smtp.starttls(context=ssl.create_default_context())
+                if self.username:
+                    smtp.login(self.username, self.password)
+                smtp.send_message(message)
+        except Exception as exc:
+            raise PlatformAdminAuthError(
+                "Organization member activation email could not be sent."
             ) from exc
 
     def send_organization_password_reset(

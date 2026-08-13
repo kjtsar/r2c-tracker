@@ -104,6 +104,23 @@ def stream_link_code(
     ).decode("ascii").rstrip("=")
 
 
+def recording_link_code(
+    organization_designator: str,
+    device_name: str,
+    session_id: str,
+) -> str:
+    """Return the short alias for one stable recording session."""
+    material = (
+        f"/{organization_designator.strip().lower()}"
+        f"/streams/{device_name.strip().lower()}"
+        f"/session/{session_id.strip().lower()}"
+    )
+    digest = hashlib.sha256(material.encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(
+        digest[:TABLET_LINK_CODE_DIGEST_BYTES]
+    ).decode("ascii").rstrip("=")
+
+
 def is_emergency_video_fallback(
     *,
     width: int,
@@ -951,6 +968,16 @@ class ActiveVideoStreamRecord:
     remote_control_enabled: bool
     last_seen_at: datetime
     expires_at: datetime
+
+    @property
+    def recorded_at_local(self) -> Optional[datetime]:
+        if self.recorded_at is None:
+            return None
+        try:
+            zone = ZoneInfo(self.timezone_name)
+        except ZoneInfoNotFoundError:
+            zone = ZoneInfo("UTC")
+        return as_utc(self.recorded_at).astimezone(zone)
 
 
 @dataclass(frozen=True)
@@ -2837,6 +2864,77 @@ class ControlPlaneStore:
                 expires_at=as_utc(user.activation_expires_at),
             )
 
+    async def renew_member_invitation(
+        self,
+        *,
+        organization_id: str,
+        user_id: str,
+        actor_id: str,
+        now: Optional[datetime] = None,
+    ) -> UserRecord:
+        issued_at = now or utc_now()
+        async with self.sessions() as session:
+            user = await session.get(OrganizationUser, user_id)
+            if user is None or user.organization_id != organization_id:
+                raise ControlPlaneError("Member not found.")
+            if "organization_owner" in user.roles:
+                raise ControlPlaneError(
+                    "The organization owner's invitation is managed from "
+                    "platform administration."
+                )
+            if user.state != "invited":
+                raise ControlPlaneError(
+                    "Only a member pending activation can be sent an invitation."
+                )
+            user.activation_nonce = new_id()
+            user.activation_expires_at = issued_at + timedelta(days=7)
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=organization_id,
+                    actor_type="organization_user",
+                    actor_id=actor_id,
+                    event_type="member.invitation_renewed",
+                    details_json=json.dumps({"user_id": user.id}),
+                    created_at=issued_at,
+                )
+            )
+            await session.commit()
+            return UserRecord(
+                id=user.id,
+                organization_id=user.organization_id,
+                email=user.email,
+                display_name=user.display_name,
+                roles=user.roles,
+                state=user.state,
+            )
+
+    async def mark_member_invitation_sent(
+        self,
+        *,
+        organization_id: str,
+        user_id: str,
+        actor_id: str,
+        now: Optional[datetime] = None,
+    ) -> None:
+        sent_at = now or utc_now()
+        async with self.sessions() as session:
+            user = await session.get(OrganizationUser, user_id)
+            if user is None or user.organization_id != organization_id:
+                raise ControlPlaneError("Member not found.")
+            if user.state != "invited":
+                raise ControlPlaneError("Member is no longer pending activation.")
+            session.add(
+                ControlPlaneAuditEvent(
+                    organization_id=organization_id,
+                    actor_type="organization_user",
+                    actor_id=actor_id,
+                    event_type="member.invitation_sent",
+                    details_json=json.dumps({"user_id": user.id}),
+                    created_at=sent_at,
+                )
+            )
+            await session.commit()
+
     async def authenticate_user(
         self,
         designator: str,
@@ -3067,7 +3165,7 @@ class ControlPlaneStore:
         *,
         activation_nonce: Optional[str] = None,
     ) -> Optional[UserRecord]:
-        """Authorize an exact verified email; activation requires its nonce."""
+        """Authorize an exact verified email and activate a live invitation."""
         clean_designator = normalize_designator(designator)
         clean_email = normalize_email(email)
         login_at = now or utc_now()
@@ -3087,9 +3185,8 @@ class ControlPlaneStore:
             if user is None:
                 return None
             if user.state == "invited":
-                if not activation_nonce or not secrets.compare_digest(
-                    user.activation_nonce,
-                    activation_nonce,
+                if activation_nonce is not None and not secrets.compare_digest(
+                    user.activation_nonce, activation_nonce
                 ):
                     return None
                 activation_expires_at = as_utc(user.activation_expires_at)
@@ -3424,8 +3521,16 @@ class ControlPlaneStore:
             user = await session.get(OrganizationUser, user_id)
             if user is None or user.organization_id != organization_id:
                 raise ControlPlaneError("Member not found.")
-            if user.state != "disabled":
-                raise ControlPlaneError("Only a deleted member can be restored.")
+            if "organization_owner" in user.roles:
+                raise ControlPlaneError(
+                    "The organization owner cannot be restored here. "
+                    "Manage ownership from platform administration."
+                )
+            if user.state not in {"disabled", "archived"}:
+                raise ControlPlaneError(
+                    "Only a deleted or archived member can be restored."
+                )
+            previous_state = user.state
             user.state = "invited"
             user.password_hash = ""
             user.activation_nonce = new_id()
@@ -3436,7 +3541,9 @@ class ControlPlaneStore:
                     actor_type="organization_user",
                     actor_id=actor_id,
                     event_type="member.restored",
-                    details_json=json.dumps({"user_id": user.id}),
+                    details_json=json.dumps(
+                        {"user_id": user.id, "previous_state": previous_state}
+                    ),
                     created_at=restored_at,
                 )
             )

@@ -26,6 +26,8 @@ from control_plane import (
     ControlPlaneStore,
     DeviceCredentialRecord,
     MANAGED_ACCESS_TERMS_VERSION,
+    OrganizationUser,
+    recording_link_code,
     VideoPreflightExchange,
     stream_link_code,
     tablet_link_code,
@@ -75,6 +77,7 @@ class FakeOrganizationEmailSender:
         self.password_resets = []
         self.access_messages = []
         self.activation_messages = []
+        self.member_activation_messages = []
         self.administrator_change_messages = []
 
     def send_organization_password_reset(self, **message):
@@ -85,6 +88,9 @@ class FakeOrganizationEmailSender:
 
     def send_organization_activation(self, **message):
         self.activation_messages.append(message)
+
+    def send_organization_member_activation(self, **message):
+        self.member_activation_messages.append(message)
 
     def send_organization_administrator_changed(self, **message):
         self.administrator_change_messages.append(message)
@@ -857,6 +863,115 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn("Restored edited@ncssar.example as a pending member", restored.text)
         self.assertIn("Pending activation", restored.text)
         self.assertEqual("invited", asyncio.run(self.store.get_user(member.id)).state)
+
+    def test_owner_can_restore_archived_member_and_send_activation_email(self):
+        organization = asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Primary Administrator",
+                admin_email="admin@ncssar.example",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        owner = asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+            )
+        )
+        member = asyncio.run(
+            self.store.add_user(
+                organization_id=organization.id,
+                display_name="Archived Viewer",
+                email="archived@ncssar.example",
+                roles=("records_admin", "records_viewer", "video_requester"),
+                actor_id=owner.id,
+            )
+        )
+
+        async def archive_member():
+            async with self.store.sessions() as session:
+                stored = await session.get(OrganizationUser, member.id)
+                stored.state = "archived"
+                await session.commit()
+
+        asyncio.run(archive_member())
+        login_page = self.client.get("/ncssar/login")
+        login = self.client.post(
+            "/ncssar/login",
+            data={
+                "form_token": self.form_token(login_page),
+                "email": organization.primary_admin_email,
+                "password": "correct horse battery staple",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(303, login.status_code)
+
+        page = self.client.get("/ncssar/admin")
+        self.assertIn("Archived (inactive)", page.text)
+        self.assertIn("Restore archived member", page.text)
+        sender = FakeOrganizationEmailSender()
+        with (
+            patch.object(main, "CONTROL_PLANE_SIMULATION", False),
+            patch.object(main, "SESSION_COOKIE_HTTPS_ONLY", True),
+            patch.object(main, "platform_admin_email_sender", sender),
+        ):
+            added = self.client.post(
+                "/ncssar/members",
+                data={
+                    "form_token": self.form_token(page),
+                    "display_name": "New Viewer",
+                    "email": "new-viewer@ncssar.example",
+                    "roles": ["records_viewer"],
+                },
+                follow_redirects=True,
+            )
+            pending_invitation = asyncio.run(
+                self.store.get_invitation(
+                    "NCSSAR",
+                    "new-viewer@ncssar.example",
+                )
+            )
+            resent = self.client.post(
+                f"/ncssar/members/{pending_invitation.user_id}/invitation",
+                data={"form_token": self.form_token(added)},
+                follow_redirects=True,
+            )
+            restored = self.client.post(
+                f"/ncssar/members/{member.id}/restore",
+                data={"form_token": self.form_token(resent)},
+                follow_redirects=True,
+            )
+
+        self.assertIn("Added pending member new-viewer@ncssar.example", added.text)
+        self.assertIn("A seven-day activation invitation was emailed", added.text)
+        self.assertIn("Send invitation", added.text)
+        self.assertIn(
+            "Sent a fresh seven-day activation invitation to new-viewer@ncssar.example",
+            resent.text,
+        )
+        self.assertIn("A seven-day activation invitation was emailed", restored.text)
+        current = asyncio.run(self.store.get_user(member.id))
+        self.assertEqual("invited", current.state)
+        self.assertEqual(set(member.roles), set(current.roles))
+        self.assertEqual(3, len(sender.member_activation_messages))
+        self.assertEqual(
+            "new-viewer@ncssar.example",
+            sender.member_activation_messages[0]["recipient"],
+        )
+        self.assertEqual(
+            "new-viewer@ncssar.example",
+            sender.member_activation_messages[1]["recipient"],
+        )
+        message = sender.member_activation_messages[2]
+        self.assertEqual("archived@ncssar.example", message["recipient"])
+        self.assertEqual("Archived Viewer", message["member_name"])
+        self.assertIn("/ncssar/activate?token=", message["activation_url"])
 
     def test_platform_navigation_does_not_expose_legacy_admin_links(self):
         self.client.cookies.clear()
@@ -1821,6 +1936,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         )
         self.assertIn("Request video", streams_page.text)
         self.assertIn("Play recording", streams_page.text)
+        self.assertIn("10 Aug 2026 12:30:00 PM PDT", streams_page.text)
         self.assertIn("Android video tablet", streams_page.text)
         self.assertIn("R2C instance", streams_page.text)
         self.assertIn("/static/organization_streams_live.js", streams_page.text)
@@ -1905,6 +2021,25 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             self.assertEqual(200, captured_page.status_code)
             self.assertIn("<td>2B</td>", captured_page.text)
             self.assertNotIn("<td>10A</td>", captured_page.text)
+            recording_code = recording_link_code(
+                "ncssar",
+                "Android video tablet",
+                "00000000-0000-0000-0000-000000000002",
+            )
+            recording_link = self.client.get(
+                f"/v/{recording_code}",
+                follow_redirects=False,
+            )
+            self.assertEqual(303, recording_link.status_code)
+            self.assertEqual(
+                "/ncssar/streams/Android%20video%20tablet/session/"
+                "00000000-0000-0000-0000-000000000002",
+                recording_link.headers["location"],
+            )
+            recording_page = self.client.get(recording_link.headers["location"])
+            self.assertEqual(200, recording_page.status_code)
+            self.assertIn("<td>2B</td>", recording_page.text)
+            self.assertNotIn("<td>10A</td>", recording_page.text)
             live_websocket.send_json(
                 {
                     "type": "video_stream_advertisement",
@@ -1927,6 +2062,13 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 "A request identifies you to the drone team",
                 remote_control_page.text,
             )
+            connected_tablets_page = self.client.get("/ncssar/streams")
+            self.assertIn("Connected R2C tablets", connected_tablets_page.text)
+            self.assertIn(
+                'href="/ncssar/streams/Android%20video%20tablet"',
+                connected_tablets_page.text,
+            )
+            self.assertIn("Android R2C instance", connected_tablets_page.text)
             live_websocket.send_json(
                 {
                     "type": "video_stream_advertisement",
@@ -1968,6 +2110,45 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             404,
             self.client.get(f"/s/{stream_code}", follow_redirects=False).status_code,
         )
+        with self.client.websocket_connect(
+            "/ncssar/ws/r2c",
+            headers={"X-SAR-Token": device.token},
+        ) as restarted_websocket:
+            restarted_websocket.send_json({
+                "type": "video_stream_advertisement",
+                "incidentName": "Alpha",
+                "timeZone": "America/Los_Angeles",
+                "streams": [{
+                    "sessionId": "00000000-0000-0000-0000-000000000001",
+                    "droneDesignator": "10A",
+                    "sourceWidth": 1920,
+                    "sourceHeight": 1080,
+                    "sourceFps": 30,
+                    "sourceBitrateBps": 4_000_000,
+                    "sourceCodec": "h264",
+                }, {
+                    "sessionId": "00000000-0000-0000-0000-000000000002",
+                    "droneDesignator": "2B",
+                    "sourceWidth": 1280,
+                    "sourceHeight": 720,
+                    "sourceFps": 30,
+                    "sourceBitrateBps": 2_000_000,
+                    "sourceCodec": "h264",
+                    "mediaKind": "recording",
+                    "recordedAt": "2026-08-10T19:30:00Z",
+                    "durationMs": 91_000,
+                }],
+            })
+            self.assertTrue(restarted_websocket.receive_json()["accepted"])
+            restarted_recording_link = self.client.get(
+                f"/v/{recording_code}",
+                follow_redirects=False,
+            )
+            self.assertEqual(303, restarted_recording_link.status_code)
+            self.assertEqual(
+                recording_link.headers["location"],
+                restarted_recording_link.headers["location"],
+            )
         with self.client.websocket_connect(
             "/ncssar/streams/events"
         ) as event_websocket:
@@ -2308,7 +2489,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertEqual(200, admin_page.status_code)
         self.assertIn("active", admin_page.text)
 
-    def test_pending_member_cannot_activate_from_ordinary_google_login(self):
+    def test_pending_member_activates_from_ordinary_google_login(self):
         organization = asyncio.run(
             self.store.create_organization(
                 legal_name="North County Search and Rescue",
@@ -2330,7 +2511,10 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 "/google/callback?code=test-code&state=organization-state",
                 follow_redirects=False,
             )
-        self.assertEqual("/ncssar/login", callback.headers["location"])
+        self.assertEqual("/ncssar/admin", callback.headers["location"])
+        self.assertEqual(200, self.client.get("/ncssar/admin").status_code)
+        members = asyncio.run(self.store.list_users(organization.id))
+        self.assertEqual("active", members[0].state)
 
     def test_forgot_password_is_non_enumerating_and_uses_fragment_token(self):
         organization = asyncio.run(

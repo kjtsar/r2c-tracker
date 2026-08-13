@@ -276,6 +276,26 @@
     {% endif %}
   </div>
 
+  {% if not tablet_device %}
+  <section class="streams-panel">
+    <h2>Connected R2C tablets</h2>
+    {% if connected_tablets %}
+    <ul>
+      {% for connected_tablet in connected_tablets %}
+      <li>
+        <a href="/{{ organization.designator|lower }}/streams/{{ connected_tablet.device_name|urlencode }}">
+          <strong>{{ connected_tablet.device_name }}</strong>
+        </a>
+        <span class="secondary">{{ connected_tablet.platform|capitalize }} R2C instance</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty-state">No R2C tablets are connected right now.</p>
+    {% endif %}
+  </section>
+  {% endif %}
+
   {% if active_preflight_request_id %}
   <div id="video-preflight"
        class="preflight-status"
@@ -352,6 +372,11 @@
             <td>
               {% if stream.media_kind == "recording" %}
               <strong>Recorded</strong>
+              {% if stream.recorded_at_local %}
+              <span class="secondary" style="display:block">
+                {{ stream.recorded_at_local.strftime("%d %b %Y %I:%M:%S %p %Z") }}
+              </span>
+              {% endif %}
               {% if stream.duration_ms %}
               <span class="secondary" style="display:block">
                 {{ (stream.duration_ms / 1000)|round|int|duration_clock }}
