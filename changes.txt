@@ -1,4 +1,4 @@
-v1.4.40:
+v1.4.40: deployed
 * Keep superseded, never-deployed release notes separate from the current tracker summary on the public version-history page.
 
 v1.4.39: deployed
