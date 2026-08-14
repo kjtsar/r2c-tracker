@@ -143,6 +143,13 @@ The quickest complete local verification is:
 ./release_check.sh
 ```
 
+Presentation-only releases may use the intentionally conspicuous
+`./publish_release.sh --bypass-safety-checks APP_VERSION_CODE` workflow after
+the source is reviewed, committed, and tagged. It still runs complete local
+qualification and candidate/public health checks, but skips idle and hosted
+staging/database safety checks. The command rejects non-UI changes and is not
+for production qualification; see [the release runbook](RELEASE.md).
+
 It creates isolated temporary SQLite data, runs the full unit suite, starts a
 localhost server, checks public and health routes, verifies that the deployment
 gate and FAA proxy reject unauthenticated requests, and exercises the R2C

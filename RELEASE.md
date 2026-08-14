@@ -10,6 +10,29 @@ The hosted service is best effort and currently runs one Cloud Run instance.
 Every release uses a zero-production-traffic candidate and the operational
 activity gate. Do not use percentage traffic splitting.
 
+## Presentation-only bypass for rapid UI testing
+
+`--bypass-safety-checks` is an explicit testing exception, not a production
+release qualification. It retains the complete local qualification, committed
+and tagged source requirement, a zero-traffic candidate, candidate/public
+health and version checks, and automatic rollback. It skips the live activity
+gate, isolated staging databases, staging Cloud Run deployment, and hosted
+staging regression. Promotion can therefore disconnect active tablet clients.
+
+The bypass refuses changes outside `static/`, `templates/`, `tests/`, and
+`changes.txt`. Backend, schema, protocol, dependency, authentication, and
+deployment changes must use the normal guarded workflow below.
+
+After reviewing, committing, and tagging a presentation-only release, run:
+
+```bash
+./publish_release.sh --bypass-safety-checks "${R2C_MINIMUM_ANDROID_BUILD}"
+```
+
+The wrapper runs `qualify_release.sh`, deploys and retests a zero-traffic
+candidate, and requires the same conspicuous flag for promotion. Do not use
+this path for a production environment or during an operational incident.
+
 ## Release roles and access
 
 One person is the **release owner** from version preparation through promotion

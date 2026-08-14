@@ -319,24 +319,73 @@
   </div>
   {% endif %}
 
+  {% if active_media_request_id %}
+  <section class="streams-panel" id="video-viewer-panel">
+    <h2>Live video</h2>
+    {% if active_media_request and active_media_request.route_kind != "unknown" %}
+    <p>
+      Measured link:
+      <span class="route-chip"
+            data-route="{{ active_media_request.route_kind }}">
+        {{ active_media_request.route_kind|capitalize }}
+      </span>
+      {% if active_media_request.estimated_uplink_bps %}
+      <span class="secondary">
+        {{ "%.1f"|format(active_media_request.estimated_uplink_bps / 1000000) }}
+        Mbps usable
+      </span>
+      {% endif %}
+    </p>
+    {% endif %}
+    <p id="video-media-status" class="secondary">Preparing the authorized media path…</p>
+    <div class="media-player-shell">
+      <video id="organization-video-player"
+             autoplay muted playsinline controls
+             style="display:none;width:100%;max-height:70vh;background:#111;border-radius:8px"></video>
+      <button id="voip-toggle" class="voip-toggle" type="button"
+              aria-label="Turn microphone on" aria-pressed="false"
+              title="Microphone off" style="display:none">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21H8v2h8v-2h-3v-3.08A7 7 0 0 0 19 11h-2Z"/>
+        </svg>
+        <span class="voip-slash" aria-hidden="true"></span>
+        <svg class="voip-megaphone" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M3 10v4h3l4 4V6L6 10H3Zm9-1.5v7a4 4 0 0 0 0-7Zm0-3v2.05a6 6 0 0 1 0 8.9v2.05a8 8 0 0 0 0-13Z"/>
+        </svg>
+      </button>
+    </div>
+    <audio id="organization-audio-player" autoplay playsinline></audio>
+    <p id="voip-status" class="secondary">VoIP microphones are off.</p>
+    <form method="post"
+          action="/{{ organization.designator|lower }}/streams/requests/{{ active_media_request_id }}/stop"
+          style="margin-top:12px">
+      <input type="hidden" name="form_token" value="{{ csrf_token }}">
+      <button class="cancel-button" type="submit">Stop video</button>
+    </form>
+  </section>
+  {% endif %}
+
+  {% set live_streams = streams|selectattr("media_kind", "equalto", "live")|list %}
+  {% set recorded_streams = streams|selectattr("media_kind", "equalto", "recording")|list %}
+  {% for session_title, session_streams, session_kind in (("Live sessions", live_streams, "live"), ("Recorded sessions", recorded_streams, "recording")) %}
   <section class="streams-panel">
-    <h2>Current tablet session</h2>
-    {% if streams %}
+    <h2>{{ session_title }}</h2>
+    {% if session_streams %}
     <div style="overflow-x:auto">
       <table class="stream-table">
         <thead>
           <tr>
             <th>Preview</th>
-            <th>Type</th>
+            {% if session_kind == "recording" %}<th>Recorded</th>{% endif %}
             <th>Incident</th>
             <th>Drone</th>
             <th>R2C instance</th>
             <th>Source</th>
-            <th>Recording</th>
+            <th>{% if session_kind == "recording" %}Recording{% else %}Live video{% endif %}</th>
           </tr>
         </thead>
         <tbody>
-        {% for stream in streams %}
+        {% for stream in session_streams %}
           {% set active_consumer = active_consumers_by_device_id.get(stream.device_credential_id) %}
           {% set recording_download = recording_downloads_by_session.get(stream.session_id) %}
           <tr data-stream-session-id="{{ stream.session_id }}">
@@ -378,9 +427,8 @@
               <span class="secondary">Preview pending</span>
               {% endif %}
             </td>
+            {% if session_kind == "recording" %}
             <td>
-              {% if recording_downloads_enabled and stream.media_kind == "recording" %}
-              <strong>Recorded</strong>
               {% if stream.recorded_at_local %}
               <span class="secondary" style="display:block">
                 {{ stream.recorded_at_local.strftime("%d %b %Y %I:%M:%S %p %Z") }}
@@ -391,10 +439,8 @@
                 {{ (stream.duration_ms / 1000)|round|int|duration_clock }}
               </span>
               {% endif %}
-              {% else %}
-              <strong>Live</strong>
-              {% endif %}
             </td>
+            {% endif %}
             <td><strong>{{ stream.incident_name }}</strong></td>
             <td>{{ stream.drone_designator }}</td>
             <td>{{ stream.device_name }}</td>
@@ -457,57 +503,12 @@
     </div>
     {% else %}
     <p class="empty-state">
-      {% if tablet_device %}This R2C instance is not{% else %}No drone teams are{% endif %} advertising video right now. This page will update
+      {% if session_kind == "live" %}{% if tablet_device %}This R2C instance is not{% else %}No drone teams are{% endif %} advertising live video right now.{% else %}No recordings are available for this R2C instance.{% endif %} This page will update
       automatically when a stream becomes available while the page has focus.
     </p>
     {% endif %}
   </section>
-
-  {% if active_media_request_id %}
-  <section class="streams-panel" id="video-viewer-panel">
-    <h2>Live video</h2>
-    {% if active_media_request and active_media_request.route_kind != "unknown" %}
-    <p>
-      Measured link:
-      <span class="route-chip"
-            data-route="{{ active_media_request.route_kind }}">
-        {{ active_media_request.route_kind|capitalize }}
-      </span>
-      {% if active_media_request.estimated_uplink_bps %}
-      <span class="secondary">
-        {{ "%.1f"|format(active_media_request.estimated_uplink_bps / 1000000) }}
-        Mbps usable
-      </span>
-      {% endif %}
-    </p>
-    {% endif %}
-    <p id="video-media-status" class="secondary">Preparing the authorized media path…</p>
-    <div class="media-player-shell">
-      <video id="organization-video-player"
-             autoplay muted playsinline controls
-             style="display:none;width:100%;max-height:70vh;background:#111;border-radius:8px"></video>
-      <button id="voip-toggle" class="voip-toggle" type="button"
-              aria-label="Turn microphone on" aria-pressed="false"
-              title="Microphone off" style="display:none">
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-          <path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21H8v2h8v-2h-3v-3.08A7 7 0 0 0 19 11h-2Z"/>
-        </svg>
-        <span class="voip-slash" aria-hidden="true"></span>
-        <svg class="voip-megaphone" viewBox="0 0 24 24" aria-hidden="true">
-          <path d="M3 10v4h3l4 4V6L6 10H3Zm9-1.5v7a4 4 0 0 0 0-7Zm0-3v2.05a6 6 0 0 1 0 8.9v2.05a8 8 0 0 0 0-13Z"/>
-        </svg>
-      </button>
-    </div>
-    <audio id="organization-audio-player" autoplay playsinline></audio>
-    <p id="voip-status" class="secondary">VoIP microphones are off.</p>
-    <form method="post"
-          action="/{{ organization.designator|lower }}/streams/requests/{{ active_media_request_id }}/stop"
-          style="margin-top:12px">
-      <input type="hidden" name="form_token" value="{{ csrf_token }}">
-      <button class="cancel-button" type="submit">Stop video</button>
-    </form>
-  </section>
-  {% endif %}
+  {% endfor %}
 
   <section class="streams-panel">
     <h2>Your recent requests</h2>
@@ -616,6 +617,6 @@
      data-designator="{{ organization.designator|lower }}"
      data-form-token="{{ csrf_token }}"
      data-ice-servers='{{ video_ice_servers|tojson }}'></div>
-<script src="/static/video_media.js?v=20260813-3" defer></script>
+<script src="/static/video_media.js?v=20260814-1" defer></script>
 {% endif %}
 {% endblock %}

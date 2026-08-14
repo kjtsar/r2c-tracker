@@ -47,6 +47,7 @@
   let videoPacketsReceived = 0;
   let videoFramesReceived = 0;
   let videoFramesDecoded = 0;
+  let firstFrameShown = false;
   let videoFramesPresented = 0;
   let videoFramesDropped = 0;
   let videoKeyFramesDecoded = 0;
@@ -317,6 +318,11 @@
     videoBytesReceived = inspectedVideoBytesReceived;
     await reportMetrics(false, false).catch(function () {});
     const now = Date.now();
+    if (!firstFrameShown && decodedFrames > 0) {
+      firstFrameShown = true;
+      show("Video is playing.", "playing");
+      reportDiagnostic("video_first_frame", `${video.videoWidth}x${video.videoHeight}`);
+    }
     if (!startedReported && (videoBytesReceived > 0 || decodedFrames > 0)) {
       await reportStarted().catch(function () {});
     }

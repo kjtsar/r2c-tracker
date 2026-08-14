@@ -32,6 +32,8 @@ GATE_SECRET = os.environ.get("DEPLOYMENT_GATE_KEY_SECRET_NAME", "r2c-deployment-
 CONFIG = os.environ.get("CLOUDSDK_ACTIVE_CONFIG_NAME", "r2c-tracker-pilot")
 STAGING_SERVICE = "r2c-tracker-staging"
 STAGING_GATE_SECRET = "r2c-staging-deployment-gate-key"  # pragma: allowlist secret
+BYPASS_ALLOWED_PATH_PREFIXES = ("static/", "templates/", "tests/")
+BYPASS_ALLOWED_PATHS = {"changes.txt"}
 
 
 def run(*args: str, capture: bool = False, env: dict[str, str] | None = None) -> str:
@@ -58,6 +60,34 @@ def committed_source_snapshot():
         with tarfile.open(archive_path) as archive:
             archive.extractall(source_path, filter="data")
         yield source_path
+
+
+def validate_bypass_change_scope() -> tuple[str, tuple[str, ...]]:
+    """Restrict the bypass path to presentation-only releases."""
+    try:
+        previous_tag = run(
+            "git", "describe", "--tags", "--abbrev=0", "HEAD^", capture=True
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            "Bypassing safety checks requires a prior release tag for comparison."
+        ) from exc
+    changed_paths = tuple(filter(None, run(
+        "git", "diff", "--name-only", f"{previous_tag}..HEAD", capture=True
+    ).splitlines()))
+    unsafe_paths = tuple(
+        path for path in changed_paths
+        if path not in BYPASS_ALLOWED_PATHS
+        and not path.startswith(BYPASS_ALLOWED_PATH_PREFIXES)
+    )
+    if unsafe_paths:
+        raise RuntimeError(
+            "--bypass-safety-checks is limited to presentation-only changes; "
+            "the normal guarded release is required for: " + ", ".join(unsafe_paths)
+        )
+    if not changed_paths:
+        raise RuntimeError("No changes were found since the prior release tag.")
+    return previous_tag, changed_paths
 
 
 def gcloud(*args: str, capture: bool = False, input_text: str | None = None) -> str:
@@ -267,7 +297,12 @@ def staging_regression(base_url: str, expected_version: str) -> None:
     print(f"Authenticated staging regression passed against {base_url}.")
 
 
-def regression(base_url: str, expected_version: str = "") -> None:
+def regression(
+    base_url: str,
+    expected_version: str = "",
+    *,
+    require_activity_gate: bool = True,
+) -> None:
     gate_key = secret_value(GATE_SECRET)
     request(f"{base_url}/deployment-readiness", expected=403)
     _, live_body = request(f"{base_url}/livez")
@@ -280,7 +315,8 @@ def regression(base_url: str, expected_version: str = "") -> None:
         raise RuntimeError(
             f"Candidate reports {live.get('version')!r}; expected {expected_version!r}."
         )
-    deployment_readiness(base_url, gate_key, storage_probe=True)
+    if require_activity_gate:
+        deployment_readiness(base_url, gate_key, storage_probe=True)
     for path in ("/", "/versions"):
         request(f"{base_url}{path}")
     request(
@@ -342,7 +378,12 @@ def validate_staging_reuse_state() -> dict:
     return state
 
 
-def deploy_candidate(app_version_code: int, bootstrap: bool, reuse_staging: bool) -> None:
+def deploy_candidate(
+    app_version_code: int,
+    bootstrap: bool,
+    reuse_staging: bool,
+    bypass_safety_checks: bool,
+) -> None:
     if run("git", "status", "--porcelain", capture=True):
         raise RuntimeError("Refusing to deploy an uncommitted or dirty worktree.")
     try:
@@ -351,6 +392,44 @@ def deploy_candidate(app_version_code: int, bootstrap: bool, reuse_staging: bool
         )
     except subprocess.CalledProcessError as exc:
         raise RuntimeError("Refusing to deploy an untagged commit.") from exc
+    if bypass_safety_checks and (bootstrap or reuse_staging):
+        raise RuntimeError(
+            "--bypass-safety-checks cannot be combined with --bootstrap or --reuse-staging."
+        )
+    if bypass_safety_checks:
+        previous_tag, changed_paths = validate_bypass_change_scope()
+        print("WARNING: BYPASSING IDLE, STAGING-DATABASE, AND HOSTED-STAGING SAFETY CHECKS.")
+        print(f"Presentation-only scope accepted relative to {previous_tag}:")
+        for path in changed_paths:
+            print(f"  {path}")
+        ensure_gate_secret()
+        description = service_description()
+        previous_revision = serving_revision(description)
+        deploy_env = dict(os.environ)
+        deploy_env.update({
+            "ACTIVATE_LATEST_REVISION": "0",
+            "REVISION_TAG": "candidate",
+            "DEPLOYMENT_GATE_KEY_SECRET_NAME": GATE_SECRET,
+        })
+        deploy_env.pop("CONTAINER_IMAGE", None)
+        with committed_source_snapshot() as source_path:
+            deploy_env["DEPLOY_SOURCE_DIR"] = str(source_path)
+            run(str(ROOT / "deploy_pilot.sh"), str(app_version_code), env=deploy_env)
+        candidate_revision, candidate_url = tagged_candidate(service_description())
+        state = {
+            "bypassed_safety_checks": True,
+            "candidate_revision": candidate_revision,
+            "candidate_url": candidate_url,
+            "expected_version": expected_version,
+            "previous_revision": previous_revision,
+            "public_url": PUBLIC_URL,
+            "status": "candidate",
+        }
+        save_state(state)
+        regression(candidate_url, expected_version, require_activity_gate=False)
+        print(f"Bypass candidate ready: {candidate_revision}")
+        print("Production traffic is unchanged. Promotion requires --bypass-safety-checks again.")
+        return
     if reuse_staging:
         validate_staging_reuse_state()
     ensure_gate_secret()
@@ -453,22 +532,38 @@ def deploy_candidate(app_version_code: int, bootstrap: bool, reuse_staging: bool
 
 def test_candidate() -> None:
     state = load_state()
-    regression(state["candidate_url"], state.get("expected_version", ""))
+    regression(
+        state["candidate_url"],
+        state.get("expected_version", ""),
+        require_activity_gate=not state.get("bypassed_safety_checks", False),
+    )
 
 
-def promote_candidate(*, bootstrap: bool) -> None:
+def promote_candidate(*, bootstrap: bool, bypass_safety_checks: bool) -> None:
     state = load_state()
+    recorded_bypass = bool(state.get("bypassed_safety_checks", False))
+    if bypass_safety_checks != recorded_bypass:
+        raise RuntimeError(
+            "Promotion must repeat --bypass-safety-checks exactly when the candidate used it."
+        )
     if bootstrap and not state.get("bootstrap"):
         raise RuntimeError("Bootstrap promotion is allowed only for the recorded first gate release.")
-    regression(state["candidate_url"], state.get("expected_version", ""))
-    try:
-        deployment_readiness(state["public_url"], secret_value(GATE_SECRET))
-    except RuntimeError as exc:
-        if not bootstrap:
-            raise
-        if not is_bootstrap_gate_unavailable(exc):
-            raise
-        print("Bootstrap acknowledged: live activity was manually rechecked before promotion.")
+    regression(
+        state["candidate_url"],
+        state.get("expected_version", ""),
+        require_activity_gate=not bypass_safety_checks,
+    )
+    if bypass_safety_checks:
+        print("WARNING: Promoting without checking whether tracker clients are active.")
+    else:
+        try:
+            deployment_readiness(state["public_url"], secret_value(GATE_SECRET))
+        except RuntimeError as exc:
+            if not bootstrap:
+                raise
+            if not is_bootstrap_gate_unavailable(exc):
+                raise
+            print("Bootstrap acknowledged: live activity was manually rechecked before promotion.")
     gcloud(
         "run", "services", "update-traffic", SERVICE,
         "--project", PROJECT, "--region", REGION,
@@ -521,17 +616,27 @@ def main() -> None:
         action="store_true",
         help="reuse validated isolated staging resources and refresh their database clones",
     )
+    deploy_parser.add_argument("--bypass-safety-checks", action="store_true")
     subparsers.add_parser("test-candidate")
     promote_parser = subparsers.add_parser("promote")
     promote_parser.add_argument("--bootstrap", action="store_true")
+    promote_parser.add_argument("--bypass-safety-checks", action="store_true")
     subparsers.add_parser("rollback")
     args = parser.parse_args()
     if args.command == "deploy-candidate":
-        deploy_candidate(args.app_version_code, args.bootstrap, args.reuse_staging)
+        deploy_candidate(
+            args.app_version_code,
+            args.bootstrap,
+            args.reuse_staging,
+            args.bypass_safety_checks,
+        )
     elif args.command == "test-candidate":
         test_candidate()
     elif args.command == "promote":
-        promote_candidate(bootstrap=args.bootstrap)
+        promote_candidate(
+            bootstrap=args.bootstrap,
+            bypass_safety_checks=args.bypass_safety_checks,
+        )
     elif args.command == "rollback":
         rollback()
 

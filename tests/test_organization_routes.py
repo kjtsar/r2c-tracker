@@ -299,6 +299,24 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn('class="stream-actions"', template)
         self.assertTrue(main.RECORDING_DOWNLOADS_ENABLED)
 
+    def test_live_player_and_sessions_are_presented_in_operational_order(self):
+        template = Path("templates/organization_streams.html").read_text()
+
+        self.assertIn('("Live sessions", live_streams, "live")', template)
+        self.assertIn('("Recorded sessions", recorded_streams, "recording")', template)
+        self.assertNotIn("Current tablet session", template)
+        self.assertLess(
+            template.index('id="video-viewer-panel"'),
+            template.index('("Live sessions", live_streams, "live")'),
+        )
+
+    def test_video_status_changes_after_the_first_decoded_frame(self):
+        script = Path("static/video_media.js").read_text()
+
+        self.assertIn("!firstFrameShown && decodedFrames > 0", script)
+        self.assertIn('show("Video is playing.", "playing")', script)
+        self.assertIn('reportDiagnostic("video_first_frame"', script)
+
     def test_recording_spool_reaper_removes_only_expired_transfer_files(self):
         spool_root = Path(self.temp_dir.name) / "organizations" / "ncssar" / "recordings" / "session"
         spool_root.mkdir(parents=True)
@@ -385,7 +403,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             'reportDiagnostic("video_play_rejected"',
         ):
             self.assertIn(diagnostic, script)
-        self.assertIn("video_media.js?v=20260813-3", template)
+        self.assertIn("video_media.js?v=20260814-1", template)
 
     def test_media_offer_posts_on_first_relay_candidate(self):
         script = Path("static/video_media.js").read_text()

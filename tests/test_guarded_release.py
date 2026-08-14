@@ -1,6 +1,7 @@
 import pathlib
 import importlib.util
 import json
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -61,6 +62,57 @@ class GuardedReleaseTest(unittest.TestCase):
         ):
             self.assertTrue((self.root / name).exists())
             self.assertIn(".venv/bin/python", (self.root / name).read_text())
+
+    def test_presentation_bypass_is_explicit_scoped_and_repeatable(self):
+        guard = (self.root / "scripts" / "release_guard.py").read_text()
+        publisher = self.root / "publish_release.sh"
+
+        self.assertTrue(publisher.is_file())
+        self.assertIn("--bypass-safety-checks", publisher.read_text())
+        self.assertIn("./qualify_release.sh", publisher.read_text())
+        self.assertIn('BYPASS_ALLOWED_PATH_PREFIXES = ("static/", "templates/", "tests/")', guard)
+        self.assertIn('BYPASS_ALLOWED_PATHS = {"changes.txt"}', guard)
+        self.assertIn("validate_bypass_change_scope()", guard)
+        self.assertIn('require_activity_gate=False', guard)
+        self.assertIn('deploy_env.pop("CONTAINER_IMAGE", None)', guard)
+        self.assertIn("Promotion must repeat --bypass-safety-checks", guard)
+        self.assertIn('"bypassed_safety_checks": True', guard)
+
+        rejected = subprocess.run(
+            ["sh", str(publisher), "--ui-test", "133"],
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(2, rejected.returncode)
+        self.assertIn("--bypass-safety-checks", rejected.stderr)
+
+    def test_presentation_bypass_change_scope_rejects_backend_files(self):
+        spec = importlib.util.spec_from_file_location(
+            "release_guard_bypass_test",
+            self.root / "scripts" / "release_guard.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        def allowed_run(*args, capture=False, env=None):
+            if args[1] == "describe":
+                return "v1.4.41"
+            return "templates/organization_streams.html\nstatic/video_media.js\ntests/test_organization_routes.py\nchanges.txt"
+
+        with mock.patch.object(module, "run", side_effect=allowed_run):
+            previous_tag, paths = module.validate_bypass_change_scope()
+        self.assertEqual("v1.4.41", previous_tag)
+        self.assertIn("static/video_media.js", paths)
+
+        def unsafe_run(*args, capture=False, env=None):
+            if args[1] == "describe":
+                return "v1.4.41"
+            return "templates/organization_streams.html\nmain.py"
+
+        with mock.patch.object(module, "run", side_effect=unsafe_run):
+            with self.assertRaisesRegex(RuntimeError, "normal guarded release.*main.py"):
+                module.validate_bypass_change_scope()
 
     def test_local_release_gate_checks_migration_rollback_compatibility(self):
         release_check = (self.root / "release_check.sh").read_text()
