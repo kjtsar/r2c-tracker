@@ -380,7 +380,7 @@
               {% endif %}
             </td>
             <td>
-              {% if stream.media_kind == "recording" %}
+              {% if recording_downloads_enabled and stream.media_kind == "recording" %}
               <strong>Recorded</strong>
               {% if stream.recorded_at_local %}
               <span class="secondary" style="display:block">
@@ -610,6 +610,7 @@
      data-in-progress-session-ids="{{ request_in_progress_session_ids | list | sort | tojson | forceescape }}"
      data-status-url="/{{ organization.designator|lower }}/streams/live-status"></div>
 <script src="/static/organization_streams_live.js?v=20260813-2" defer></script>
+{% if recording_downloads_enabled %}
 {% for recording_download in recording_downloads_by_session.values() %}
 {% if recording_download.state in ("awaiting_approval", "approved", "uploading") %}
 <div class="recording-download-status" hidden
@@ -618,6 +619,7 @@
 {% endif %}
 {% endfor %}
 <script src="/static/recording_download_status.js?v=20260813-2" defer></script>
+{% endif %}
 {% if active_preflight_request_id %}
 <script src="/static/video_preflight.js?v=20260812-1" defer></script>
 {% endif %}

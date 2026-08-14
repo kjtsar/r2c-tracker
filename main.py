@@ -527,6 +527,9 @@ def resolve_tracker_version() -> str:
 TRACKER_VERSION = resolve_tracker_version()
 
 BASE_LOG_DIRECTORY = '/flightlogs-vol'
+# Tracker-side recording persistence remains disabled until retention,
+# deletion, capacity, and audit policies are explicitly established.
+RECORDING_DOWNLOADS_ENABLED = False
 FLIGHTLOGS_STORAGE_REQUIRED = os.environ.get(
     "FLIGHTLOGS_STORAGE_REQUIRED", "false"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -8206,6 +8209,7 @@ async def organization_streams(
             ),
             "active_consumers_by_device_id": active_consumers_by_device_id,
             "remote_control_enabled": remote_control_enabled,
+            "recording_downloads_enabled": RECORDING_DOWNLOADS_ENABLED,
             "recording_downloads_by_session": {
                 item.stream_session_id: item
                 for item in recording_download_requests
@@ -8382,6 +8386,8 @@ async def organization_request_recording_download(
     organization, user = await require_organization_user(
         request, designator, ("video_requester",)
     )
+    if not RECORDING_DOWNLOADS_ENABLED:
+        raise HTTPException(status_code=404, detail="Recording downloads are not enabled.")
     try:
         item = await control_plane_store.create_recording_download_request(
             organization_id=organization.id,
@@ -8413,6 +8419,8 @@ async def upload_recording_download(
         credential: Optional[DeviceCredentialRecord] = Depends(get_api_key)):
     if credential is None:
         raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="Device credential required")
+    if not RECORDING_DOWNLOADS_ENABLED:
+        raise HTTPException(status_code=404, detail="Recording downloads are not enabled.")
     try:
         item = await control_plane_store.get_recording_download_request(
             request_id=request_id, device_credential_id=credential.id,
@@ -8518,6 +8526,8 @@ async def organization_recording_download(
     organization, _user = await require_organization_user(
         request, designator, ("video_requester",)
     )
+    if not RECORDING_DOWNLOADS_ENABLED:
+        raise HTTPException(status_code=404, detail="Recording downloads are not enabled.")
     item, path = await authorized_recording_copy(organization, request_id)
     return FileResponse(
         path, media_type=item.media_type, filename=item.filename,
@@ -8531,6 +8541,8 @@ async def organization_recording_playback(
     organization, _user = await require_organization_user(
         request, designator, ("video_requester",)
     )
+    if not RECORDING_DOWNLOADS_ENABLED:
+        raise HTTPException(status_code=404, detail="Recording downloads are not enabled.")
     item, path = await authorized_recording_copy(organization, request_id)
     return FileResponse(
         path, media_type=item.media_type,
@@ -8544,6 +8556,8 @@ async def organization_recording_download_status(
     organization, user = await require_organization_user(
         request, designator, ("video_requester",)
     )
+    if not RECORDING_DOWNLOADS_ENABLED:
+        raise HTTPException(status_code=404, detail="Recording downloads are not enabled.")
     try:
         item = await control_plane_store.get_recording_download_request(
             request_id=request_id, organization_id=organization.id,

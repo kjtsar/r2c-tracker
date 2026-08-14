@@ -292,6 +292,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn("window.location.assign(item.dataset.downloadUrl)", script)
         self.assertIn("data-download-url=", template)
         self.assertIn('class="stream-actions"', template)
+        self.assertFalse(main.RECORDING_DOWNLOADS_ENABLED)
 
     def test_video_start_marker_retries_until_the_server_acknowledges_it(self):
         script = Path("static/video_media.js").read_text()
@@ -1992,6 +1993,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             )
         )
 
+    @patch.object(main, "RECORDING_DOWNLOADS_ENABLED", True)
     def test_video_requester_sees_sorted_streams_and_request_stays_pending(self):
         organization = asyncio.run(
             self.store.create_organization(
