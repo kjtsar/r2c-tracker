@@ -1,4 +1,7 @@
-v1.4.42:
+v1.4.43:
+* Close negotiated video sessions when no RTP packets arrive instead of waiting forever for a browser playback event that cannot occur.
+
+v1.4.42: superseded before deployment
 * Put the active live-video player first, separate Live sessions from Recorded sessions, and clear the waiting-for-first-frame message once decoded video is playing.
 * Add an explicit presentation-only release shortcut that retains local qualification, zero-traffic candidate verification, health checks, and rollback while clearly requiring --bypass-safety-checks to omit idle and hosted-staging safeguards.
 

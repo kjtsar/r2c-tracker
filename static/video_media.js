@@ -367,6 +367,15 @@
     trackAttachedAt = Date.now();
     videoTrackState = event.track.readyState || "live";
     reportDiagnostic("video_track_attached", `muted=${Boolean(event.track.muted)}`);
+    // A receiver can get a negotiated track before any RTP arrives. Start the
+    // packet deadline here; waiting for HTMLMediaElement.playing would leave a
+    // zero-packet source open forever because that event can never fire.
+    if (!statsTimer) {
+      statsTimer = window.setInterval(function () {
+        inspectFrameProgress().catch(function () {});
+      }, 1500);
+    }
+    inspectFrameProgress().catch(function () {});
     event.track.addEventListener("mute", function () {
       reportDiagnostic("video_track_muted", "");
     });
@@ -393,12 +402,6 @@
   video.addEventListener("playing", function () {
     reportDiagnostic("video_playing", `${video.videoWidth}x${video.videoHeight}`);
     show("Video track attached; waiting for the first video frame…", "connecting");
-    if (!statsTimer) {
-      statsTimer = window.setInterval(function () {
-        inspectFrameProgress().catch(function () {});
-      }, 1500);
-    }
-    inspectFrameProgress().catch(function () {});
   });
   video.addEventListener("waiting", function () {
     reportDiagnostic("video_waiting", "");

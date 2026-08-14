@@ -317,6 +317,15 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn('show("Video is playing.", "playing")', script)
         self.assertIn('reportDiagnostic("video_first_frame"', script)
 
+    def test_video_no_packet_deadline_starts_when_track_attaches(self):
+        script = Path("static/video_media.js").read_text()
+
+        track_handler = script.index('peer.addEventListener("track"')
+        playing_handler = script.index('video.addEventListener("playing"')
+        timer_start = script.index("statsTimer = window.setInterval", track_handler)
+        self.assertLess(timer_start, playing_handler)
+        self.assertIn("now - trackAttachedAt >= 15000", script)
+
     def test_recording_spool_reaper_removes_only_expired_transfer_files(self):
         spool_root = Path(self.temp_dir.name) / "organizations" / "ncssar" / "recordings" / "session"
         spool_root.mkdir(parents=True)
@@ -403,7 +412,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             'reportDiagnostic("video_play_rejected"',
         ):
             self.assertIn(diagnostic, script)
-        self.assertIn("video_media.js?v=20260814-1", template)
+        self.assertIn("video_media.js?v=20260814-2", template)
 
     def test_media_offer_posts_on_first_relay_candidate(self):
         script = Path("static/video_media.js").read_text()
