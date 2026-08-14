@@ -1,3 +1,7 @@
+v1.4.37:
+* Complete an approved recording transfer as one browser action by starting the file download automatically when the tablet upload finishes.
+* Place Download recording beside Play recording, and let authorized users play the tracker-transferred copy without reconnecting to the tablet.
+
 v1.4.36: deployed
 * Let authorized organization video users download a tablet recording as an ordinary browser file, with tablet approval when Remote Video Control is off and automatic transfer when it is on.
 * Transfer recordings from Android and iOS in resumable chunks, retain completed tracker copies for later authorized downloads, and leave the tablet's original recording untouched.

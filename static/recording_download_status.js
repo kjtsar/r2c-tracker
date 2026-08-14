@@ -12,7 +12,15 @@
         });
         if (!response.ok) continue;
         const payload = await response.json();
-        if (["ready", "declined", "failed"].includes(payload.state)) {
+        if (payload.state === "ready") {
+          stopped = true;
+          // A recording download is one user gesture with an asynchronous
+          // tablet-approval/upload phase. Complete that gesture by navigating
+          // to the authorized attachment as soon as the upload is ready.
+          window.location.assign(item.dataset.downloadUrl);
+          return;
+        }
+        if (["declined", "failed"].includes(payload.state)) {
           stopped = true;
           window.location.reload();
           return;

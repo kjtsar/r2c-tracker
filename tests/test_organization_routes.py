@@ -284,6 +284,15 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn("status.inProgressSessionIds", live_script)
         self.assertIn("renderedInProgressSessionIds", live_script)
 
+    def test_recording_transfer_completion_starts_browser_download(self):
+        script = Path("static/recording_download_status.js").read_text()
+        template = Path("templates/organization_streams.html").read_text()
+
+        self.assertIn('payload.state === "ready"', script)
+        self.assertIn("window.location.assign(item.dataset.downloadUrl)", script)
+        self.assertIn("data-download-url=", template)
+        self.assertIn('class="stream-actions"', template)
+
     def test_video_start_marker_retries_until_the_server_acknowledges_it(self):
         script = Path("static/video_media.js").read_text()
 
@@ -2191,6 +2200,16 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             self.assertIn("<td>2B</td>", recording_page.text)
             self.assertNotIn("<td>10A</td>", recording_page.text)
             self.assertIn("Download recording", recording_page.text)
+            recording_row = re.search(
+                r'<tr data-stream-session-id="00000000-0000-0000-0000-000000000002">(.*?)</tr>',
+                recording_page.text,
+                re.DOTALL,
+            ).group(1)
+            self.assertIn('class="stream-actions"', recording_row)
+            self.assertGreater(
+                recording_row.index("Download recording"),
+                recording_row.index('class="stream-actions"'),
+            )
             download_root = Path(self.temp_dir.name) / "recordings"
             with patch.object(main, "BASE_LOG_DIRECTORY", str(download_root)):
                 requested_download = self.client.post(
@@ -2210,6 +2229,11 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                     "decision": "approve",
                 })
                 self.assertTrue(live_websocket.receive_json()["accepted"])
+                pending_page = self.client.get(recording_link.headers["location"])
+                self.assertIn(
+                    f'data-download-url="/ncssar/streams/downloads/{transfer_request["requestId"]}"',
+                    pending_page.text,
+                )
                 first_chunk = self.client.put(
                     transfer_request["uploadPath"],
                     headers={
@@ -2235,6 +2259,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 self.assertEqual(200, uploaded.status_code)
                 ready_page = self.client.get(recording_link.headers["location"])
                 self.assertIn("Download recording", ready_page.text)
+                self.assertIn("Play transferred copy", ready_page.text)
                 downloaded = self.client.get(
                     f"/ncssar/streams/downloads/{transfer_request['requestId']}"
                 )
@@ -2244,6 +2269,12 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                     'attachment; filename="A5-flight.mp4"',
                     downloaded.headers["content-disposition"],
                 )
+                played = self.client.get(
+                    f"/ncssar/streams/downloads/{transfer_request['requestId']}/play"
+                )
+                self.assertEqual(200, played.status_code)
+                self.assertEqual(b"original-recording-bytes", played.content)
+                self.assertNotIn("content-disposition", played.headers)
             live_websocket.send_json({
                 "type": "video_stream_advertisement",
                 "incidentName": "Alpha",

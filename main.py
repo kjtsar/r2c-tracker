@@ -8492,12 +8492,8 @@ async def upload_recording_download(
     return {"accepted": True, "state": completed.state, "bytes": completed.byte_count}
 
 
-@app.get("/{designator}/streams/downloads/{request_id}", response_class=FileResponse)
-async def organization_recording_download(
-        request: Request, designator: str, request_id: str):
-    organization, user = await require_organization_user(
-        request, designator, ("video_requester",)
-    )
+async def authorized_recording_copy(
+        organization, request_id: str):
     try:
         item = await control_plane_store.get_recording_download_request(
             request_id=request_id, organization_id=organization.id,
@@ -8513,8 +8509,31 @@ async def organization_recording_download(
     path = os.path.join(BASE_LOG_DIRECTORY, normalized)
     if not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="Recording file not found.")
+    return item, path
+
+
+@app.get("/{designator}/streams/downloads/{request_id}", response_class=FileResponse)
+async def organization_recording_download(
+        request: Request, designator: str, request_id: str):
+    organization, _user = await require_organization_user(
+        request, designator, ("video_requester",)
+    )
+    item, path = await authorized_recording_copy(organization, request_id)
     return FileResponse(
         path, media_type=item.media_type, filename=item.filename,
+        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+@app.get("/{designator}/streams/downloads/{request_id}/play", response_class=FileResponse)
+async def organization_recording_playback(
+        request: Request, designator: str, request_id: str):
+    organization, _user = await require_organization_user(
+        request, designator, ("video_requester",)
+    )
+    item, path = await authorized_recording_copy(organization, request_id)
+    return FileResponse(
+        path, media_type=item.media_type,
         headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
     )
 
