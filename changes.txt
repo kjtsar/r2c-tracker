@@ -1,4 +1,4 @@
-v1.4.36: pending review
+v1.4.36: deployed
 * Let authorized organization video users download a tablet recording as an ordinary browser file, with tablet approval when Remote Video Control is off and automatic transfer when it is on.
 * Transfer recordings from Android and iOS in resumable chunks, retain completed tracker copies for later authorized downloads, and leave the tablet's original recording untouched.
 * Keep active WebRTC requests intact while tablet stream membership changes, and promptly clear completed, failed, or pilot-terminated requests from the current-session page.
