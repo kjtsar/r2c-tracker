@@ -1,4 +1,4 @@
-v1.4.43:
+v1.4.43: deployed
 * Close negotiated video sessions when no RTP packets arrive instead of waiting forever for a browser playback event that cannot occur.
 
 v1.4.42: superseded before deployment
