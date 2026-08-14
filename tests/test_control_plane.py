@@ -920,6 +920,9 @@ class ControlPlaneStoreTest(unittest.TestCase):
         self.assertEqual("unknown", request.route_kind)
         self.assertEqual(owner.email, request.requester_email)
         self.assertEqual("America/Los_Angeles", request.timezone_name)
+        self.assertEqual(
+            self.now + timedelta(seconds=90), request.expires_at
+        )
         self.assertEqual(2, request.requested_at_local.hour)
         self.assertEqual("PDT", request.requested_at_local.tzname())
         with self.assertRaisesRegex(
@@ -983,6 +986,9 @@ class ControlPlaneStoreTest(unittest.TestCase):
         self.assertEqual("awaiting_approval", preflight.state)
         self.assertEqual("direct", preflight.route_kind)
         self.assertEqual(8_000_000, preflight.estimated_uplink_bps)
+        self.assertEqual(
+            self.now + timedelta(seconds=90), preflight.expires_at
+        )
         approved = asyncio.run(
             self.store.record_video_stream_decision(
                 request_id=request.id,
@@ -999,6 +1005,9 @@ class ControlPlaneStoreTest(unittest.TestCase):
         self.assertEqual(1920, approved.selected_width)
         self.assertEqual(15, approved.selected_fps)
         self.assertEqual(2_000_000, approved.selected_bitrate_bps)
+        self.assertEqual(
+            self.now + timedelta(seconds=633), approved.expires_at
+        )
         media_offer_sdp = (
             "v=0\r\n"
             "o=- 3 4 IN IP4 127.0.0.1\r\n"
@@ -1240,7 +1249,7 @@ class ControlPlaneStoreTest(unittest.TestCase):
             )
         )
         self.assertEqual(
-            1,
+            0,
             asyncio.run(
                 self.store.cleanup_expired_video_preflight_exchanges(
                     now=self.now + timedelta(minutes=11),

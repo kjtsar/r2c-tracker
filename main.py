@@ -1196,6 +1196,7 @@ class R2CZoneConnection:
         self.hello_received_at_ms: int = 0
         self.last_seen_ms: int = 0
         self.remote_video_control_enabled: bool = False
+        self.video_inventory_reconciled: bool = False
         self.sent_confirmed_event_keys: set[str] = set()
 
 
@@ -2159,8 +2160,12 @@ class R2CCoordinationHub:
         async with self._lock:
             conn = self._connections.get(websocket)
             credential = conn.device_credential if conn is not None else None
+            first_inventory_after_connect = bool(
+                conn is not None and not conn.video_inventory_reconciled
+            )
             if conn is not None:
                 conn.remote_video_control_enabled = remote_control_enabled
+                conn.video_inventory_reconciled = True
         if credential is None or control_plane_store is None:
             await websocket.send_text(
                 json.dumps(
@@ -2228,7 +2233,15 @@ class R2CCoordinationHub:
             organization_id=credential.organization_id,
             device_credential_id=credential.id,
             active_session_ids=accepted_session_ids,
+            notify_even_if_unchanged=first_inventory_after_connect,
         )
+        if first_inventory_after_connect:
+            # A reconnect is an authoritative, event-driven repair boundary.
+            # Wake focused viewers once even if the prior 45-second presence
+            # lease made the accepted session set look unchanged.
+            await organization_stream_event_hub.broadcast(
+                credential.organization_id
+            )
         pending_requests = await self._pending_video_stream_requests(
             credential.id
         )
@@ -2237,6 +2250,11 @@ class R2CCoordinationHub:
         )
         pending_media_offers = await self._pending_video_media_offers(
             credential.id
+        )
+        pending_recording_downloads = (
+            await self._pending_recording_download_requests(credential.id)
+            if first_inventory_after_connect
+            else ()
         )
         await websocket.send_text(
             json.dumps(
@@ -2268,6 +2286,8 @@ class R2CCoordinationHub:
             await self.send_video_preflight_offer(exchange)
         for exchange in pending_media_offers:
             await self.send_video_media_offer(exchange)
+        for recording_download in pending_recording_downloads:
+            await self.send_recording_download_request(recording_download)
 
     async def _pending_video_stream_requests(
         self,
@@ -2586,6 +2606,24 @@ class R2CCoordinationHub:
             )
             return ()
 
+    async def _pending_recording_download_requests(
+        self,
+        device_credential_id: str,
+    ) -> tuple:
+        if control_plane_store is None:
+            return ()
+        try:
+            return await control_plane_store.list_pending_recording_download_requests_for_device(
+                device_credential_id=device_credential_id
+            )
+        except Exception:
+            logger.warning(
+                "Recording download replay lookup failed for device=%s",
+                device_credential_id,
+                exc_info=True,
+            )
+            return ()
+
     async def send_video_preflight_offer(self, exchange) -> bool:
         ice_servers = await video_ice_server_provider.get_ice_servers()
         async with self._lock:
@@ -2726,29 +2764,6 @@ class R2CCoordinationHub:
             websocket = connection.websocket if connection is not None else None
         if websocket is None:
             return False
-
-    async def send_recording_download_request(self, item) -> bool:
-        async with self._lock:
-            connections = self._device_connections_locked(item.device_credential_id)
-            websocket = connections[0].websocket if connections else None
-        if websocket is None:
-            return False
-        try:
-            await websocket.send_text(json.dumps({
-                "type": "recording_download_request",
-                "requestId": item.id,
-                "requesterEmail": item.requester_email,
-                "streamSessionId": item.stream_session_id,
-                "droneDesignator": item.drone_designator,
-                "uploadPath": f"/recording-downloads/{item.id}/content",
-                "expiresAt": item.expires_at.isoformat(),
-                "consentRequired": not item.remote_control_enabled,
-                "remoteControlEnabled": item.remote_control_enabled,
-            }))
-            return True
-        except Exception:
-            logger.warning("Recording download request delivery failed", exc_info=True)
-            return False
         try:
             await websocket.send_text(
                 json.dumps(
@@ -2777,6 +2792,32 @@ class R2CCoordinationHub:
                 device_credential_id,
                 exc_info=True,
             )
+            return False
+
+    async def send_recording_download_request(self, item) -> bool:
+        async with self._lock:
+            connections = self._device_connections_locked(item.device_credential_id)
+            websocket = connections[0].websocket if connections else None
+        if websocket is None:
+            return False
+        try:
+            await websocket.send_text(json.dumps({
+                "type": "recording_download_request",
+                "requestId": item.id,
+                "requesterEmail": item.requester_email,
+                "streamSessionId": item.stream_session_id,
+                "droneDesignator": item.drone_designator,
+                "uploadPath": f"/recording-downloads/{item.id}/content",
+                "expiresAt": item.expires_at.isoformat(),
+                "consentRequired": (
+                    item.state == "awaiting_approval"
+                    and not item.remote_control_enabled
+                ),
+                "remoteControlEnabled": item.remote_control_enabled,
+            }))
+            return True
+        except Exception:
+            logger.warning("Recording download request delivery failed", exc_info=True)
             return False
 
     async def send_video_stream_request_cancelled(
@@ -8502,6 +8543,13 @@ async def upload_recording_download(
         )
     if item.state not in {"approved", "uploading"}:
         raise HTTPException(status_code=409, detail="Recording transfer is not authorized.")
+    try:
+        item = await control_plane_store.mark_recording_download_uploading(
+            request_id=request_id,
+            device_credential_id=credential.id,
+        )
+    except ControlPlaneError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     raw_filename = request.headers.get("X-R2C-Filename", "recording.mp4")
     filename = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(raw_filename))[:240]
     if not filename:

@@ -10,7 +10,7 @@ import tarfile
 import tempfile
 import unittest
 from contextlib import ExitStack
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -290,6 +290,10 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         template = Path("templates/organization_streams.html").read_text()
 
         self.assertIn('payload.state === "ready"', script)
+        self.assertIn('payload.state === "approved"', script)
+        self.assertIn('payload.state === "uploading"', script)
+        self.assertIn("[data-flash-message]", script)
+        self.assertIn('"expired"', script)
         self.assertIn("window.location.assign(item.dataset.downloadUrl)", script)
         self.assertIn("data-download-url=", template)
         self.assertIn('class="stream-actions"', template)
@@ -2117,7 +2121,9 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             streams_page.text.index("<td>2B</td>"),
         )
         self.assertIn("Request video", streams_page.text)
-        self.assertIn("Play recording", streams_page.text)
+        self.assertIn("<th>Recording</th>", streams_page.text)
+        self.assertNotIn("<th>Consumer</th>", streams_page.text)
+        self.assertRegex(streams_page.text, r">\s*Play\s*</button>")
         self.assertIn("10 Aug 2026 12:30:00 PM PDT", streams_page.text)
         self.assertIn("Android video tablet", streams_page.text)
         self.assertIn("R2C instance", streams_page.text)
@@ -2222,7 +2228,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             self.assertEqual(200, recording_page.status_code)
             self.assertIn("<td>2B</td>", recording_page.text)
             self.assertNotIn("<td>10A</td>", recording_page.text)
-            self.assertIn("Download recording", recording_page.text)
+            self.assertRegex(recording_page.text, r">\s*Download\s*</button>")
             recording_row = re.search(
                 r'<tr data-stream-session-id="00000000-0000-0000-0000-000000000002">(.*?)</tr>',
                 recording_page.text,
@@ -2230,7 +2236,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             ).group(1)
             self.assertIn('class="stream-actions"', recording_row)
             self.assertGreater(
-                recording_row.index("Download recording"),
+                recording_row.index(">Download</button>"),
                 recording_row.index('class="stream-actions"'),
             )
             download_root = Path(self.temp_dir.name) / "recordings"
@@ -2246,12 +2252,32 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 transfer_request = live_websocket.receive_json()
                 self.assertEqual("recording_download_request", transfer_request["type"])
                 self.assertTrue(transfer_request["consentRequired"])
+                approval_seconds = (
+                    datetime.fromisoformat(transfer_request["expiresAt"])
+                    - datetime.now(UTC)
+                ).total_seconds()
+                self.assertGreater(approval_seconds, 55)
+                self.assertLessEqual(approval_seconds, 60)
                 live_websocket.send_json({
                     "type": "recording_download_decision",
                     "requestId": transfer_request["requestId"],
                     "decision": "approve",
                 })
                 self.assertTrue(live_websocket.receive_json()["accepted"])
+                approved_transfer = asyncio.run(
+                    self.store.get_recording_download_request(
+                        request_id=transfer_request["requestId"]
+                    )
+                )
+                transfer_seconds = (
+                    approved_transfer.expires_at - datetime.now(UTC)
+                ).total_seconds()
+                self.assertGreater(transfer_seconds, 14 * 60)
+                self.assertLessEqual(transfer_seconds, 15 * 60)
+                self.assertEqual(
+                    "Recording transfer approved; waiting for the tablet to upload it.",
+                    approved_transfer.status_message,
+                )
                 pending_page = self.client.get(recording_link.headers["location"])
                 self.assertIn(
                     f'data-download-url="/ncssar/streams/downloads/{transfer_request["requestId"]}"',
@@ -2281,7 +2307,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 )
                 self.assertEqual(200, uploaded.status_code)
                 ready_page = self.client.get(recording_link.headers["location"])
-                self.assertIn("Download recording", ready_page.text)
+                self.assertRegex(ready_page.text, r">\s*Download\s*</a>")
                 self.assertNotIn("Play transferred copy", ready_page.text)
                 ranged = self.client.get(
                     f"/ncssar/streams/downloads/{transfer_request['requestId']}",
@@ -2530,21 +2556,25 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 replay_ack["type"],
             )
             replayed = replay_websocket.receive_json()
-            if replayed["type"] == "video_stream_request":
-                self.assertEqual(
-                    organization.primary_admin_email,
-                    replayed["requesterEmail"],
-                )
-                self.assertEqual(1920, replayed["sourceWidth"])
-                self.assertEqual(4_000_000, replayed["sourceBitrateBps"])
-                self.assertTrue(replayed["consentRequired"])
-                preflight_offer = replay_websocket.receive_json()
-            else:
-                preflight_offer = replayed
+            self.assertEqual("video_stream_request", replayed["type"])
+            self.assertEqual(
+                organization.primary_admin_email,
+                replayed["requesterEmail"],
+            )
+            self.assertEqual(1920, replayed["sourceWidth"])
+            self.assertEqual(4_000_000, replayed["sourceBitrateBps"])
+            self.assertTrue(replayed["consentRequired"])
+            preflight_offer = replay_websocket.receive_json()
             self.assertEqual("video_preflight_offer", preflight_offer["type"])
             self.assertEqual(request_id, preflight_offer["requestId"])
             self.assertEqual(offer_sdp, preflight_offer["sdp"])
             self.assertEqual(2000, preflight_offer["probeDurationMs"])
+            resumed_recording_transfer = replay_websocket.receive_json()
+            self.assertEqual(
+                "recording_download_request",
+                resumed_recording_transfer["type"],
+            )
+            self.assertFalse(resumed_recording_transfer["consentRequired"])
             answer_sdp = (
                 "v=0\r\n"
                 "o=- 2 3 IN IP4 127.0.0.1\r\n"
@@ -2643,11 +2673,28 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 simulation=True,
             )
         )
-        asyncio.run(
+        owner = asyncio.run(
             self.store.activate_owner(
                 organization.designator,
                 organization.primary_admin_email,
                 "correct horse battery staple",
+            )
+        )
+        campaign = asyncio.run(
+            self.store.create_enrollment_campaign(
+                organization_id=organization.id,
+                label="Reconnect inventory",
+                created_by_user_id=owner.id,
+                expires_in_hours=24,
+                max_redemptions=1,
+            )
+        )
+        device = asyncio.run(
+            self.store.issue_device_credential(
+                campaign_id=campaign.id,
+                organization_id=organization.id,
+                device_name="A5 Pro",
+                platform="android",
             )
         )
         login_page = self.client.get("/ncssar/login")
@@ -2669,10 +2716,19 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             self.assertEqual("ready", ready["type"])
             self.assertFalse(ready["active"])
             self.assertRegex(ready["revision"], r"^[0-9a-f]{20}$")
-            event_websocket.portal.call(
-                main.organization_stream_event_hub.broadcast,
-                organization.id,
-            )
+            with self.client.websocket_connect(
+                "/ncssar/ws/r2c",
+                headers={"X-SAR-Token": device.token},
+            ) as r2c_websocket:
+                r2c_websocket.send_json({
+                    "type": "video_stream_advertisement",
+                    "incidentName": "Reconnect test",
+                    "streams": [{
+                        "sessionId": "00000000-0000-0000-0000-000000000099",
+                        "droneDesignator": "NCS1",
+                    }],
+                })
+                self.assertTrue(r2c_websocket.receive_json()["accepted"])
             self.assertEqual(
                 "streams_changed",
                 event_websocket.receive_json()["type"],

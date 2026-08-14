@@ -1,3 +1,9 @@
+v1.4.41:
+* Expire unanswered live-video and recording-transfer approval requests after 60 seconds, while keeping approved playback and upload windows independently bounded.
+* Reconcile tablet stream and pending-transfer state when an R2C websocket reconnects, without adding periodic tracker polling.
+* Keep recording-transfer progress visible after tablet approval and simplify the current-session recording actions to Play and Download.
+* Restore delivery of live-video requests to connected tablets and reject stale signaling cleanly.
+
 v1.4.40: deployed
 * Keep superseded, never-deployed release notes separate from the current tracker summary on the public version-history page.
 

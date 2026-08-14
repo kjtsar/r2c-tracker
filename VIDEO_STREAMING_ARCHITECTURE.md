@@ -54,7 +54,8 @@ pending -> probing -> awaiting_approval -> approved -> streaming -> stopped
 - `declined`: pilot/VO rejected the request. With no current viewer, the
   requester sees `insufficient bandwidth`; while another viewer is active,
   the requester sees `App already streaming to <email-addr>`.
-- `expired`: no decision was made within ten minutes.
+- `expired`: the next required technical or human response did not arrive
+  within 60 seconds, or an approved ten-minute media authorization ended.
 - `redirected`: the pilot/VO approved a higher-priority request. The displaced
   browser tears down its media peer and shows
   `Stream redirected to <email-addr>`.
@@ -91,7 +92,8 @@ authenticated `/<designator>/ws/r2c` connection. Each advertisement contains:
 
 Presence expires 45 seconds after the last advertisement. The organization
 page orders active records case-insensitively by incident name and then drone
-designator. It refreshes only on user demand; it does not poll.
+designator. A focused page refreshes from lifecycle events, reconnect, or
+explicit user demand; it does not periodically poll the catalog.
 
 Presence does not depend on a stream-to-telemetry association. A newly started
 camera therefore appears immediately in the authenticated tablet inventory
@@ -134,6 +136,15 @@ existing 15-second presence advertisement also replays pending requests from
 the database. This provides cross-instance and reconnect delivery without a
 continuously running event service. Request IDs are idempotency keys, so apps
 must suppress duplicate prompts.
+
+The first authoritative advertisement after every tablet websocket reconnect
+also emits one catalog-change event even if its session IDs still fit inside
+their prior presence lease. This repairs a missed browser notification without
+introducing periodic tracker work.
+
+`pending`, `probing`, and `awaiting_approval` share one maximum 60-second
+request-response window. Approval starts a separate ten-minute media
+authorization, so active playback is not constrained to the response deadline.
 
 ## Two-second link preflight
 

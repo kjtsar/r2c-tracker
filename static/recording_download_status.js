@@ -3,6 +3,18 @@
   const items = Array.from(document.querySelectorAll(".recording-download-status"));
   if (!items.length) return;
   let stopped = false;
+  let lastProgressState = "";
+
+  function showProgress(state, message) {
+    if (state === lastProgressState) return;
+    lastProgressState = state;
+    const flash = Array.from(document.querySelectorAll("[data-flash-message]"))
+      .find((item) => item.textContent.includes("Recording transfer"));
+    if (!flash) return;
+    flash.textContent = message;
+    flash.className = "alert alert-success";
+  }
+
   async function poll() {
     if (stopped || document.hidden) return;
     for (const item of items) {
@@ -12,6 +24,18 @@
         });
         if (!response.ok) continue;
         const payload = await response.json();
+        if (payload.state === "approved") {
+          showProgress(
+            payload.state,
+            payload.statusMessage ||
+              "Recording transfer approved; waiting for the tablet to upload it."
+          );
+        } else if (payload.state === "uploading") {
+          showProgress(
+            payload.state,
+            payload.statusMessage || "Recording transfer is in progress."
+          );
+        }
         if (payload.state === "ready") {
           stopped = true;
           // A recording download is one user gesture with an asynchronous
@@ -20,7 +44,7 @@
           window.location.assign(item.dataset.downloadUrl);
           return;
         }
-        if (["declined", "failed"].includes(payload.state)) {
+        if (["declined", "failed", "expired"].includes(payload.state)) {
           stopped = true;
           window.location.reload();
           return;

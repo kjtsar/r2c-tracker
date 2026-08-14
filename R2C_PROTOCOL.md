@@ -369,6 +369,38 @@ Important behavior:
   accepted owner telemetry; standby clients should park instead of heartbeating
   forever
 
+### 8. Bounded managed-video and recording exchanges
+
+Managed-video control shares this authenticated websocket but does not change
+drone ownership. Every durable request has an `expiresAt` deadline and every
+request ID is idempotent across reconnect replay.
+
+| Tracker request | R2C response | Unanswered resolution |
+| --- | --- | --- |
+| `video_stream_request` | preflight answer/result, then `video_stream_decision` | `pending`, `probing`, or `awaiting_approval` becomes `expired` after 60 seconds |
+| `video_preflight_offer` | `video_preflight_answer` and `video_preflight_result` | the enclosing video request expires; stored SDP and ICE credentials are deleted |
+| `video_media_offer` | `video_media_answer` | the browser stops after its 20-second signaling deadline; the enclosing authorization remains bounded |
+| `recording_download_request` | `recording_download_decision` or an authenticated upload | `awaiting_approval` becomes `expired` after 60 seconds |
+| `video_thumbnail_preview` | none | the preview lease ends after the supplied bounded `ttlSec` |
+
+An approved video decision starts a separate ten-minute media authorization;
+the 60-second human-response deadline is not reused as the playback lifetime.
+An approved recording transfer receives a separate 15-minute upload window.
+Terminal, expired, declined, unavailable, redirected, and stopped requests are
+not replayed after reconnect.
+
+The first authoritative `video_stream_advertisement` after each R2C websocket
+connect reconciles the complete device inventory and emits one stream-change
+notification even when the preceding 45-second presence lease has not expired.
+This is the missed-event repair boundary. Focused browser pages reconcile once
+in response; unfocused pages keep no passive tracker connection and reconcile
+once when focus returns. No periodic catalog poll is required.
+
+Advertisements, decisions, answers, unavailable reports, and termination
+reports receive explicit `*_ack` messages. Cancellation and thumbnail-preview
+messages are one-way: their durable terminal state or bounded lease is the
+resolution, so an additional acknowledgement would add no authority.
+
 ## Zone status broadcasts
 
 Every zone on a map receives `zone_update` payloads like:

@@ -258,7 +258,7 @@
   }
 
   function terminalStatusMessage(current) {
-    if (!["redirected", "declined", "stopped", "e_nosuch_stream"].includes(
+    if (!["redirected", "declined", "stopped", "expired", "e_nosuch_stream"].includes(
       current.state || ""
     )) return "";
     return current.statusMessage || "Video stream stopped.";

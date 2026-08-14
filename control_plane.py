@@ -73,6 +73,10 @@ EMERGENCY_VIDEO_MAX_LONG_EDGE = 640
 EMERGENCY_VIDEO_MAX_FPS = 5.0
 EMERGENCY_VIDEO_MAX_BITRATE_BPS = 200_000
 TABLET_LINK_CODE_DIGEST_BYTES = 4
+VIDEO_RESPONSE_TIMEOUT_SECONDS = 60
+VIDEO_SESSION_AUTHORIZATION_SECONDS = 10 * 60
+RECORDING_APPROVAL_TIMEOUT_SECONDS = 60
+RECORDING_TRANSFER_TIMEOUT_SECONDS = 15 * 60
 
 
 def tablet_link_code(organization_designator: str, device_name: str) -> str:
@@ -4942,6 +4946,7 @@ class ControlPlaneStore:
         organization_id: str,
         device_credential_id: str,
         active_session_ids: Iterable[str],
+        notify_even_if_unchanged: bool = False,
         now: Optional[datetime] = None,
     ) -> int:
         """Retire streams omitted from a device's authoritative advertisement."""
@@ -5009,7 +5014,7 @@ class ControlPlaneStore:
                             VideoMediaExchange.request_id.in_(request_ids)
                         )
                     )
-            if streams:
+            if streams or notify_even_if_unchanged:
                 await self._notify_video_stream_change(session, organization_id)
                 await session.commit()
             return len(streams)
@@ -5096,7 +5101,9 @@ class ControlPlaneStore:
                 remote_control_enabled=bool(stream.remote_control_enabled),
                 state="pending",
                 requested_at=requested_at,
-                expires_at=requested_at + timedelta(minutes=10),
+                expires_at=requested_at + timedelta(
+                    seconds=VIDEO_RESPONSE_TIMEOUT_SECONDS
+                ),
             )
             session.add(request)
             session.add(
@@ -5163,7 +5170,13 @@ class ControlPlaneStore:
                 remote_control_enabled=bool(stream.remote_control_enabled),
                 state=("approved" if stream.remote_control_enabled else "awaiting_approval"),
                 requested_at=requested_at,
-                expires_at=requested_at + timedelta(minutes=15),
+                expires_at=requested_at + timedelta(
+                    seconds=(
+                        RECORDING_TRANSFER_TIMEOUT_SECONDS
+                        if stream.remote_control_enabled
+                        else RECORDING_APPROVAL_TIMEOUT_SECONDS
+                    )
+                ),
             )
             session.add(item)
             session.add(ControlPlaneAuditEvent(
@@ -5181,7 +5194,9 @@ class ControlPlaneStore:
         self, *, request_id: str, organization_id: Optional[str] = None,
         requester_user_id: Optional[str] = None,
         device_credential_id: Optional[str] = None,
+        now: Optional[datetime] = None,
     ) -> RecordingDownloadRequestRecord:
+        checked_at = now or utc_now()
         statement = (select(RecordingDownloadRequest, ActiveVideoStream)
             .join(ActiveVideoStream, ActiveVideoStream.id == RecordingDownloadRequest.active_stream_id)
             .where(RecordingDownloadRequest.id == request_id))
@@ -5192,6 +5207,13 @@ class ControlPlaneStore:
         if device_credential_id is not None:
             statement = statement.where(RecordingDownloadRequest.device_credential_id == device_credential_id)
         async with self.sessions() as session:
+            await self._expire_recording_download_requests(
+                session,
+                checked_at=checked_at,
+                organization_id=organization_id,
+                request_id=request_id,
+            )
+            await session.commit()
             row = (await session.execute(statement)).first()
         if row is None:
             raise ControlPlaneError("Recording download request was not found.")
@@ -5199,8 +5221,9 @@ class ControlPlaneStore:
 
     async def list_recording_download_requests(
         self, *, organization_id: str, requester_user_id: Optional[str] = None,
-        limit: int = 100,
+        limit: int = 100, now: Optional[datetime] = None,
     ) -> tuple[RecordingDownloadRequestRecord, ...]:
+        checked_at = now or utc_now()
         statement = (select(RecordingDownloadRequest, ActiveVideoStream)
             .join(ActiveVideoStream, ActiveVideoStream.id == RecordingDownloadRequest.active_stream_id)
             .where(RecordingDownloadRequest.organization_id == organization_id))
@@ -5209,14 +5232,60 @@ class ControlPlaneStore:
                 RecordingDownloadRequest.requester_user_id == requester_user_id
             )
         async with self.sessions() as session:
+            await self._expire_recording_download_requests(
+                session,
+                checked_at=checked_at,
+                organization_id=organization_id,
+            )
+            await session.commit()
             rows = (await session.execute(statement
                 .order_by(RecordingDownloadRequest.requested_at.desc())
                 .limit(max(1, min(limit, 200))))).all()
         return tuple(self._recording_download_request_record(*row) for row in rows)
 
+    async def list_pending_recording_download_requests_for_device(
+        self,
+        *,
+        device_credential_id: str,
+        now: Optional[datetime] = None,
+        limit: int = 20,
+    ) -> tuple[RecordingDownloadRequestRecord, ...]:
+        checked_at = now or utc_now()
+        statement = (
+            select(RecordingDownloadRequest, ActiveVideoStream)
+            .join(
+                ActiveVideoStream,
+                ActiveVideoStream.id
+                == RecordingDownloadRequest.active_stream_id,
+            )
+            .where(
+                RecordingDownloadRequest.device_credential_id
+                == device_credential_id,
+                RecordingDownloadRequest.state.in_((
+                    "awaiting_approval", "approved",
+                )),
+                RecordingDownloadRequest.expires_at >= checked_at,
+            )
+            .order_by(RecordingDownloadRequest.requested_at)
+            .limit(max(1, min(limit, 50)))
+        )
+        async with self.sessions() as session:
+            await self._expire_recording_download_requests(
+                session,
+                checked_at=checked_at,
+            )
+            await session.commit()
+            rows = (await session.execute(statement)).all()
+        return tuple(
+            self._recording_download_request_record(item, stream)
+            for item, stream in rows
+        )
+
     async def decide_recording_download_request(
         self, *, request_id: str, device_credential_id: str, approved: bool,
+        now: Optional[datetime] = None,
     ) -> RecordingDownloadRequestRecord:
+        decided_at = now or utc_now()
         async with self.sessions() as session:
             row = (await session.execute(
                 select(RecordingDownloadRequest, ActiveVideoStream)
@@ -5226,10 +5295,23 @@ class ControlPlaneStore:
             if row is None or row[0].device_credential_id != device_credential_id:
                 raise ControlPlaneError("Recording download request was not found.")
             item, stream = row
+            if as_utc(item.expires_at) < decided_at:
+                item.state = "expired"
+                item.status_message = "Recording transfer request timed out."
+                await self._notify_video_stream_change(session, item.organization_id)
+                await session.commit()
+                raise ControlPlaneError("Recording download request has expired.")
             if item.state not in {"awaiting_approval", "approved"}:
                 raise ControlPlaneError("Recording download request is no longer awaiting a decision.")
             item.state = "approved" if approved else "declined"
-            item.status_message = "" if approved else "Tablet operator declined the transfer."
+            item.status_message = (
+                "Recording transfer approved; waiting for the tablet to upload it."
+                if approved
+                else "Tablet operator declined the transfer."
+            )
+            item.expires_at = decided_at + timedelta(
+                seconds=RECORDING_TRANSFER_TIMEOUT_SECONDS
+            ) if approved else decided_at
             await self._notify_video_stream_change(session, item.organization_id)
             await session.commit()
             return self._recording_download_request_record(item, stream)
@@ -5249,6 +5331,12 @@ class ControlPlaneStore:
             if row is None or row[0].device_credential_id != device_credential_id:
                 raise ControlPlaneError("Recording download request was not found.")
             item, stream = row
+            if as_utc(item.expires_at) < completed_at:
+                item.state = "expired"
+                item.status_message = "Recording transfer timed out."
+                await self._notify_video_stream_change(session, item.organization_id)
+                await session.commit()
+                raise ControlPlaneError("Recording transfer has expired.")
             if item.state not in {"approved", "uploading"}:
                 raise ControlPlaneError("Recording transfer is not authorized.")
             item.state = "ready"
@@ -5273,6 +5361,86 @@ class ControlPlaneStore:
             await self._notify_video_stream_change(session, item.organization_id)
             await session.commit()
             return self._recording_download_request_record(item, stream)
+
+    async def mark_recording_download_uploading(
+        self,
+        *,
+        request_id: str,
+        device_credential_id: str,
+        now: Optional[datetime] = None,
+    ) -> RecordingDownloadRequestRecord:
+        started_at = now or utc_now()
+        async with self.sessions() as session:
+            row = (await session.execute(
+                select(RecordingDownloadRequest, ActiveVideoStream)
+                .join(
+                    ActiveVideoStream,
+                    ActiveVideoStream.id
+                    == RecordingDownloadRequest.active_stream_id,
+                )
+                .where(RecordingDownloadRequest.id == request_id)
+                .with_for_update()
+            )).first()
+            if row is None or row[0].device_credential_id != device_credential_id:
+                raise ControlPlaneError("Recording download request was not found.")
+            item, stream = row
+            if as_utc(item.expires_at) < started_at:
+                item.state = "expired"
+                item.status_message = "Recording transfer timed out."
+                await self._notify_video_stream_change(
+                    session, item.organization_id
+                )
+                await session.commit()
+                raise ControlPlaneError("Recording transfer has expired.")
+            if item.state not in {"approved", "uploading"}:
+                raise ControlPlaneError("Recording transfer is not authorized.")
+            if item.state == "approved":
+                item.state = "uploading"
+                item.status_message = "Recording transfer is in progress."
+                await self._notify_video_stream_change(
+                    session, item.organization_id
+                )
+                await session.commit()
+            return self._recording_download_request_record(item, stream)
+
+    async def _expire_recording_download_requests(
+        self,
+        session: AsyncSession,
+        *,
+        checked_at: datetime,
+        organization_id: Optional[str] = None,
+        request_id: str = "",
+    ) -> int:
+        statement = select(RecordingDownloadRequest).where(
+            RecordingDownloadRequest.state.in_((
+                "awaiting_approval", "approved", "uploading"
+            )),
+            RecordingDownloadRequest.expires_at < checked_at,
+        )
+        if organization_id is not None:
+            statement = statement.where(
+                RecordingDownloadRequest.organization_id == organization_id
+            )
+        if request_id:
+            statement = statement.where(
+                RecordingDownloadRequest.id == request_id
+            )
+        items = tuple((await session.scalars(statement)).all())
+        for item in items:
+            prior_state = item.state
+            item.state = "expired"
+            item.status_message = (
+                "Recording transfer request timed out."
+                if prior_state == "awaiting_approval"
+                else "Recording transfer timed out."
+            )
+        for expired_organization_id in {
+            item.organization_id for item in items
+        }:
+            await self._notify_video_stream_change(
+                session, expired_organization_id
+            )
+        return len(items)
 
     async def complete_recording_download_delivery(
         self, *, request_id: str, now: Optional[datetime] = None,
@@ -5395,9 +5563,17 @@ class ControlPlaneStore:
         )
 
     async def get_video_stream_request_for_requester(
-        self, *, request_id: str, organization_id: str, requester_user_id: str
+        self, *, request_id: str, organization_id: str, requester_user_id: str,
+        now: Optional[datetime] = None,
     ) -> VideoStreamRequestRecord:
+        checked_at = now or utc_now()
         async with self.sessions() as session:
+            await self._expire_video_stream_requests(
+                session,
+                checked_at=checked_at,
+                organization_id=organization_id,
+            )
+            await session.commit()
             row = (await session.execute(
                 select(VideoStreamRequest, ActiveVideoStream)
                 .join(
@@ -5508,16 +5684,20 @@ class ControlPlaneStore:
             await session.commit()
             return self._video_stream_request_record(request, stream)
 
-    @staticmethod
     async def _expire_video_stream_requests(
+        self,
         session: AsyncSession,
         *,
         checked_at: datetime,
         organization_id: Optional[str] = None,
     ) -> int:
-        statement = select(VideoStreamRequest.id).where(
+        statement = select(
+            VideoStreamRequest.id,
+            VideoStreamRequest.organization_id,
+        ).where(
             VideoStreamRequest.state.in_((
-                "pending", "probing", "awaiting_approval", "approved"
+                "pending", "probing", "awaiting_approval", "approved",
+                "streaming",
             )),
             VideoStreamRequest.expires_at < checked_at,
         )
@@ -5525,14 +5705,33 @@ class ControlPlaneStore:
             statement = statement.where(
                 VideoStreamRequest.organization_id == organization_id
             )
-        request_ids = tuple((await session.scalars(statement)).all())
+        request_rows = tuple((await session.execute(statement)).all())
+        request_ids = tuple(row[0] for row in request_rows)
         if not request_ids:
             return 0
         await session.execute(
             update(VideoStreamRequest)
             .where(VideoStreamRequest.id.in_(request_ids))
-            .values(state="expired", stopped_at=checked_at)
+            .values(
+                state="expired",
+                status_message="Video request timed out.",
+                stopped_at=checked_at,
+            )
         )
+        await session.execute(
+            delete(VideoPreflightExchange).where(
+                VideoPreflightExchange.request_id.in_(request_ids)
+            )
+        )
+        await session.execute(
+            delete(VideoMediaExchange).where(
+                VideoMediaExchange.request_id.in_(request_ids)
+            )
+        )
+        for expired_organization_id in {row[1] for row in request_rows}:
+            await self._notify_video_stream_change(
+                session, expired_organization_id
+            )
         return len(request_ids)
 
     async def start_video_preflight(
@@ -6030,6 +6229,9 @@ class ControlPlaneStore:
                         "This R2C app is already sharing video with another member."
                     )
                 request.state = "approved"
+                request.expires_at = decided_at + timedelta(
+                    seconds=VIDEO_SESSION_AUTHORIZATION_SECONDS
+                )
                 request.selected_width = width
                 request.selected_height = height
                 request.selected_fps_milli = fps_milli
@@ -6303,6 +6505,13 @@ class ControlPlaneStore:
             request, stream, exchange = row
             if stream.device_credential_id != device_credential_id:
                 raise ControlPlaneError("Video stream request belongs to another device.")
+            if as_utc(request.expires_at) < answered_at:
+                request.state = "expired"
+                request.status_message = "Video request timed out."
+                request.stopped_at = answered_at
+                await session.delete(exchange)
+                await session.commit()
+                raise ControlPlaneError("Video stream request has expired.")
             if request.state not in {"approved", "streaming"}:
                 raise ControlPlaneError("Video stream is not approved.")
             exchange.device_answer_sdp = answer
@@ -6326,6 +6535,15 @@ class ControlPlaneStore:
             request, stream = row
             if request.organization_id != organization_id or request.requester_user_id != requester_user_id:
                 raise ControlPlaneError("Video stream request belongs to another user.")
+            if as_utc(request.expires_at) < started_at:
+                request.state = "expired"
+                request.status_message = "Video request timed out."
+                request.stopped_at = started_at
+                exchange = await session.get(VideoMediaExchange, request.id)
+                if exchange is not None:
+                    await session.delete(exchange)
+                await session.commit()
+                raise ControlPlaneError("Video stream request has expired.")
             if request.state not in {"approved", "streaming"}:
                 raise ControlPlaneError("Video stream is not approved.")
             request.state = "streaming"

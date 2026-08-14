@@ -283,6 +283,37 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
             payload["iceServers"][0]["credential"],
         )
 
+    async def test_video_stream_request_is_delivered_to_online_tablet(self):
+        self.hub._connections_by_device_credential_id["device-1"] = (
+            types.SimpleNamespace(websocket=self.ws_alpha)
+        )
+        expires_at = datetime(2026, 7, 31, 22, 0, tzinfo=UTC)
+
+        delivered = await self.hub.send_video_stream_request(
+            device_credential_id="device-1",
+            request_id="request-1",
+            requester_email="viewer@example.test",
+            stream_session_id="stream-1",
+            incident_name="Training",
+            drone_designator="NCS1",
+            source_width=1920,
+            source_height=1080,
+            source_fps=30.0,
+            source_bitrate_bps=4_000_000,
+            source_codec="h264",
+            remote_control_enabled=False,
+            expires_at=expires_at,
+        )
+
+        self.assertTrue(delivered)
+        payload = json.loads(self.ws_alpha.sent_texts[-1])
+        self.assertEqual("video_stream_request", payload["type"])
+        self.assertEqual("request-1", payload["requestId"])
+        self.assertEqual("stream-1", payload["streamSessionId"])
+        self.assertEqual("viewer@example.test", payload["requesterEmail"])
+        self.assertTrue(payload["consentRequired"])
+        self.assertEqual(expires_at.isoformat(), payload["expiresAt"])
+
     async def test_thumbnail_preview_lease_is_bounded_and_device_scoped(self):
         self.hub._connections_by_device_credential_id["device-1"] = (
             types.SimpleNamespace(websocket=self.ws_alpha)
