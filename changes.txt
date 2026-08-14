@@ -1,11 +1,16 @@
-v1.4.39:
+v1.4.40:
+* Keep superseded, never-deployed release notes separate from the current tracker summary on the public version-history page.
+
+v1.4.39: deployed
 * Keep recording downloads enabled while treating tracker-local media as a temporary transfer spool that is deleted after the browser response completes.
 * Expire abandoned recording transfer spools instead of retaining completed media, and remove tracker-side playback of transferred copies.
 
-v1.4.38: superseded before deployment
+v1.4.38:
+* Superseded before deployment.
 * Disable tracker-side recording transfer, storage, download, and transferred-copy playback until an explicit storage and retention policy is established; tablet-side recordings and remote playback remain available.
 
-v1.4.37: superseded before deployment
+v1.4.37:
+* Superseded before deployment.
 * Complete an approved recording transfer as one browser action by starting the file download automatically when the tablet upload finishes.
 * Place Download recording beside Play recording, and let authorized users play the tracker-transferred copy without reconnecting to the tablet.
 
