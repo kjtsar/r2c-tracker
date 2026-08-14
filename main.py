@@ -34,6 +34,7 @@ from fastapi import BackgroundTasks
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 from starlette.status import HTTP_403_FORBIDDEN
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -527,9 +528,10 @@ def resolve_tracker_version() -> str:
 TRACKER_VERSION = resolve_tracker_version()
 
 BASE_LOG_DIRECTORY = '/flightlogs-vol'
-# Tracker-side recording persistence remains disabled until retention,
-# deletion, capacity, and audit policies are explicitly established.
-RECORDING_DOWNLOADS_ENABLED = False
+RECORDING_DOWNLOADS_ENABLED = True
+RECORDING_DOWNLOAD_SPOOL_TTL_SEC = max(60, int(os.environ.get(
+    "RECORDING_DOWNLOAD_SPOOL_TTL_SEC", "3600"
+)))
 FLIGHTLOGS_STORAGE_REQUIRED = os.environ.get(
     "FLIGHTLOGS_STORAGE_REQUIRED", "false"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -967,6 +969,67 @@ AsyncSessionLocal = async_sessionmaker(
     expire_on_commit=False
 )
 
+
+def _remove_expired_recording_spool_files(relative_paths: tuple[str, ...]) -> int:
+    removed = 0
+    recordings_root = os.path.join(BASE_LOG_DIRECTORY, "organizations")
+    for relative_path in relative_paths:
+        normalized = os.path.normpath(relative_path)
+        if os.path.isabs(normalized) or normalized == ".." or normalized.startswith(".." + os.sep):
+            logger.warning("Refusing unsafe recording spool path: %s", relative_path)
+            continue
+        try:
+            os.remove(os.path.join(BASE_LOG_DIRECTORY, normalized))
+            removed += 1
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("Unable to remove expired recording spool %s: %s", relative_path, exc)
+
+    # Recover from interrupted uploads or a process failure between deleting a
+    # file and updating its database row. Everything below recordings/ is a
+    # bounded transfer spool, so age is sufficient to reap orphaned files.
+    cutoff = datetime.now(UTC).timestamp() - RECORDING_DOWNLOAD_SPOOL_TTL_SEC
+    if os.path.isdir(recordings_root):
+        for directory, _subdirectories, filenames in os.walk(recordings_root):
+            if f"{os.sep}recordings{os.sep}" not in directory + os.sep:
+                continue
+            for filename in filenames:
+                path = os.path.join(directory, filename)
+                try:
+                    if os.path.getmtime(path) < cutoff:
+                        os.remove(path)
+                        removed += 1
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    logger.warning("Unable to reap recording spool %s: %s", path, exc)
+    return removed
+
+
+async def cleanup_recording_download_spools() -> int:
+    if control_plane_store is None:
+        return 0
+    relative_paths = await control_plane_store.expire_recording_download_spools()
+    return await anyio.to_thread.run_sync(
+        _remove_expired_recording_spool_files, relative_paths,
+    )
+
+
+async def recording_spool_cleanup_worker(stop: asyncio.Event) -> None:
+    interval_seconds = max(30, min(300, RECORDING_DOWNLOAD_SPOOL_TTL_SEC // 4))
+    while not stop.is_set():
+        try:
+            removed = await cleanup_recording_download_spools()
+            if removed:
+                logger.info("Removed %s expired recording transfer spool files", removed)
+        except Exception as exc:
+            logger.warning("Recording transfer spool cleanup failed: %s", exc)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval_seconds)
+        except asyncio.TimeoutError:
+            pass
+
 if __name__ == "__main__":
     asyncio.run(init_db())
 
@@ -978,6 +1041,10 @@ async def lifespan(app: FastAPI):
         await control_plane_store.init()
     billing_notification_stop = asyncio.Event()
     billing_notification_task = None
+    recording_spool_cleanup_stop = asyncio.Event()
+    recording_spool_cleanup_task = asyncio.create_task(
+        recording_spool_cleanup_worker(recording_spool_cleanup_stop)
+    )
     if control_plane_store is not None and platform_admin_email_sender.is_configured:
         billing_notification_task = asyncio.create_task(
             billing_notification_worker(billing_notification_stop)
@@ -987,8 +1054,10 @@ async def lifespan(app: FastAPI):
     # Shutdown Clean up resources (if needed)
     await r2c_hub.stop()
     billing_notification_stop.set()
+    recording_spool_cleanup_stop.set()
     if billing_notification_task is not None:
         await billing_notification_task
+    await recording_spool_cleanup_task
     if control_plane_store is not None:
         await control_plane_store.dispose()
     await engine.dispose()
@@ -8493,6 +8562,7 @@ async def upload_recording_download(
             request_id=request_id, device_credential_id=credential.id,
             filename=filename, media_type=media_type, byte_count=byte_count,
             sha256=digest.hexdigest(), storage_relpath=storage_relpath,
+            spool_ttl_seconds=RECORDING_DOWNLOAD_SPOOL_TTL_SEC,
         )
     except ControlPlaneError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -8520,6 +8590,23 @@ async def authorized_recording_copy(
     return item, path
 
 
+async def delete_delivered_recording_copy(request_id: str, path: str) -> None:
+    """Remove a one-shot transfer spool after its HTTP response is sent."""
+    try:
+        await control_plane_store.complete_recording_download_delivery(
+            request_id=request_id,
+        )
+    except Exception as exc:
+        logger.warning("Unable to mark recording transfer %s delivered: %s", request_id, exc)
+        return
+    try:
+        await anyio.to_thread.run_sync(os.remove, path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning("Unable to remove recording transfer spool %s: %s", request_id, exc)
+
+
 @app.get("/{designator}/streams/downloads/{request_id}", response_class=FileResponse)
 async def organization_recording_download(
         request: Request, designator: str, request_id: str):
@@ -8528,25 +8615,18 @@ async def organization_recording_download(
     )
     if not RECORDING_DOWNLOADS_ENABLED:
         raise HTTPException(status_code=404, detail="Recording downloads are not enabled.")
+    if request.headers.get("Range"):
+        raise HTTPException(
+            status_code=416,
+            detail="Recording transfer downloads must be requested as a complete file.",
+        )
     item, path = await authorized_recording_copy(organization, request_id)
     return FileResponse(
         path, media_type=item.media_type, filename=item.filename,
         headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
-    )
-
-
-@app.get("/{designator}/streams/downloads/{request_id}/play", response_class=FileResponse)
-async def organization_recording_playback(
-        request: Request, designator: str, request_id: str):
-    organization, _user = await require_organization_user(
-        request, designator, ("video_requester",)
-    )
-    if not RECORDING_DOWNLOADS_ENABLED:
-        raise HTTPException(status_code=404, detail="Recording downloads are not enabled.")
-    item, path = await authorized_recording_copy(organization, request_id)
-    return FileResponse(
-        path, media_type=item.media_type,
-        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
+        background=BackgroundTask(
+            delete_delivered_recording_copy, request_id, path,
+        ),
     )
 
 

@@ -5237,6 +5237,7 @@ class ControlPlaneStore:
     async def complete_recording_download_upload(
         self, *, request_id: str, device_credential_id: str, filename: str,
         media_type: str, byte_count: int, sha256: str, storage_relpath: str,
+        spool_ttl_seconds: int = 3600,
     ) -> RecordingDownloadRequestRecord:
         completed_at = utc_now()
         async with self.sessions() as session:
@@ -5258,7 +5259,11 @@ class ControlPlaneStore:
             item.sha256 = sha256[:64]
             item.storage_relpath = storage_relpath[:500]
             item.completed_at = completed_at
-            item.expires_at = completed_at + timedelta(days=3650)
+            # The completed file is a short-lived transfer spool, not tracker
+            # media storage. The browser normally consumes it immediately.
+            item.expires_at = completed_at + timedelta(
+                seconds=max(60, spool_ttl_seconds)
+            )
             session.add(ControlPlaneAuditEvent(
                 organization_id=item.organization_id, actor_type="organization_device",
                 actor_id=device_credential_id, event_type="recording.download_ready",
@@ -5268,6 +5273,57 @@ class ControlPlaneStore:
             await self._notify_video_stream_change(session, item.organization_id)
             await session.commit()
             return self._recording_download_request_record(item, stream)
+
+    async def complete_recording_download_delivery(
+        self, *, request_id: str, now: Optional[datetime] = None,
+    ) -> RecordingDownloadRequestRecord:
+        delivered_at = now or utc_now()
+        async with self.sessions() as session:
+            row = (await session.execute(
+                select(RecordingDownloadRequest, ActiveVideoStream)
+                .join(ActiveVideoStream, ActiveVideoStream.id == RecordingDownloadRequest.active_stream_id)
+                .where(RecordingDownloadRequest.id == request_id).with_for_update()
+            )).first()
+            if row is None:
+                raise ControlPlaneError("Recording download request was not found.")
+            item, stream = row
+            if item.state == "ready":
+                item.state = "downloaded"
+                item.status_message = "Recording download completed."
+                item.storage_relpath = ""
+                item.expires_at = delivered_at
+                session.add(ControlPlaneAuditEvent(
+                    organization_id=item.organization_id,
+                    actor_type="organization_user",
+                    actor_id=item.requester_user_id,
+                    event_type="recording.download_completed",
+                    details_json=json.dumps({"request_id": item.id, "bytes": item.byte_count}),
+                    created_at=delivered_at,
+                ))
+                await self._notify_video_stream_change(session, item.organization_id)
+                await session.commit()
+            return self._recording_download_request_record(item, stream)
+
+    async def expire_recording_download_spools(
+        self, *, now: Optional[datetime] = None,
+    ) -> tuple[str, ...]:
+        """Expire abandoned transfer spools and return their relative paths."""
+        checked_at = now or utc_now()
+        async with self.sessions() as session:
+            items = (await session.execute(
+                select(RecordingDownloadRequest).where(
+                    RecordingDownloadRequest.state == "ready",
+                    RecordingDownloadRequest.expires_at < checked_at,
+                    RecordingDownloadRequest.storage_relpath != "",
+                ).with_for_update()
+            )).scalars().all()
+            paths = tuple(item.storage_relpath for item in items if item.storage_relpath)
+            for item in items:
+                item.state = "expired"
+                item.status_message = "Recording transfer expired before download."
+                item.storage_relpath = ""
+            await session.commit()
+            return paths
 
     async def get_pending_video_stream_request(
         self,

@@ -1,4 +1,8 @@
-v1.4.38:
+v1.4.39:
+* Keep recording downloads enabled while treating tracker-local media as a temporary transfer spool that is deleted after the browser response completes.
+* Expire abandoned recording transfer spools instead of retaining completed media, and remove tracker-side playback of transferred copies.
+
+v1.4.38: superseded before deployment
 * Disable tracker-side recording transfer, storage, download, and transferred-copy playback until an explicit storage and retention policy is established; tablet-side recordings and remote playback remain available.
 
 v1.4.37: superseded before deployment

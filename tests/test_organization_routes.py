@@ -4,6 +4,7 @@ import html
 import io
 import json
 import logging
+import os
 import re
 import tarfile
 import tempfile
@@ -292,7 +293,27 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn("window.location.assign(item.dataset.downloadUrl)", script)
         self.assertIn("data-download-url=", template)
         self.assertIn('class="stream-actions"', template)
-        self.assertFalse(main.RECORDING_DOWNLOADS_ENABLED)
+        self.assertTrue(main.RECORDING_DOWNLOADS_ENABLED)
+
+    def test_recording_spool_reaper_removes_only_expired_transfer_files(self):
+        spool_root = Path(self.temp_dir.name) / "organizations" / "ncssar" / "recordings" / "session"
+        spool_root.mkdir(parents=True)
+        expired = spool_root / ".expired.part"
+        current = spool_root / ".current.part"
+        expired.write_bytes(b"expired")
+        current.write_bytes(b"current")
+        old_timestamp = datetime.now().timestamp() - 120
+        os.utime(expired, (old_timestamp, old_timestamp))
+
+        with (
+            patch.object(main, "BASE_LOG_DIRECTORY", self.temp_dir.name),
+            patch.object(main, "RECORDING_DOWNLOAD_SPOOL_TTL_SEC", 60),
+        ):
+            removed = main._remove_expired_recording_spool_files(())
+
+        self.assertEqual(1, removed)
+        self.assertFalse(expired.exists())
+        self.assertTrue(current.exists())
 
     def test_video_start_marker_retries_until_the_server_acknowledges_it(self):
         script = Path("static/video_media.js").read_text()
@@ -2261,7 +2282,13 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 self.assertEqual(200, uploaded.status_code)
                 ready_page = self.client.get(recording_link.headers["location"])
                 self.assertIn("Download recording", ready_page.text)
-                self.assertIn("Play transferred copy", ready_page.text)
+                self.assertNotIn("Play transferred copy", ready_page.text)
+                ranged = self.client.get(
+                    f"/ncssar/streams/downloads/{transfer_request['requestId']}",
+                    headers={"Range": "bytes=0-9"},
+                )
+                self.assertEqual(416, ranged.status_code)
+                self.assertTrue(any(download_root.rglob("A5-flight.mp4")))
                 downloaded = self.client.get(
                     f"/ncssar/streams/downloads/{transfer_request['requestId']}"
                 )
@@ -2271,12 +2298,14 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                     'attachment; filename="A5-flight.mp4"',
                     downloaded.headers["content-disposition"],
                 )
-                played = self.client.get(
-                    f"/ncssar/streams/downloads/{transfer_request['requestId']}/play"
+                self.assertFalse(any(download_root.rglob("A5-flight.mp4")))
+                consumed = asyncio.run(
+                    self.store.get_recording_download_request(
+                        request_id=transfer_request["requestId"],
+                    )
                 )
-                self.assertEqual(200, played.status_code)
-                self.assertEqual(b"original-recording-bytes", played.content)
-                self.assertNotIn("content-disposition", played.headers)
+                self.assertEqual("downloaded", consumed.state)
+                self.assertEqual("", consumed.storage_relpath)
             live_websocket.send_json({
                 "type": "video_stream_advertisement",
                 "incidentName": "Alpha",

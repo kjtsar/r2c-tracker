@@ -445,11 +445,6 @@
                    href="/{{ organization.designator|lower }}/streams/downloads/{{ recording_download.id }}">
                   Download recording
                 </a>
-                <a class="request-button"
-                   href="/{{ organization.designator|lower }}/streams/downloads/{{ recording_download.id }}/play"
-                   target="_blank" rel="noopener">
-                  Play transferred copy
-                </a>
                 {% elif recording_download and recording_download.state in ("awaiting_approval", "approved", "uploading") %}
                 <button class="request-button" type="button" disabled>
                   {% if recording_download.state == "awaiting_approval" %}Awaiting transfer approval{% else %}Preparing download{% endif %}
