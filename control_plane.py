@@ -5301,6 +5301,13 @@ class ControlPlaneStore:
                 await self._notify_video_stream_change(session, item.organization_id)
                 await session.commit()
                 raise ControlPlaneError("Recording download request has expired.")
+            if approved and item.state in {"uploading", "ready"}:
+                # The authenticated HTTP upload is itself an authoritative
+                # approval.  A small or fast first chunk can therefore reach
+                # us before the websocket decision.  Acknowledge that delayed
+                # decision idempotently instead of turning a valid transfer
+                # into a rejected approval.
+                return self._recording_download_request_record(item, stream)
             if item.state not in {"awaiting_approval", "approved"}:
                 raise ControlPlaneError("Recording download request is no longer awaiting a decision.")
             item.state = "approved" if approved else "declined"

@@ -30,6 +30,8 @@ class GuardedReleaseTest(unittest.TestCase):
         self.assertIn('--liveness-probe "httpGet.path=/livez', deploy)
         self.assertIn("r2c-deployment-gate-key", pilot)
         self.assertIn('"FLIGHTLOGS_STORAGE_REQUIRED"', deploy)
+        self.assertIn('FAST_UI_DEPLOY="${FAST_UI_DEPLOY:-0}"', deploy)
+        self.assertIn("reusing the production service's existing secrets and IAM bindings", deploy)
 
     def test_candidate_promotion_and_rollback_are_separate_commands(self):
         guard = (self.root / "scripts" / "release_guard.py").read_text()
@@ -69,10 +71,17 @@ class GuardedReleaseTest(unittest.TestCase):
 
         self.assertTrue(publisher.is_file())
         self.assertIn("--bypass-safety-checks", publisher.read_text())
+        self.assertIn("qualification-current", publisher.read_text())
+        self.assertIn("--allow-non-presentation-changes", publisher.read_text())
         self.assertIn("./qualify_release.sh", publisher.read_text())
+        self.assertNotIn("./test_candidate.sh", publisher.read_text())
         self.assertIn('BYPASS_ALLOWED_PATH_PREFIXES = ("static/", "templates/", "tests/")', guard)
         self.assertIn('BYPASS_ALLOWED_PATHS = {"changes.txt"}', guard)
-        self.assertIn("validate_bypass_change_scope()", guard)
+        self.assertIn("secret_baseline_is_semantically_unchanged", guard)
+        self.assertIn('"FAST_UI_DEPLOY": "1"', guard)
+        self.assertIn("candidate_regression_passed_at_epoch", guard)
+        self.assertIn("Non-presentation fast publication requires", guard)
+        self.assertIn("validate_bypass_change_scope(", guard)
         self.assertIn('require_activity_gate=False', guard)
         self.assertIn('deploy_env.pop("CONTAINER_IMAGE", None)', guard)
         self.assertIn("Promotion must repeat --bypass-safety-checks", guard)
@@ -113,6 +122,132 @@ class GuardedReleaseTest(unittest.TestCase):
         with mock.patch.object(module, "run", side_effect=unsafe_run):
             with self.assertRaisesRegex(RuntimeError, "normal guarded release.*main.py"):
                 module.validate_bypass_change_scope()
+
+        def baseline_run(*args, capture=False, env=None):
+            if args[1] == "describe":
+                return "v1.4.43"
+            return "static/video_media.js\n.secrets.baseline"
+
+        with (
+            mock.patch.object(module, "run", side_effect=baseline_run),
+            mock.patch.object(
+                module,
+                "secret_baseline_is_semantically_unchanged",
+                return_value=True,
+            ),
+        ):
+            _previous_tag, paths = module.validate_bypass_change_scope()
+        self.assertIn(".secrets.baseline", paths)
+
+        with (
+            mock.patch.object(module, "run", side_effect=baseline_run),
+            mock.patch.object(
+                module,
+                "secret_baseline_is_semantically_unchanged",
+                return_value=False,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, r"\.secrets\.baseline"):
+                module.validate_bypass_change_scope()
+
+    def test_secret_baseline_location_changes_are_semantically_ignored(self):
+        spec = importlib.util.spec_from_file_location(
+            "release_guard_baseline_test",
+            self.root / "scripts" / "release_guard.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        previous = {
+            "generated_at": "earlier",
+            "results": {"tests/example.py": [{
+                "type": "Secret Keyword",
+                "hashed_secret": "same-fingerprint",  # pragma: allowlist secret
+                "line_number": 40,
+            }]},
+        }
+        current = {
+            "generated_at": "later",
+            "results": {"tests/example.py": [{
+                "type": "Secret Keyword",
+                "hashed_secret": "same-fingerprint",  # pragma: allowlist secret
+                "line_number": 57,
+            }]},
+        }
+        changed = json.loads(json.dumps(current))
+        changed["results"]["tests/example.py"][0]["hashed_secret"] = (  # pragma: allowlist secret
+            "different"
+        )
+
+        self.assertEqual(
+            module._normalized_secret_baseline(previous),
+            module._normalized_secret_baseline(current),
+        )
+        self.assertNotEqual(
+            module._normalized_secret_baseline(previous),
+            module._normalized_secret_baseline(changed),
+        )
+
+    def test_explicit_bypass_scope_override_keeps_changes_auditable(self):
+        spec = importlib.util.spec_from_file_location(
+            "release_guard_scope_override_test",
+            self.root / "scripts" / "release_guard.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        def fake_run(*args, capture=False, env=None):
+            if args[1] == "describe":
+                return "v1.4.43"
+            return "main.py\ncontrol_plane.py"
+
+        with mock.patch.object(module, "run", side_effect=fake_run):
+            previous_tag, paths = module.validate_bypass_change_scope(
+                allow_non_presentation_changes=True
+            )
+        self.assertEqual("v1.4.43", previous_tag)
+        self.assertEqual(("main.py", "control_plane.py"), paths)
+
+    def test_qualification_receipt_is_wired_into_full_and_fast_release(self):
+        qualification = (self.root / "qualify_release.sh").read_text()
+        publisher = (self.root / "publish_release.sh").read_text()
+        guard = (self.root / "scripts" / "release_guard.py").read_text()
+
+        self.assertIn("record-qualification", qualification)
+        self.assertIn("qualification-current", publisher)
+        self.assertIn("QUALIFICATION_RECEIPT_MAX_AGE_SECONDS", guard)
+        self.assertIn('run("git", "status", "--porcelain"', guard)
+
+    def test_qualification_receipt_matches_only_the_clean_exact_commit(self):
+        spec = importlib.util.spec_from_file_location(
+            "release_guard_receipt_test",
+            self.root / "scripts" / "release_guard.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        identity = {"commit": "commit-a", "tree": "tree-a"}
+
+        def fake_run(*args, capture=False, env=None):
+            if args[1:3] == ("status", "--porcelain"):
+                return ""
+            if args[1:3] == ("rev-parse", "HEAD"):
+                return identity["commit"]
+            if args[1:3] == ("rev-parse", "HEAD^{tree}"):
+                return identity["tree"]
+            raise AssertionError(args)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            receipt = pathlib.Path(temporary_directory) / "qualification.json"
+            with (
+                mock.patch.object(module, "QUALIFICATION_RECEIPT_PATH", receipt),
+                mock.patch.object(module, "run", side_effect=fake_run),
+                mock.patch.object(module.time, "time", return_value=1_000),
+            ):
+                self.assertTrue(module.record_qualification_receipt())
+                self.assertTrue(module.qualification_receipt_is_current())
+                identity["commit"] = "commit-b"
+                self.assertFalse(module.qualification_receipt_is_current())
 
     def test_local_release_gate_checks_migration_rollback_compatibility(self):
         release_check = (self.root / "release_check.sh").read_text()

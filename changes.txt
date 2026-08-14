@@ -1,3 +1,8 @@
+v1.4.44:
+* Make an authenticated recording upload authoritative after tablet approval so delayed or lost websocket acknowledgements cannot strand Android or iOS downloads.
+* Add transfer-state diagnostics and accept websocket approval idempotently when the HTTP upload arrives first.
+* Let an explicitly acknowledged fast publication carry qualified non-presentation changes while retaining exact-commit qualification, a zero-traffic candidate, cloud regression, health checks, and automatic rollback.
+
 v1.4.43: deployed
 * Close negotiated video sessions when no RTP packets arrive instead of waiting forever for a browser playback event that cannot occur.
 

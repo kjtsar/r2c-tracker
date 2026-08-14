@@ -291,6 +291,15 @@ trap 'rm -f "${ENV_VARS_FILE}"' EXIT
 
 echo "Using Cloud Run runtime service account: ${RUNTIME_SERVICE_ACCOUNT}"
 
+FAST_UI_DEPLOY="${FAST_UI_DEPLOY:-0}"
+case "${FAST_UI_DEPLOY}" in
+  0|1) ;;
+  *) echo "FAST_UI_DEPLOY must be 0 or 1." >&2; exit 2 ;;
+esac
+
+if [ "${FAST_UI_DEPLOY}" = "1" ]; then
+  echo "Fast UI deployment: reusing the production service's existing secrets and IAM bindings."
+else
 if [ -n "${DATABASE_URL_SECRET_NAME}" ]; then
   require_existing_secret "${DATABASE_URL_SECRET_NAME}" "DATABASE_URL"
 fi
@@ -442,6 +451,7 @@ run_gcloud secrets add-iam-policy-binding "${FAA_CLIENT_SECRET_SECRET_NAME}" \
   --project "${GCLOUD_PROJECT}" \
   --member "serviceAccount:${RUNTIME_SERVICE_ACCOUNT}" \
   --role "roles/secretmanager.secretAccessor"
+fi
 
 python3 - <<'PY' > "${ENV_VARS_FILE}"
 import json

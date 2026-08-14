@@ -23,6 +23,8 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parents[1]
 STATE_PATH = ROOT / ".release-state" / "pilot.json"
 STAGING_STATE_PATH = ROOT / ".release-state" / "staging.json"
+QUALIFICATION_RECEIPT_PATH = ROOT / ".release-state" / "qualification.json"
+QUALIFICATION_RECEIPT_MAX_AGE_SECONDS = 4 * 60 * 60
 STAGING_REUSE_MAX_AGE_SECONDS = 24 * 60 * 60
 PROJECT = os.environ.get("GCLOUD_PROJECT", "r2c-tracker-pilot")
 REGION = os.environ.get("REGION", "us-west1")
@@ -34,6 +36,30 @@ STAGING_SERVICE = "r2c-tracker-staging"
 STAGING_GATE_SECRET = "r2c-staging-deployment-gate-key"  # pragma: allowlist secret
 BYPASS_ALLOWED_PATH_PREFIXES = ("static/", "templates/", "tests/")
 BYPASS_ALLOWED_PATHS = {"changes.txt"}
+
+
+def _normalized_secret_baseline(value):
+    """Remove location-only metadata while preserving every secret fingerprint."""
+    if isinstance(value, dict):
+        return {
+            key: _normalized_secret_baseline(item)
+            for key, item in value.items()
+            if key not in {"generated_at", "line_number"}
+        }
+    if isinstance(value, list):
+        return [_normalized_secret_baseline(item) for item in value]
+    return value
+
+
+def secret_baseline_is_semantically_unchanged(previous_tag: str) -> bool:
+    try:
+        previous = json.loads(run(
+            "git", "show", f"{previous_tag}:.secrets.baseline", capture=True,
+        ))
+        current = json.loads((ROOT / ".secrets.baseline").read_text())
+    except (subprocess.CalledProcessError, OSError, json.JSONDecodeError):
+        return False
+    return _normalized_secret_baseline(previous) == _normalized_secret_baseline(current)
 
 
 def run(*args: str, capture: bool = False, env: dict[str, str] | None = None) -> str:
@@ -62,7 +88,9 @@ def committed_source_snapshot():
         yield source_path
 
 
-def validate_bypass_change_scope() -> tuple[str, tuple[str, ...]]:
+def validate_bypass_change_scope(
+    *, allow_non_presentation_changes: bool = False,
+) -> tuple[str, tuple[str, ...]]:
     """Restrict the bypass path to presentation-only releases."""
     try:
         previous_tag = run(
@@ -75,19 +103,65 @@ def validate_bypass_change_scope() -> tuple[str, tuple[str, ...]]:
     changed_paths = tuple(filter(None, run(
         "git", "diff", "--name-only", f"{previous_tag}..HEAD", capture=True
     ).splitlines()))
-    unsafe_paths = tuple(
-        path for path in changed_paths
-        if path not in BYPASS_ALLOWED_PATHS
-        and not path.startswith(BYPASS_ALLOWED_PATH_PREFIXES)
-    )
-    if unsafe_paths:
+    unsafe_paths = []
+    for path in changed_paths:
+        if path in BYPASS_ALLOWED_PATHS or path.startswith(BYPASS_ALLOWED_PATH_PREFIXES):
+            continue
+        if path == ".secrets.baseline" and secret_baseline_is_semantically_unchanged(previous_tag):
+            continue
+        unsafe_paths.append(path)
+    unsafe_paths = tuple(unsafe_paths)
+    if unsafe_paths and not allow_non_presentation_changes:
         raise RuntimeError(
             "--bypass-safety-checks is limited to presentation-only changes; "
             "the normal guarded release is required for: " + ", ".join(unsafe_paths)
         )
+    if unsafe_paths:
+        print(
+            "WARNING: explicit non-presentation override accepted for: "
+            + ", ".join(unsafe_paths)
+        )
     if not changed_paths:
         raise RuntimeError("No changes were found since the prior release tag.")
     return previous_tag, changed_paths
+
+
+def source_identity() -> tuple[str, str]:
+    return (
+        run("git", "rev-parse", "HEAD", capture=True),
+        run("git", "rev-parse", "HEAD^{tree}", capture=True),
+    )
+
+
+def record_qualification_receipt() -> bool:
+    if run("git", "status", "--porcelain", capture=True):
+        print("Qualification passed, but the worktree is dirty; no reusable receipt was written.")
+        return False
+    commit, tree = source_identity()
+    QUALIFICATION_RECEIPT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    QUALIFICATION_RECEIPT_PATH.write_text(json.dumps({
+        "commit": commit,
+        "qualified_at_epoch": int(time.time()),
+        "tree": tree,
+    }, indent=2, sort_keys=True) + "\n")
+    print(f"Qualification receipt recorded for {commit}.")
+    return True
+
+
+def qualification_receipt_is_current() -> bool:
+    if run("git", "status", "--porcelain", capture=True):
+        return False
+    try:
+        receipt = json.loads(QUALIFICATION_RECEIPT_PATH.read_text())
+        commit, tree = source_identity()
+        age_seconds = int(time.time()) - int(receipt["qualified_at_epoch"])
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        receipt.get("commit") == commit
+        and receipt.get("tree") == tree
+        and 0 <= age_seconds <= QUALIFICATION_RECEIPT_MAX_AGE_SECONDS
+    )
 
 
 def gcloud(*args: str, capture: bool = False, input_text: str | None = None) -> str:
@@ -383,6 +457,7 @@ def deploy_candidate(
     bootstrap: bool,
     reuse_staging: bool,
     bypass_safety_checks: bool,
+    allow_non_presentation_changes: bool,
 ) -> None:
     if run("git", "status", "--porcelain", capture=True):
         raise RuntimeError("Refusing to deploy an uncommitted or dirty worktree.")
@@ -396,8 +471,19 @@ def deploy_candidate(
         raise RuntimeError(
             "--bypass-safety-checks cannot be combined with --bootstrap or --reuse-staging."
         )
+    if allow_non_presentation_changes and not bypass_safety_checks:
+        raise RuntimeError(
+            "--allow-non-presentation-changes requires --bypass-safety-checks."
+        )
+    if allow_non_presentation_changes and not qualification_receipt_is_current():
+        raise RuntimeError(
+            "Non-presentation fast publication requires a current full qualification "
+            "receipt for this exact clean commit."
+        )
     if bypass_safety_checks:
-        previous_tag, changed_paths = validate_bypass_change_scope()
+        previous_tag, changed_paths = validate_bypass_change_scope(
+            allow_non_presentation_changes=allow_non_presentation_changes,
+        )
         print("WARNING: BYPASSING IDLE, STAGING-DATABASE, AND HOSTED-STAGING SAFETY CHECKS.")
         print(f"Presentation-only scope accepted relative to {previous_tag}:")
         for path in changed_paths:
@@ -410,6 +496,7 @@ def deploy_candidate(
             "ACTIVATE_LATEST_REVISION": "0",
             "REVISION_TAG": "candidate",
             "DEPLOYMENT_GATE_KEY_SECRET_NAME": GATE_SECRET,
+            "FAST_UI_DEPLOY": "1",
         })
         deploy_env.pop("CONTAINER_IMAGE", None)
         with committed_source_snapshot() as source_path:
@@ -418,6 +505,7 @@ def deploy_candidate(
         candidate_revision, candidate_url = tagged_candidate(service_description())
         state = {
             "bypassed_safety_checks": True,
+            "allowed_non_presentation_changes": allow_non_presentation_changes,
             "candidate_revision": candidate_revision,
             "candidate_url": candidate_url,
             "expected_version": expected_version,
@@ -427,6 +515,8 @@ def deploy_candidate(
         }
         save_state(state)
         regression(candidate_url, expected_version, require_activity_gate=False)
+        state["candidate_regression_passed_at_epoch"] = int(time.time())
+        save_state(state)
         print(f"Bypass candidate ready: {candidate_revision}")
         print("Production traffic is unchanged. Promotion requires --bypass-safety-checks again.")
         return
@@ -537,6 +627,8 @@ def test_candidate() -> None:
         state.get("expected_version", ""),
         require_activity_gate=not state.get("bypassed_safety_checks", False),
     )
+    state["candidate_regression_passed_at_epoch"] = int(time.time())
+    save_state(state)
 
 
 def promote_candidate(*, bootstrap: bool, bypass_safety_checks: bool) -> None:
@@ -548,11 +640,19 @@ def promote_candidate(*, bootstrap: bool, bypass_safety_checks: bool) -> None:
         )
     if bootstrap and not state.get("bootstrap"):
         raise RuntimeError("Bootstrap promotion is allowed only for the recorded first gate release.")
-    regression(
-        state["candidate_url"],
-        state.get("expected_version", ""),
-        require_activity_gate=not bypass_safety_checks,
-    )
+    recent_bypass_regression = False
+    if bypass_safety_checks:
+        tested_at = int(state.get("candidate_regression_passed_at_epoch", 0) or 0)
+        age_seconds = int(time.time()) - tested_at
+        recent_bypass_regression = 0 <= age_seconds <= 5 * 60
+    if recent_bypass_regression:
+        print("Reusing the candidate regression completed by this fast publication run.")
+    else:
+        regression(
+            state["candidate_url"],
+            state.get("expected_version", ""),
+            require_activity_gate=not bypass_safety_checks,
+        )
     if bypass_safety_checks:
         print("WARNING: Promoting without checking whether tracker clients are active.")
     else:
@@ -617,11 +717,14 @@ def main() -> None:
         help="reuse validated isolated staging resources and refresh their database clones",
     )
     deploy_parser.add_argument("--bypass-safety-checks", action="store_true")
+    deploy_parser.add_argument("--allow-non-presentation-changes", action="store_true")
     subparsers.add_parser("test-candidate")
     promote_parser = subparsers.add_parser("promote")
     promote_parser.add_argument("--bootstrap", action="store_true")
     promote_parser.add_argument("--bypass-safety-checks", action="store_true")
     subparsers.add_parser("rollback")
+    subparsers.add_parser("record-qualification")
+    subparsers.add_parser("qualification-current")
     args = parser.parse_args()
     if args.command == "deploy-candidate":
         deploy_candidate(
@@ -629,6 +732,7 @@ def main() -> None:
             args.bootstrap,
             args.reuse_staging,
             args.bypass_safety_checks,
+            args.allow_non_presentation_changes,
         )
     elif args.command == "test-candidate":
         test_candidate()
@@ -639,6 +743,12 @@ def main() -> None:
         )
     elif args.command == "rollback":
         rollback()
+    elif args.command == "record-qualification":
+        record_qualification_receipt()
+    elif args.command == "qualification-current":
+        if not qualification_receipt_is_current():
+            raise SystemExit(1)
+        print("Qualification receipt matches the clean current commit.")
 
 
 if __name__ == "__main__":

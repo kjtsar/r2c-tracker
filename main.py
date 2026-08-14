@@ -2139,11 +2139,22 @@ class R2CCoordinationHub:
                 device_credential_id=credential.id,
                 approved=str(payload.get("decision", "")).lower() == "approve",
             )
+            logger.info(
+                "Recording transfer decision accepted: request=%s device=%s state=%s",
+                result.id,
+                credential.id,
+                result.state,
+            )
             await websocket.send_text(json.dumps({
                 "type": "recording_download_decision_ack", "requestId": result.id,
                 "accepted": True, "state": result.state,
             }))
         except ControlPlaneError as exc:
+            logger.warning(
+                "Recording transfer decision rejected: request=%s error=%s",
+                request_id,
+                exc,
+            )
             await websocket.send_text(json.dumps({
                 "type": "recording_download_decision_ack", "requestId": request_id,
                 "accepted": False, "error": str(exc),
@@ -8541,6 +8552,11 @@ async def upload_recording_download(
         item = await control_plane_store.decide_recording_download_request(
             request_id=request_id, device_credential_id=credential.id, approved=True,
         )
+        logger.info(
+            "Recording upload supplied operator approval: request=%s device=%s",
+            request_id,
+            credential.id,
+        )
     if item.state not in {"approved", "uploading"}:
         raise HTTPException(status_code=409, detail="Recording transfer is not authorized.")
     try:
@@ -8569,6 +8585,13 @@ async def upload_recording_download(
     range_start, range_end, total_bytes = (
         tuple(map(int, match.groups())) if match else (0, -1, -1)
     )
+    if range_start == 0:
+        logger.info(
+            "Recording upload started: request=%s device=%s total_bytes=%s",
+            request_id,
+            credential.id,
+            total_bytes,
+        )
     if match and (
         range_end < range_start or total_bytes <= range_end or total_bytes > max_bytes
         or range_end - range_start + 1 > 16 * 1024 * 1024
@@ -8615,6 +8638,12 @@ async def upload_recording_download(
     except ControlPlaneError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     await meter_organization_usage(credential, network_bytes=received)
+    logger.info(
+        "Recording upload completed: request=%s device=%s bytes=%s",
+        request_id,
+        credential.id,
+        completed.byte_count,
+    )
     return {"accepted": True, "state": completed.state, "bytes": completed.byte_count}
 
 

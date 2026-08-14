@@ -60,3 +60,4 @@ fi
 
 finished_at="$(date +%s)"
 echo "Release qualification passed in $((finished_at - started_at)) seconds."
+"${PYTHON}" scripts/release_guard.py record-qualification

@@ -2285,26 +2285,6 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 ).total_seconds()
                 self.assertGreater(approval_seconds, 55)
                 self.assertLessEqual(approval_seconds, 60)
-                live_websocket.send_json({
-                    "type": "recording_download_decision",
-                    "requestId": transfer_request["requestId"],
-                    "decision": "approve",
-                })
-                self.assertTrue(live_websocket.receive_json()["accepted"])
-                approved_transfer = asyncio.run(
-                    self.store.get_recording_download_request(
-                        request_id=transfer_request["requestId"]
-                    )
-                )
-                transfer_seconds = (
-                    approved_transfer.expires_at - datetime.now(UTC)
-                ).total_seconds()
-                self.assertGreater(transfer_seconds, 14 * 60)
-                self.assertLessEqual(transfer_seconds, 15 * 60)
-                self.assertEqual(
-                    "Recording transfer approved; waiting for the tablet to upload it.",
-                    approved_transfer.status_message,
-                )
                 pending_page = self.client.get(recording_link.headers["location"])
                 self.assertIn(
                     f'data-download-url="/ncssar/streams/downloads/{transfer_request["requestId"]}"',
@@ -2322,6 +2302,17 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 )
                 self.assertEqual(200, first_chunk.status_code)
                 self.assertEqual("uploading", first_chunk.json()["state"])
+                # The tablet starts the authenticated upload immediately after
+                # operator approval.  The websocket decision may arrive just
+                # behind its first HTTP chunk and must remain idempotent.
+                live_websocket.send_json({
+                    "type": "recording_download_decision",
+                    "requestId": transfer_request["requestId"],
+                    "decision": "approve",
+                })
+                delayed_ack = live_websocket.receive_json()
+                self.assertTrue(delayed_ack["accepted"])
+                self.assertEqual("uploading", delayed_ack["state"])
                 uploaded = self.client.put(
                     transfer_request["uploadPath"],
                     headers={
