@@ -21,7 +21,17 @@ Status: minimum design; alert delivery is not complete until two program-operato
 
 Security events should include UTC time, event type, outcome, organization ID/designator where necessary, actor/credential identifier, request or correlation ID, source network metadata where justified, and affected resource ID. Logs must not contain passwords, API/device tokens, session cookies, OAuth codes, reset/activation links, raw video, or unnecessary precise location. Credential diagnostics may record length and a short non-reversible suffix only when necessary and reviewed.
 
-Access to security logs is limited to authorized responders and is itself audited. The Board must approve retention periods based on response, privacy, grant/contract, and legal needs.
+Access to security logs is limited to authorized responders and is itself audited.
+Application audit events are retained for 365 days from their event timestamp;
+the newest 90 days are the default searchable window. A platform administrator
+may place an event-specific retention hold for an incident, investigation,
+grant/contract requirement, or legal process. Held events are not deleted until
+the hold is explicitly released. Expired, unheld events are deleted by the
+daily retention job, and backup copies age out through the separately approved
+backup lifecycle. Accounting source records and the billing ledger follow their
+own accountant/Board-approved records schedule rather than extending every
+operational audit event. Review this schedule annually and whenever legal,
+contractual, insurer, grant, or incident-response requirements change.
 
 ## Alert operation
 
@@ -33,4 +43,9 @@ Access to security logs is limited to authorized responders and is itself audite
 
 ## Current implementation status
 
-As of August 7, 2026, the Google Cloud project has no configured notification channel, alert policy, or custom log-based metric. Application logs already emit several authentication, device mismatch, video lifecycle, and error events, but alert delivery and retention approval remain open. Creating useful notification channels requires governance-designated responder addresses or a program-operator-controlled group.
+As of August 15, 2026, application audit retention, event-specific holds,
+filtered platform-administrator review, audited CSV export, and audited access
+are implemented. The Google Cloud project still has no confirmed notification
+channel, alert policy, or custom log-based metric. Creating useful notification
+channels requires governance-designated responder addresses or a
+program-operator-controlled group.

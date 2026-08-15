@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
@@ -6,6 +7,9 @@ from decimal import Decimal
 from pathlib import Path
 
 from control_plane import (
+    AUDIT_EVENT_HOT_DAYS,
+    AUDIT_EVENT_RETENTION_DAYS,
+    ControlPlaneAuditEvent,
     DEFAULT_OWNER_ROLES,
     ControlPlaneError,
     ControlPlaneStore,
@@ -72,7 +76,166 @@ class ControlPlaneStoreTest(unittest.TestCase):
         audit_events = asyncio.run(self.store.list_audit_events())
         self.assertEqual("organization.created", audit_events[0].event_type)
 
-    def test_live_onboarding_waits_for_email_and_starts_trial_on_activation(self):
+    def test_audit_search_paginates_filters_and_reports_total(self):
+        organization = self.create_organization()
+
+        async def add_events():
+            async with self.store.sessions() as session:
+                session.add_all((
+                    ControlPlaneAuditEvent(
+                        organization_id=organization.id,
+                        actor_type="organization_user",
+                        actor_id="member-1",
+                        event_type="member.updated",
+                        created_at=self.now + timedelta(minutes=1),
+                    ),
+                    ControlPlaneAuditEvent(
+                        organization_id=organization.id,
+                        actor_type="organization_device",
+                        actor_id="device-1",
+                        event_type="video.streaming",
+                        created_at=self.now + timedelta(minutes=2),
+                    ),
+                ))
+                await session.commit()
+
+        asyncio.run(add_events())
+        administration = asyncio.run(self.store.search_audit_events(
+            page_size=1,
+            organization_designator="ncssar",
+            categories=("administration",),
+        ))
+
+        self.assertEqual(2, administration.total)
+        self.assertEqual(2, administration.total_pages)
+        self.assertEqual("member.updated", administration.events[0].event_type)
+        administration_page_two = asyncio.run(self.store.search_audit_events(
+            page=2,
+            page_size=1,
+            organization_designator="NCSSAR",
+            categories=("administration",),
+        ))
+        self.assertEqual(
+            "organization.created",
+            administration_page_two.events[0].event_type,
+        )
+        video = asyncio.run(self.store.search_audit_events(
+            actor_type="organization_device",
+            event_type="video.streaming",
+            categories=("video",),
+        ))
+        self.assertEqual(1, video.total)
+        self.assertEqual("NCSSAR", video.events[0].designator)
+
+    def test_audit_retention_deletes_expired_events_but_preserves_holds(self):
+        organization = self.create_organization()
+        expired_at = self.now - timedelta(days=AUDIT_EVENT_RETENTION_DAYS + 1)
+
+        async def add_old_events():
+            async with self.store.sessions() as session:
+                expired = ControlPlaneAuditEvent(
+                    organization_id=organization.id,
+                    actor_type="organization_user",
+                    actor_id="expired-member",
+                    event_type="member.updated",
+                    created_at=expired_at,
+                )
+                held = ControlPlaneAuditEvent(
+                    organization_id=organization.id,
+                    actor_type="organization_user",
+                    actor_id="held-member",
+                    event_type="member.deleted",
+                    created_at=expired_at,
+                    retention_hold=True,
+                )
+                session.add_all((expired, held))
+                await session.commit()
+                return expired.id, held.id
+
+        expired_id, held_id = asyncio.run(add_old_events())
+        removed = asyncio.run(self.store.purge_expired_audit_events(now=self.now))
+        self.assertEqual(1, removed)
+        retained = asyncio.run(self.store.search_audit_events(
+            start_at=expired_at - timedelta(days=1),
+            end_at=self.now + timedelta(days=1),
+        ))
+        retained_ids = {event.id for event in retained.events}
+        self.assertNotIn(expired_id, retained_ids)
+        self.assertIn(held_id, retained_ids)
+
+    def test_audit_access_and_retention_hold_changes_are_audited(self):
+        organization = self.create_organization()
+        created = asyncio.run(self.store.list_audit_events())[0]
+
+        held = asyncio.run(self.store.set_audit_event_retention_hold(
+            event_id=created.id,
+            retention_hold=True,
+            actor_id="platform-admin",
+            now=self.now + timedelta(minutes=1),
+        ))
+        self.assertTrue(held.retention_hold)
+        asyncio.run(self.store.record_audit_access(
+            actor_id="platform-admin",
+            details={"view": "audit_log"},
+            now=self.now + timedelta(minutes=2),
+        ))
+        events = asyncio.run(self.store.search_audit_events(
+            categories=("audit",),
+        )).events
+        self.assertEqual(
+            ["audit.viewed", "audit.retention_hold_placed"],
+            [event.event_type for event in events[:2]],
+        )
+        released = asyncio.run(self.store.set_audit_event_retention_hold(
+            event_id=created.id,
+            retention_hold=False,
+            actor_id="platform-admin",
+            now=self.now + timedelta(minutes=3),
+        ))
+        self.assertFalse(released.retention_hold)
+        self.assertEqual(90, AUDIT_EVENT_HOT_DAYS)
+
+    def test_audit_retention_schema_migrates_existing_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "legacy-control-plane.db"
+            connection = sqlite3.connect(database_path)
+            connection.execute("""
+                CREATE TABLE control_plane_audit_events (
+                    id VARCHAR(36) PRIMARY KEY,
+                    organization_id VARCHAR(36),
+                    actor_type VARCHAR(32) NOT NULL,
+                    actor_id VARCHAR(160) NOT NULL,
+                    event_type VARCHAR(80) NOT NULL,
+                    details_json TEXT,
+                    created_at DATETIME
+                )
+            """)
+            connection.commit()
+            connection.close()
+            store = ControlPlaneStore(
+                f"sqlite+aiosqlite:///{database_path}"
+            )
+            asyncio.run(store.init())
+            connection = sqlite3.connect(database_path)
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(control_plane_audit_events)"
+                )
+            }
+            indexes = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA index_list(control_plane_audit_events)"
+                )
+            }
+            connection.close()
+            asyncio.run(store.dispose())
+
+        self.assertIn("retention_hold", columns)
+        self.assertIn("idx_control_plane_audit_events_created_at", indexes)
+
+    def test_live_onboarding_waits_for_email_and_starts_extended_beta_on_activation(self):
         organization = self.create_organization(
             designator="LIVESAR",
             admin_email="admin@livesar.example",
@@ -107,10 +270,9 @@ class ControlPlaneStoreTest(unittest.TestCase):
         )
         activated = asyncio.run(self.store.get_organization("LIVESAR"))
         self.assertEqual("ready", activated.provisioning_state)
-        self.assertEqual(
-            self.now + timedelta(days=30, hours=1),
-            activated.trial_ends_at,
-        )
+        self.assertEqual("extended_beta", activated.lifecycle_state)
+        self.assertEqual("extended beta", activated.billing_mode)
+        self.assertIsNone(activated.trial_ends_at)
         job = asyncio.run(self.store.list_provisioning_jobs())[0]
         self.assertEqual("completed", job.state)
         self.assertTrue(all(step["state"] == "completed" for step in job.steps))
@@ -418,7 +580,7 @@ class ControlPlaneStoreTest(unittest.TestCase):
                 now=self.now + timedelta(hours=2),
             )
         )
-        self.assertEqual("trial", restored.lifecycle_state)
+        self.assertEqual("extended_beta", restored.lifecycle_state)
         self.assertEqual("simulation ready", restored.provisioning_state)
         self.assertEqual("530-555-0102", restored.primary_admin_phone)
         self.assertIsNotNone(
@@ -1099,6 +1261,12 @@ class ControlPlaneStoreTest(unittest.TestCase):
             )
         )
         self.assertEqual(6_007_500, reconnected_metrics.total_media_bytes)
+        usage = asyncio.run(
+            self.store.month_to_date_usage_aggregates(
+                now=self.now + timedelta(seconds=39),
+            )
+        )
+        self.assertEqual(6_007_500, usage[organization.id].turn_relay_bytes)
         with self.assertRaises(ControlPlaneError):
             asyncio.run(
                 self.store.stop_video_stream_from_device(
@@ -1863,7 +2031,7 @@ class ControlPlaneStoreTest(unittest.TestCase):
                 )
             )
 
-    def test_deposited_credit_is_consumed_by_cumulative_gcp_usage(self):
+    def test_historical_ledger_does_not_change_extended_beta_lifecycle(self):
         organization = self.create_organization()
         asyncio.run(
             self.store.append_ledger_entry(
@@ -1879,10 +2047,9 @@ class ControlPlaneStoreTest(unittest.TestCase):
         )
 
         funded = asyncio.run(self.store.get_organization("NCSSAR"))
-        self.assertEqual("funded", funded.lifecycle_state)
-        self.assertEqual("prepaid credit", funded.billing_mode)
+        self.assertEqual("extended_beta", funded.lifecycle_state)
+        self.assertEqual("extended beta", funded.billing_mode)
         self.assertEqual(Decimal("10.0000"), funded.credit_balance)
-        self.assertIsNone(funded.trial_ends_at)
 
         asyncio.run(
             self.store.record_daily_usage(
@@ -1895,26 +2062,13 @@ class ControlPlaneStoreTest(unittest.TestCase):
         )
 
         grace = asyncio.run(self.store.get_organization("NCSSAR"))
-        self.assertEqual("grace", grace.lifecycle_state)
-        self.assertEqual("30-day grace", grace.billing_mode)
+        self.assertEqual("extended_beta", grace.lifecycle_state)
+        self.assertEqual("extended beta", grace.billing_mode)
         self.assertEqual(Decimal("0.00"), grace.credit_balance)
-        self.assertEqual(
-            self.now + timedelta(days=31),
-            grace.trial_ends_at,
-        )
         notifications = asyncio.run(
             self.store.list_pending_billing_notifications()
         )
-        self.assertEqual(1, len(notifications))
-        self.assertEqual("funding_exhausted", notifications[0].notification_type)
-        self.assertEqual("admin@ncssar.example", notifications[0].administrator_email)
-        asyncio.run(
-            self.store.mark_billing_notification_sent(notifications[0].id)
-        )
-        self.assertEqual(
-            (),
-            asyncio.run(self.store.list_pending_billing_notifications()),
-        )
+        self.assertEqual((), notifications)
 
         asyncio.run(
             self.store.append_ledger_entry(
@@ -1929,41 +2083,158 @@ class ControlPlaneStoreTest(unittest.TestCase):
             )
         )
         refunded = asyncio.run(self.store.get_organization("NCSSAR"))
-        self.assertEqual("funded", refunded.lifecycle_state)
+        self.assertEqual("extended_beta", refunded.lifecycle_state)
         self.assertEqual(Decimal("5.0000"), refunded.credit_balance)
         self.assertIsNone(refunded.trial_ends_at)
 
-    def test_trial_deadline_notifications_never_archive_organization(self):
+    def test_extended_beta_allowance_notices_and_video_cutoff_are_monthly(self):
         organization = self.create_organization()
+        billing_admin = asyncio.run(self.store.add_user(
+            organization_id=organization.id,
+            display_name="Billing Administrator",
+            email="billing@ncssar.example",
+            roles=("billing_admin",),
+            actor_id="platform-admin",
+            now=self.now,
+        ))
 
-        asyncio.run(
-            self.store.queue_lifecycle_deadline_notifications(
-                now=self.now + timedelta(days=24),
-            )
-        )
-        notifications = asyncio.run(self.store.list_pending_billing_notifications())
-        self.assertEqual(["trial_ending_7d"], [item.notification_type for item in notifications])
-        asyncio.run(self.store.mark_billing_notification_sent(notifications[0].id))
+        async def activate_billing_admin():
+            async with self.store.sessions() as session:
+                user = await session.get(OrganizationUser, billing_admin.id)
+                user.state = "active"
+                await session.commit()
 
-        asyncio.run(
-            self.store.queue_lifecycle_deadline_notifications(
-                now=self.now + timedelta(days=29, hours=12),
-            )
-        )
-        notifications = asyncio.run(self.store.list_pending_billing_notifications())
-        self.assertEqual(["trial_ending_1d"], [item.notification_type for item in notifications])
-        asyncio.run(self.store.mark_billing_notification_sent(notifications[0].id))
+        asyncio.run(activate_billing_admin())
 
-        asyncio.run(
-            self.store.queue_lifecycle_deadline_notifications(
-                now=self.now + timedelta(days=31),
-            )
-        )
+        reconciled = asyncio.run(self.store.reconcile_extended_beta_allowances(
+            billing_month="2026-07",
+            billing_data_through=self.now,
+            actual_costs={organization.id: Decimal("9.10")},
+            forecast_costs={organization.id: Decimal("12.00")},
+            now=self.now,
+        ))
+        self.assertEqual(1, len(reconciled))
+        self.assertFalse(reconciled[0].video_streaming_allowed)
+        self.assertEqual(Decimal("10.000000"), reconciled[0].allowance_amount)
         notifications = asyncio.run(self.store.list_pending_billing_notifications())
-        self.assertEqual(["trial_ended"], [item.notification_type for item in notifications])
+        self.assertEqual(
+            ["beta_allowance_on_track", "beta_video_disabled"],
+            [item.notification_type for item in notifications],
+        )
+        self.assertTrue(all(
+            item.administrator_email == "billing@ncssar.example"
+            for item in notifications
+        ))
+        with self.assertRaisesRegex(ControlPlaneError, "Remote video streaming is disabled"):
+            asyncio.run(self.store.create_video_stream_request(
+                organization_id=organization.id,
+                stream_session_id="unreachable-stream",
+                requester_user_id="unreachable-user",
+                now=self.now,
+            ))
+
+        asyncio.run(self.store.reconcile_extended_beta_allowances(
+            billing_month="2026-07",
+            billing_data_through=self.now + timedelta(hours=1),
+            actual_costs={organization.id: Decimal("10.01")},
+            forecast_costs={organization.id: Decimal("12.50")},
+            now=self.now + timedelta(hours=1),
+        ))
+        notifications = asyncio.run(self.store.list_pending_billing_notifications())
+        self.assertEqual(
+            [
+                "beta_allowance_on_track",
+                "beta_video_disabled",
+                "beta_allowance_exceeded",
+            ],
+            [item.notification_type for item in notifications],
+        )
         current = asyncio.run(self.store.get_organization(organization.designator))
-        self.assertEqual("trial", current.lifecycle_state)
+        self.assertEqual("extended_beta", current.lifecycle_state)
         self.assertEqual("simulation ready", current.provisioning_state)
+
+    def test_allowance_notice_falls_back_to_primary_admin(self):
+        organization = self.create_organization()
+        asyncio.run(self.store.reconcile_extended_beta_allowances(
+            billing_month="2026-07",
+            billing_data_through=self.now,
+            actual_costs={organization.id: Decimal("1.00")},
+            forecast_costs={organization.id: Decimal("11.00")},
+            now=self.now,
+        ))
+        notifications = asyncio.run(self.store.list_pending_billing_notifications())
+        self.assertEqual(1, len(notifications))
+        self.assertEqual(
+            "admin@ncssar.example",
+            notifications[0].administrator_email,
+        )
+
+    def test_video_cutoff_stops_an_active_request(self):
+        organization = self.create_organization()
+        invitation = asyncio.run(self.store.get_invitation(
+            organization.designator,
+            organization.primary_admin_email,
+        ))
+        owner = asyncio.run(self.store.activate_owner(
+            organization.designator,
+            organization.primary_admin_email,
+            "correct horse battery staple",
+            self.now,
+            activation_nonce=invitation.activation_nonce,
+        ))
+        campaign = asyncio.run(self.store.create_enrollment_campaign(
+            organization_id=organization.id,
+            label="Allowance cutoff tablet",
+            created_by_user_id=owner.id,
+            expires_in_hours=24,
+            max_redemptions=1,
+            now=self.now,
+        ))
+        device = asyncio.run(self.store.issue_device_credential(
+            campaign_id=campaign.id,
+            organization_id=organization.id,
+            device_name="Field tablet",
+            platform="android",
+            now=self.now,
+        ))
+        stream = asyncio.run(self.store.advertise_video_stream(
+            organization_id=organization.id,
+            device_credential_id=device.id,
+            device_name="Field tablet",
+            session_id="00000000-0000-0000-0000-000000000090",
+            incident_name="Training",
+            drone_designator="9A",
+            source_width=1280,
+            source_height=720,
+            source_fps=15,
+            source_bitrate_bps=1_000_000,
+            source_codec="H264",
+            timezone_name="UTC",
+            now=self.now,
+        ))
+        request = asyncio.run(self.store.create_video_stream_request(
+            organization_id=organization.id,
+            stream_session_id=stream.session_id,
+            requester_user_id=owner.id,
+            now=self.now,
+        ))
+
+        asyncio.run(self.store.reconcile_extended_beta_allowances(
+            billing_month="2026-07",
+            billing_data_through=self.now,
+            actual_costs={organization.id: Decimal("9.00")},
+            forecast_costs={organization.id: Decimal("9.50")},
+            now=self.now,
+        ))
+
+        requests = asyncio.run(self.store.list_video_stream_requests(
+            organization_id=organization.id,
+            requester_user_id=owner.id,
+            now=self.now,
+        ))
+        stopped = next(item for item in requests if item.id == request.id)
+        self.assertEqual("stopped", stopped.state)
+        self.assertIn("extended beta allowance month", stopped.status_message)
 
     def test_archive_requires_and_audits_administrator_contact(self):
         organization = self.create_organization()
@@ -2032,7 +2303,7 @@ class ControlPlaneStoreTest(unittest.TestCase):
         )
 
         activated = asyncio.run(self.store.get_organization("FUNDEDSAR"))
-        self.assertEqual("funded", activated.lifecycle_state)
+        self.assertEqual("extended_beta", activated.lifecycle_state)
         self.assertEqual(Decimal("25.0000"), activated.credit_balance)
         self.assertIsNone(activated.trial_ends_at)
 

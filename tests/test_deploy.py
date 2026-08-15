@@ -131,7 +131,6 @@ class DeployScriptTest(unittest.TestCase):
             "platform_admin.py",
             "platform_admin_identity.py",
             "platform_admin_auth.py",
-            "stripe_checkout.py",
             "turn_credentials.py",
         ):
             with self.subTest(module=module):
@@ -199,7 +198,7 @@ class DeployScriptTest(unittest.TestCase):
         self.assertIn('RELEASE_STAGING_MODE="true"', script)
         self.assertIn('CONTROL_PLANE_MODE="simulation"', script)
         self.assertIn('PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_SECRET_NAME=""', script)
-        self.assertIn('STRIPE_SECRET_KEY_SECRET_NAME=""', script)
+        self.assertNotIn("STRIPE_SECRET_KEY", script)
 
     def test_local_setup_uses_isolated_gcloud_configuration_and_private_env_file(self):
         repo = pathlib.Path(__file__).resolve().parents[1]

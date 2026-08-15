@@ -157,6 +157,9 @@
         return;
       }
       if (message.type === "ready" || message.type === "streams_changed") {
+        window.dispatchEvent(new CustomEvent("r2c:streams-changed", {
+          detail: message,
+        }));
         reconcile();
       }
     };

@@ -15,6 +15,20 @@
     flash.className = "alert alert-success";
   }
 
+  function startDownload(url) {
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "";
+    link.hidden = true;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    showProgress(
+      "download_started",
+      "Recording download started. You can continue using this page."
+    );
+  }
+
   async function poll() {
     if (stopped || document.hidden) return;
     for (const item of items) {
@@ -38,10 +52,9 @@
         }
         if (payload.state === "ready") {
           stopped = true;
-          // A recording download is one user gesture with an asynchronous
-          // tablet-approval/upload phase. Complete that gesture by navigating
-          // to the authorized attachment as soon as the upload is ready.
-          window.location.assign(item.dataset.downloadUrl);
+          // Preserve the tablet-specific streams page while the browser handles
+          // the attachment as an independent download.
+          startDownload(item.dataset.downloadUrl);
           return;
         }
         if (["declined", "failed", "expired"].includes(payload.state)) {
@@ -53,8 +66,10 @@
         // The next bounded poll repairs transient network failures.
       }
     }
-    window.setTimeout(poll, 2000);
   }
+  window.addEventListener("r2c:streams-changed", poll);
   window.addEventListener("pagehide", function () { stopped = true; });
-  window.setTimeout(poll, 1000);
+  // Reconcile once after navigation or reconnect. Subsequent checks are driven
+  // by the existing organization streams WebSocket rather than periodic polls.
+  window.setTimeout(poll, 0);
 })();

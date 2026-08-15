@@ -55,11 +55,13 @@ direct login route remains available. Archiving an organization reserves its
 designator and disables its site and device access without deleting its data.
 Restoration is a platform lifecycle action.
 
-When outbound email is configured, trials and grace periods generate advance
-and expiration notifications with organization archive instructions. Reaching
-a deadline does not automatically archive or shut down an organization. The
-platform administrator must make contact with an organization administrator
-before manually archiving a site.
+Organizations receive open-ended extended-beta access; there is no trial expiry
+and the tracker accepts no payments. Each organization receives a platform-funded
+$10.00 calendar-month usage allowance. The billing administrator, or the primary
+organization administrator when no billing administrator is active, is notified
+when projected usage exceeds the allowance and again when actual allocated usage
+exceeds it. At $9.00, remote video streaming is disabled through month end while
+flight logs and R2C-based drone-owner arbitration continue.
 
 ## Roles
 
@@ -118,11 +120,11 @@ platform route families.
 - Support password and verified Google organization login, single-use password
   reset, and separately authenticated platform administration.
 - Advertise organization streams and coordinate request, consent, preflight,
-  signaling, stop, and aggregate-metrics state. The tracker does not ingest,
-  transcode, or record media; media follows the selected direct or TURN path.
-- Track aggregate attributed platform usage, trials, grace periods, prepaid
-  credits, and an append-only ledger. Stripe remains optional and unavailable
-  unless both server-side Stripe secrets are configured.
+  signaling, stop, and aggregate-metrics state. Live/playback media uses TURN;
+  approved downloads use a private, bounded temporary handoff that is deleted
+  after successful browser delivery or expiry.
+- Track aggregate attributed platform usage against each organization's
+  platform-funded extended-beta allowance; payment and checkout routes are absent.
 
 Managed video remains separately qualified by platform and network path. See
 [the managed-video architecture](VIDEO_STREAMING_ARCHITECTURE.md) for the exact
@@ -210,11 +212,11 @@ Do not commit `.env` files or place secret values in command arguments.
 - Live aggregate billing uses `PLATFORM_BILLING_SOURCE=bigquery`, an explicit
   project/dataset, and the mandatory `PLATFORM_BILLING_INCLUDED_PROJECTS`
   allowlist. It does not query tenant operational data.
-- Optional payments require both `STRIPE_SECRET_KEY` and
-  `STRIPE_WEBHOOK_SECRET`; otherwise Checkout is disabled.
+- Payments are disabled during the extended beta; the runtime has no checkout or
+  payment-webhook route and the deployment does not accept payment secrets.
 - Direct/Routed preflight uses `VIDEO_ICE_SERVERS_JSON`. The pilot obtains
-  short-lived TURN credentials from `CLOUDFLARE_TURN_KEY_ID` and
-  `CLOUDFLARE_TURN_API_TOKEN` when configured.
+  short-lived, organization-tagged TURN credentials from
+  `CLOUDFLARE_TURN_KEY_ID` and `CLOUDFLARE_TURN_API_TOKEN` when configured.
 
 ### FAA and bounded uploads
 

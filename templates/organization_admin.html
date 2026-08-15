@@ -201,7 +201,7 @@
   <div class="org-banner" role="status">
     <strong>Simulation mode:</strong>
     settings, invitations, and enrollment campaigns are stored locally, but no
-    tenant infrastructure, email, payments, or app credentials are created.
+    tenant infrastructure, email, or app credentials are created.
   </div>
   {% endif %}
   {% if invitation_url %}
@@ -274,23 +274,14 @@
 
     <section class="org-panel" id="service-status">
       <h2>Service status</h2>
-      <p><strong>Account:</strong> {{ organization.lifecycle_state }}</p>
+      <p><strong>Account:</strong> {{ organization.lifecycle_state|replace('_', ' ') }}</p>
       <p><strong>Provisioning:</strong> {{ organization.provisioning_state }}</p>
       <p><strong>Billing:</strong> {{ organization.billing_mode }}</p>
-      <p><strong>Credit balance:</strong> ${{ "%.2f"|format(organization.credit_balance) }}</p>
-      {% if organization.trial_ends_at %}
-      <p><strong>{{ "Grace ends" if organization.lifecycle_state == "grace" else "Trial ends" }}:</strong> {{ organization.trial_ends_at.strftime("%d %b %Y") }}</p>
       <p>
-        This deadline does not automatically archive or shut down the site.
-        The platform administrator will contact your organization administrator
-        before any archival or service shutdown.
+        R2C Tracker is operating as an open-ended extended beta. The platform
+        does not accept payments. Each organization receives a platform-funded
+        $10.00 calendar-month usage allowance.
       </p>
-      <p>
-        To preserve organization-owned data, open
-        <a href="/{{ organization.designator|lower }}/admin/flights">Manage flight records</a>,
-        then download both the CSV export and Flight Log Archive.
-      </p>
-      {% endif %}
       <p>
         Command staff with the <code>video_requester</code> role may request a
         stream, but pilot approval is always required.
@@ -305,6 +296,20 @@
       {% endif %}
       {% if "organization_owner" in organization_user.roles or "billing_admin" in organization_user.roles %}
       <h3>Month-to-date platform cost</h3>
+      {% if beta_allowance %}
+      <p>
+        <strong>${{ "%.2f"|format(beta_allowance.actual_cost) }}</strong> of the
+        ${{ "%.2f"|format(beta_allowance.allowance_amount) }} extended-beta
+        allowance is currently allocated to this organization.
+      </p>
+      {% if not beta_allowance.video_streaming_allowed %}
+      <p class="alert alert-warning">
+        Remote video streaming is disabled through
+        {{ beta_allowance.month_ends_at.strftime("%d %b %Y") }}. Flight logs and
+        R2C-based drone-owner arbitration remain available.
+      </p>
+      {% endif %}
+      {% endif %}
       {% if organization_cost %}
       <p>
         <strong class="organization-cost-total">${{ "%.2f"|format(organization_cost.total) }}</strong>
@@ -328,8 +333,8 @@
       <p>
         Google Cloud billing data through
         {{ billing_snapshot.billing_data_through.strftime("%d %b %Y %H:%M UTC") }}.
-        This is a shadow allocation for transparency, not a charge, and it does
-        not consume prepaid credit.
+        This allocation measures consumption of the extended-beta allowance;
+        it is not a bill or charge.
       </p>
       {% elif billing_snapshot %}
       <p>
@@ -337,36 +342,7 @@
         {{ billing_snapshot.source_message }}
       </p>
       {% endif %}
-      <h3>Add prepaid funding</h3>
-      {% if stripe_checkout_enabled %}
-      <p>
-        Choose how much to fund based on expected usage. Stripe processes the
-        payment securely; the actual processing fee is shown separately and
-        the remainder becomes service credit.
-      </p>
-      <form class="org-form" method="post"
-            action="/{{ organization.designator|lower }}/billing/checkout">
-        <input type="hidden" name="form_token" value="{{ csrf_token }}">
-        <label>
-          Payment amount (USD)
-          <input type="number" name="amount" min="10" max="10000"
-                 step="0.01" value="25.00" required list="funding-amounts">
-          <datalist id="funding-amounts">
-            <option value="10.00"></option>
-            <option value="25.00"></option>
-            <option value="50.00"></option>
-            <option value="100.00"></option>
-          </datalist>
-        </label>
-        <button class="primary-button" type="submit">Continue to Stripe</button>
-      </form>
-      {% else %}
-      <p>
-        Online payments are being prepared. Contact the R2C Tracker platform
-        administrator to add credit in the meantime.
-      </p>
-      {% endif %}
-      <h3>Recent account activity</h3>
+      <h3>Historical account activity</h3>
       {% for entry in ledger_entries %}
       <p>
         {{ entry.created_at.strftime("%d %b %Y") }} · {{ entry.entry_type }} ·
@@ -374,7 +350,7 @@
         {{ entry.description }}
       </p>
       {% else %}
-      <p>No charges or payments have been recorded.</p>
+      <p>No account ledger entries have been recorded.</p>
       {% endfor %}
       {% endif %}
     </section>

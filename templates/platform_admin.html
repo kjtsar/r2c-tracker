@@ -166,6 +166,20 @@
       cursor: not-allowed;
       opacity: 0.58;
   }
+  .panel-link {
+      display: inline-flex;
+      align-items: center;
+      padding: 9px 13px;
+      border: 1px solid var(--platform-blue);
+      border-radius: 8px;
+      color: var(--platform-blue);
+      font-weight: 700;
+      text-decoration: none;
+      white-space: nowrap;
+  }
+  .panel-link:hover {
+      background: var(--platform-sky);
+  }
   .organization-table-scroll {
       overflow-x: auto;
   }
@@ -471,8 +485,8 @@
     <div>
       <h1>Costs &amp; Organizations</h1>
       <p>
-        Commercial control plane for aggregate Google Cloud costs, organization
-        provisioning, trials, subscriptions, and prepaid service balances.
+        Extended-beta control plane for aggregate Google Cloud costs,
+        organization provisioning, usage allowances, and service safeguards.
       </p>
     </div>
     <div class="platform-header-meta">
@@ -543,7 +557,7 @@
     <article class="metric-card">
       <div class="metric-label">Attributed to organizations</div>
       <div class="metric-value">${{ "%.2f"|format(snapshot.attributed_cost_mtd) }}</div>
-      <div class="metric-note">Shadow allocation; credit is not consumed</div>
+      <div class="metric-note">Counts toward each extended-beta allowance</div>
     </article>
     <article class="metric-card">
       <div class="metric-label">Unallocated platform cost</div>
@@ -560,9 +574,9 @@
       </div>
     </article>
     <article class="metric-card">
-      <div class="metric-label">Collected MTD</div>
+      <div class="metric-label">Payments accepted MTD</div>
       <div class="metric-value">${{ "%.2f"|format(snapshot.collected_mtd) }}</div>
-      <div class="metric-note">Settled payments only</div>
+      <div class="metric-note">Payments are disabled during extended beta</div>
     </article>
     <article class="metric-card">
       <div class="metric-label">Organizations</div>
@@ -577,7 +591,8 @@
     usage meters. If a billed category has no measured usage, it is divided
     equally among fully provisioned organizations. Miscellaneous platform cost
     is also shared equally. Pending and archived organizations are excluded,
-    and these shadow amounts do not yet consume credit.
+    and these amounts measure each organization's $10.00 calendar-month
+    extended-beta allowance. They are not bills or charges.
   </div>
 
   <section class="platform-panel">
@@ -644,8 +659,8 @@
       <div>
         <h2>Organizations</h2>
         <p>
-          Commercial metadata and monthly aggregate resource usage only.
-          Trial and grace deadlines never trigger automatic archival or shutdown.
+          Administrative metadata and monthly aggregate resource usage only.
+          Extended-beta access is open-ended; payments are not accepted.
         </p>
       </div>
       <button class="primary-action" type="button" disabled title="Available after provisioning workflow is implemented">
@@ -687,10 +702,10 @@
       </label>
       <div class="form-actions form-span">
         <span>
-          Activating starts the 30-day trial unless prepaid credit is available.
-          Funded organizations enter a 30-day grace period only after cumulative
-          attributed GCP usage consumes their credit. Restricted flight-record
-          visibility is applied by default.
+          Activating starts open-ended extended-beta access with a platform-funded
+          $10.00 calendar-month usage allowance. At $9.00, remote video is disabled
+          for the rest of the month while flight logs and R2C-based drone-owner
+          arbitration continue. Restricted flight-record visibility is applied by default.
         </span>
         <button class="primary-action" type="submit">Create organization</button>
       </div>
@@ -713,7 +728,7 @@
             <th>Account</th>
             <th>Provisioning</th>
             <th>Billing</th>
-            <th>Available credit</th>
+            <th>Monthly allowance</th>
             <th>Usage cost MTD</th>
             <th>Aggregate usage MTD</th>
             <th>Actions</th>
@@ -767,14 +782,8 @@
             </td>
             <td>
               <span class="status-badge {{ organization.account_status|replace(' ', '-') }}">
-                {{ organization.account_status }}
+                {{ organization.account_status|replace('_', ' ') }}
               </span>
-              {% if organization.trial_ends_at %}
-              <div class="secondary-text">
-                {{ "Grace ends" if organization.account_status == "grace" else "Trial ends" }}
-                {{ organization.trial_ends_at.strftime("%d %b %Y") }}
-              </div>
-              {% endif %}
             </td>
             <td>
               <span class="status-badge {{ organization.provisioning_status|replace(' ', '-') }}">
@@ -794,18 +803,8 @@
               <div>{{ organization.billing_mode }}</div>
             </td>
             <td>
-              <div class="cost-total">${{ "%.2f"|format(organization.credit_balance) }}</div>
-              {% if organization.account_status != "archived" and ledger_nonces is defined and organization.designator in ledger_nonces %}
-              <form class="credit-form" method="post"
-                    action="/platform-admin/organizations/{{ organization.designator|lower }}/credit">
-                <input type="hidden" name="form_token" value="{{ csrf_token }}">
-                <input type="hidden" name="idempotency_key"
-                       value="{{ ledger_nonces[organization.designator] }}">
-                <input type="number" name="amount" min="0.01" max="100000"
-                       step="0.01" value="10.00" aria-label="Credit amount for {{ organization.designator }}">
-                <button type="submit">Add credit</button>
-              </form>
-              {% endif %}
+              <div class="cost-total">$10.00</div>
+              <div class="secondary-text">Platform-funded · no payments</div>
             </td>
             <td>
               <div class="cost-total">${{ "%.2f"|format(organization.month_to_date_cost.total) }}</div>
@@ -884,9 +883,9 @@
       <div class="privacy-mark" aria-hidden="true">P</div>
       <div>
         <strong>Tenant privacy boundary:</strong>
-        this control plane receives aggregate billing and provisioning metadata.
-        It has no application route to flight records, flight logs, incident
-        details, aircraft identifiers, or organization user activity.
+        this control plane receives aggregate billing, provisioning, and
+        security/audit metadata. It has no application route to flight records,
+        flight logs, incident details, raw media, or precise locations.
       </div>
     </div>
   </section>
@@ -917,9 +916,15 @@
     <section class="platform-panel">
       <div class="panel-heading">
         <div>
-          <h2>Control-plane audit</h2>
-          <p>Commercial and policy changes; credentials are never recorded.</p>
+          <h2>Recent administrative activity</h2>
+          <p>
+            Showing up to {{ audit_recent_limit }} administrative, billing, and
+            enrollment events from the past {{ audit_recent_days }} days.
+            {{ audit_event_total }} matched. Audit records are retained for
+            {{ audit_retention_days }} days unless held.
+          </p>
         </div>
+        <a class="panel-link" href="/platform-admin/audit">View audit log</a>
       </div>
       <div class="control-list">
       {% for event in audit_events %}

@@ -6,7 +6,6 @@ sqlalchemy
 greenlet
 suncalc
 requests
-stripe>=14.4,<15
 jinja2
 psycopg2-binary
 python-multipart

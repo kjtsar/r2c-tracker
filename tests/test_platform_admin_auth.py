@@ -11,10 +11,28 @@ from platform_admin_auth import (
     MicrosoftOidcClient,
     PlatformAdminAuthError,
     SmtpPlatformAdminEmailSender,
+    _organization_extended_beta_allowance_message,
 )
 
 
 class PlatformAdminAuthHelpersTest(unittest.TestCase):
+    def test_extended_beta_video_notice_preserves_non_video_services(self):
+        message = _organization_extended_beta_allowance_message(
+            "tracker@example.org",
+            "billing@ncssar.example",
+            "Billing Administrator",
+            "North County SAR",
+            "NCSSAR",
+            "beta_video_disabled",
+            "31 Aug 2026",
+            "https://r2c-tracker.com/ncssar/admin#service-status",
+        )
+        body = message.get_content()
+        self.assertIn("disabled for the remainder of the month ending 31 Aug 2026", body)
+        self.assertIn("Flight logs", body)
+        self.assertIn("R2C-based drone-owner arbitration", body)
+        self.assertIn("does not accept payments", body)
+
     def test_microsoft_authorization_uses_organizations_state_nonce_and_pkce(self):
         client = MicrosoftOidcClient("client-id", "client-secret")
 
@@ -231,7 +249,9 @@ class PlatformAdminAuthHelpersTest(unittest.TestCase):
         )
         message = connection.send_message.call_args.args[0]
         self.assertIn("single-use link", message.get_content())
-        self.assertIn("30-day trial", message.get_content())
+        self.assertIn("open-ended extended beta", message.get_content())
+        self.assertIn("does not accept payments", message.get_content())
+        self.assertIn("$10.00 calendar-month usage allowance", message.get_content())
         self.assertIn("Do not forward", message.get_content())
         self.assertNotIn("pilot", message.get_content().lower())
         self.assertEqual("admin@ncssar.example", message["To"])

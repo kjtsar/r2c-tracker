@@ -5,6 +5,7 @@ import re
 import secrets
 import uuid
 from dataclasses import dataclass
+from calendar import monthrange
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Iterable, Optional
@@ -16,6 +17,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    Index,
     Numeric,
     inspect,
     String,
@@ -24,6 +26,7 @@ from sqlalchemy import (
     delete,
     event,
     func,
+    or_,
     select,
     text,
     update,
@@ -77,6 +80,22 @@ VIDEO_RESPONSE_TIMEOUT_SECONDS = 60
 VIDEO_SESSION_AUTHORIZATION_SECONDS = 10 * 60
 RECORDING_APPROVAL_TIMEOUT_SECONDS = 60
 RECORDING_TRANSFER_TIMEOUT_SECONDS = 15 * 60
+AUDIT_EVENT_RETENTION_DAYS = 365
+AUDIT_EVENT_HOT_DAYS = 90
+AUDIT_EVENT_RECENT_DAYS = 30
+AUDIT_EVENT_RECENT_LIMIT = 25
+AUDIT_EVENT_PAGE_SIZE = 50
+AUDIT_EVENT_EXPORT_LIMIT = 10_000
+EXTENDED_BETA_MONTHLY_ALLOWANCE = Decimal("10.00")
+EXTENDED_BETA_VIDEO_CUTOFF = Decimal("9.00")
+AUDIT_EVENT_CATEGORY_PREFIXES = {
+    "administration": ("organization.", "administrator.", "member."),
+    "billing": ("billing.",),
+    "enrollment": ("enrollment.", "device."),
+    "video": ("video.",),
+    "recording": ("recording.",),
+    "audit": ("audit.",),
+}
 
 
 def tablet_link_code(organization_designator: str, device_name: str) -> str:
@@ -195,7 +214,7 @@ class Organization(Base):
     legal_name: Mapped[str] = mapped_column(String(200), nullable=False)
     designator: Mapped[str] = mapped_column(String(16), unique=True, index=True)
     hostname: Mapped[str] = mapped_column(String(255), unique=True, index=True)
-    lifecycle_state: Mapped[str] = mapped_column(String(32), default="trial")
+    lifecycle_state: Mapped[str] = mapped_column(String(32), default="extended_beta")
     provisioning_state: Mapped[str] = mapped_column(
         String(32), default="simulation pending"
     )
@@ -478,7 +497,7 @@ class Subscription(Base):
     organization_id: Mapped[str] = mapped_column(
         ForeignKey("organizations.id"), unique=True, index=True
     )
-    state: Mapped[str] = mapped_column(String(24), default="trial")
+    state: Mapped[str] = mapped_column(String(24), default="extended_beta")
     collection_method: Mapped[str] = mapped_column(
         String(32), default="not configured"
     )
@@ -552,6 +571,35 @@ class UsageDaily(Base):
     )
 
 
+class ExtendedBetaAllowance(Base):
+    __tablename__ = "extended_beta_allowances"
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id", "billing_month", name="uq_beta_allowance_org_month"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id"), index=True
+    )
+    billing_month: Mapped[str] = mapped_column(String(7), nullable=False, index=True)
+    allowance_amount: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), default=EXTENDED_BETA_MONTHLY_ALLOWANCE
+    )
+    actual_cost: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal("0"))
+    forecast_cost: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal("0"))
+    billing_data_through: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    video_disabled_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True)
+    )
+    month_ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
 class BillingLedgerEntry(Base):
     __tablename__ = "billing_ledger"
     __table_args__ = (
@@ -596,6 +644,9 @@ class BillingNotification(Base):
 
 class ControlPlaneAuditEvent(Base):
     __tablename__ = "control_plane_audit_events"
+    __table_args__ = (
+        Index("idx_control_plane_audit_events_created_at", "created_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     organization_id: Mapped[Optional[str]] = mapped_column(
@@ -608,6 +659,7 @@ class ControlPlaneAuditEvent(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
     )
+    retention_hold: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class EnrollmentCampaign(Base):
@@ -831,7 +883,7 @@ class OrganizationRecord:
     notification_email: str
     primary_admin_name: str
     primary_admin_email: str
-    subscription_state: str = "trial"
+    subscription_state: str = "extended_beta"
     credit_balance: Decimal = Decimal("0.00")
     primary_admin_postal_address: str = ""
     primary_admin_phone: str = ""
@@ -934,6 +986,22 @@ class BillingNotificationRecord:
 
 
 @dataclass(frozen=True)
+class ExtendedBetaAllowanceRecord:
+    organization_id: str
+    billing_month: str
+    allowance_amount: Decimal
+    actual_cost: Decimal
+    forecast_cost: Decimal
+    billing_data_through: datetime
+    video_disabled_at: Optional[datetime]
+    month_ends_at: datetime
+
+    @property
+    def video_streaming_allowed(self) -> bool:
+        return self.video_disabled_at is None
+
+
+@dataclass(frozen=True)
 class UsageCostRecord:
     organization_id: str
     compute: Decimal
@@ -981,6 +1049,19 @@ class AuditEventRecord:
     event_type: str
     details: dict
     created_at: datetime
+    retention_hold: bool
+
+
+@dataclass(frozen=True)
+class AuditEventPage:
+    events: tuple[AuditEventRecord, ...]
+    total: int
+    page: int
+    page_size: int
+
+    @property
+    def total_pages(self) -> int:
+        return max(1, (self.total + self.page_size - 1) // self.page_size)
 
 
 @dataclass(frozen=True)
@@ -1097,6 +1178,7 @@ class RecordingDownloadRequestRecord:
     id: str
     organization_id: str
     device_credential_id: str
+    device_name: str
     stream_session_id: str
     drone_designator: str
     requester_user_id: str
@@ -1410,6 +1492,30 @@ class ControlPlaneStore:
                     "ALTER TABLE managed_access_requests "
                     f"ADD COLUMN terms_acknowledged_at {timestamp_type}"
                 ))
+            audit_columns = await connection.run_sync(
+                lambda sync_connection: {
+                    item["name"]
+                    for item in inspect(sync_connection).get_columns(
+                        "control_plane_audit_events"
+                    )
+                }
+            )
+            if "retention_hold" not in audit_columns:
+                boolean_type = (
+                    "BOOLEAN"
+                    if self.engine.dialect.name == "postgresql"
+                    else "INTEGER"
+                )
+                await connection.execute(text(
+                    "ALTER TABLE control_plane_audit_events "
+                    f"ADD COLUMN retention_hold {boolean_type} "
+                    "DEFAULT FALSE NOT NULL"
+                ))
+            await connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS "
+                "idx_control_plane_audit_events_created_at "
+                "ON control_plane_audit_events (created_at)"
+            ))
             billing_notification_columns = await connection.run_sync(
                 lambda sync_connection: {
                     item["name"]
@@ -1530,6 +1636,39 @@ class ControlPlaneStore:
                     organization.hostname = (
                         f"r2c-tracker.com/{organization.designator.lower()}"
                     )
+                if organization.lifecycle_state != "archived":
+                    organization.lifecycle_state = "extended_beta"
+                    organization.billing_mode = "extended beta"
+                    organization.trial_starts_at = None
+                    organization.trial_ends_at = None
+                elif organization.archived_from_lifecycle_state in {
+                    "trial", "grace", "funded"
+                }:
+                    organization.archived_from_lifecycle_state = "extended_beta"
+            subscriptions = (await session.scalars(select(Subscription))).all()
+            for subscription in subscriptions:
+                if subscription.state != "archived":
+                    subscription.state = "extended_beta"
+                    subscription.collection_method = "none"
+                    subscription.billing_cadence = "calendar month allowance"
+                    subscription.trial_starts_at = None
+                    subscription.trial_ends_at = None
+            await session.execute(
+                update(BillingNotification)
+                .where(
+                    BillingNotification.state == "pending",
+                    BillingNotification.notification_type.in_((
+                        "funding_exhausted",
+                        "trial_ending_7d",
+                        "trial_ending_1d",
+                        "trial_ended",
+                        "grace_ending_7d",
+                        "grace_ending_1d",
+                        "grace_ended",
+                    )),
+                )
+                .values(state="canceled")
+            )
             subscribed_ids = set(
                 await session.scalars(select(Subscription.organization_id))
             )
@@ -1540,9 +1679,15 @@ class ControlPlaneStore:
                     Subscription(
                         id=new_id(),
                         organization_id=organization.id,
-                        state=organization.lifecycle_state,
-                        trial_starts_at=organization.trial_starts_at,
-                        trial_ends_at=organization.trial_ends_at,
+                        state=(
+                            "archived"
+                            if organization.lifecycle_state == "archived"
+                            else "extended_beta"
+                        ),
+                        collection_method="none",
+                        billing_cadence="calendar month allowance",
+                        trial_starts_at=None,
+                        trial_ends_at=None,
                         created_at=organization.created_at,
                         updated_at=utc_now(),
                     )
@@ -1965,20 +2110,18 @@ class ControlPlaneStore:
             raise InvalidOrganizationError("Enter a phone number no longer than 64 characters.")
 
         hostname = f"r2c-tracker.com/{clean_designator.lower()}"
-        trial_start = created_at if simulation else None
-        trial_end = created_at + timedelta(days=30) if simulation else None
         organization = Organization(
             id=new_id(),
             legal_name=clean_name,
             designator=clean_designator,
             hostname=hostname,
-            lifecycle_state="trial",
+            lifecycle_state="extended_beta",
             provisioning_state=(
                 "simulation ready" if simulation else "provisioning queued"
             ),
-            billing_mode="shadow billing",
-            trial_starts_at=trial_start,
-            trial_ends_at=trial_end,
+            billing_mode="extended beta",
+            trial_starts_at=None,
+            trial_ends_at=None,
             notification_email=clean_email,
             created_at=created_at,
             updated_at=created_at,
@@ -2018,9 +2161,11 @@ class ControlPlaneStore:
         subscription = Subscription(
             id=new_id(),
             organization_id=organization.id,
-            state="trial",
-            trial_starts_at=trial_start,
-            trial_ends_at=trial_end,
+            state="extended_beta",
+            collection_method="none",
+            billing_cadence="calendar month allowance",
+            trial_starts_at=None,
+            trial_ends_at=None,
             created_at=created_at,
             updated_at=created_at,
         )
@@ -2169,19 +2314,10 @@ class ControlPlaneStore:
         first_activation = organization.provisioning_state != "ready"
         organization.provisioning_state = "ready"
         if first_activation:
-            deposited, usage_cost = await self._organization_funding_totals(
-                session,
-                organization_id,
-            )
-            if deposited - usage_cost > 0:
-                organization.lifecycle_state = "funded"
-                organization.billing_mode = "prepaid credit"
-                organization.trial_starts_at = None
-                organization.trial_ends_at = None
-            else:
-                organization.lifecycle_state = "trial"
-                organization.trial_starts_at = activated_at
-                organization.trial_ends_at = activated_at + timedelta(days=30)
+            organization.lifecycle_state = "extended_beta"
+            organization.billing_mode = "extended beta"
+            organization.trial_starts_at = None
+            organization.trial_ends_at = None
         organization.updated_at = activated_at
         subscription = await session.scalar(
             select(Subscription).where(
@@ -2189,14 +2325,11 @@ class ControlPlaneStore:
             )
         )
         if subscription is not None and first_activation:
-            if organization.lifecycle_state == "funded":
-                subscription.state = "funded"
-                subscription.trial_starts_at = None
-                subscription.trial_ends_at = None
-            else:
-                subscription.state = "trial"
-                subscription.trial_starts_at = activated_at
-                subscription.trial_ends_at = activated_at + timedelta(days=30)
+            subscription.state = "extended_beta"
+            subscription.collection_method = "none"
+            subscription.billing_cadence = "calendar month allowance"
+            subscription.trial_starts_at = None
+            subscription.trial_ends_at = None
             subscription.updated_at = activated_at
         job = await session.scalar(
             select(ProvisioningJob).where(
@@ -2710,9 +2843,10 @@ class ControlPlaneStore:
                 raise InvalidOrganizationError("Organization not found.")
             if organization.lifecycle_state != "archived":
                 raise ControlPlaneError(f"{clean_designator} is not archived.")
-            organization.lifecycle_state = (
-                organization.archived_from_lifecycle_state or "trial"
-            )
+            organization.lifecycle_state = "extended_beta"
+            organization.billing_mode = "extended beta"
+            organization.trial_starts_at = None
+            organization.trial_ends_at = None
             organization.provisioning_state = (
                 organization.archived_from_provisioning_state or "ready"
             )
@@ -2752,10 +2886,11 @@ class ControlPlaneStore:
                 )
             )
             if subscription is not None:
-                subscription.state = (
-                    organization.archived_from_subscription_state
-                    or organization.lifecycle_state
-                )
+                subscription.state = "extended_beta"
+                subscription.collection_method = "none"
+                subscription.billing_cadence = "calendar month allowance"
+                subscription.trial_starts_at = None
+                subscription.trial_ends_at = None
                 subscription.updated_at = restored_at
             job = await session.scalar(
                 select(ProvisioningJob).where(
@@ -3960,69 +4095,22 @@ class ControlPlaneStore:
     ) -> None:
         if organization.lifecycle_state == "archived":
             return
-        deposited, usage_cost = await self._organization_funding_totals(
-            session,
-            organization.id,
-        )
         subscription = await session.scalar(
             select(Subscription).where(
                 Subscription.organization_id == organization.id
             )
         )
-        previous_state = organization.lifecycle_state
-        if deposited - usage_cost > 0:
-            organization.lifecycle_state = "funded"
-            organization.billing_mode = "prepaid credit"
-            organization.trial_starts_at = None
-            organization.trial_ends_at = None
-            if subscription is not None:
-                subscription.state = "funded"
-                subscription.trial_starts_at = None
-                subscription.trial_ends_at = None
-                subscription.updated_at = changed_at
-        elif deposited > 0 and organization.lifecycle_state != "grace":
-            organization.lifecycle_state = "grace"
-            organization.billing_mode = "30-day grace"
-            organization.trial_starts_at = changed_at
-            organization.trial_ends_at = changed_at + timedelta(days=30)
-            if subscription is not None:
-                subscription.state = "grace"
-                subscription.trial_starts_at = changed_at
-                subscription.trial_ends_at = changed_at + timedelta(days=30)
-                subscription.updated_at = changed_at
-            session.add(
-                BillingNotification(
-                    organization_id=organization.id,
-                    notification_type="funding_exhausted",
-                    event_key=(
-                        f"funding-exhausted:{organization.id}:"
-                        f"{changed_at.isoformat()}"
-                    ),
-                    deadline_at=organization.trial_ends_at,
-                    created_at=changed_at,
-                )
-            )
-        if organization.lifecycle_state != previous_state:
-            session.add(
-                ControlPlaneAuditEvent(
-                    organization_id=organization.id,
-                    actor_type="billing_system",
-                    actor_id="gcp-usage-reconciliation",
-                    event_type="billing.funding_state_changed",
-                    details_json=json.dumps(
-                        {
-                            "from": previous_state,
-                            "to": organization.lifecycle_state,
-                            "deposited": str(deposited),
-                            "attributed_gcp_usage_cost": str(usage_cost),
-                            "available_credit": str(
-                                max(deposited - usage_cost, Decimal("0"))
-                            ),
-                        }
-                    ),
-                    created_at=changed_at,
-                )
-            )
+        organization.lifecycle_state = "extended_beta"
+        organization.billing_mode = "extended beta"
+        organization.trial_starts_at = None
+        organization.trial_ends_at = None
+        if subscription is not None:
+            subscription.state = "extended_beta"
+            subscription.collection_method = "none"
+            subscription.billing_cadence = "calendar month allowance"
+            subscription.trial_starts_at = None
+            subscription.trial_ends_at = None
+            subscription.updated_at = changed_at
         organization.updated_at = changed_at
 
     async def queue_lifecycle_deadline_notifications(
@@ -4114,6 +4202,197 @@ class ControlPlaneStore:
                 )
             await session.commit()
 
+    @staticmethod
+    def _extended_beta_allowance_record(
+        allowance: ExtendedBetaAllowance,
+    ) -> ExtendedBetaAllowanceRecord:
+        return ExtendedBetaAllowanceRecord(
+            organization_id=allowance.organization_id,
+            billing_month=allowance.billing_month,
+            allowance_amount=Decimal(allowance.allowance_amount),
+            actual_cost=Decimal(allowance.actual_cost),
+            forecast_cost=Decimal(allowance.forecast_cost),
+            billing_data_through=as_utc(allowance.billing_data_through),
+            video_disabled_at=as_utc(allowance.video_disabled_at),
+            month_ends_at=as_utc(allowance.month_ends_at),
+        )
+
+    async def reconcile_extended_beta_allowances(
+        self,
+        *,
+        billing_month: str,
+        billing_data_through: datetime,
+        actual_costs: dict[str, Decimal],
+        forecast_costs: dict[str, Decimal],
+        now: Optional[datetime] = None,
+    ) -> tuple[ExtendedBetaAllowanceRecord, ...]:
+        reconciled_at = now or utc_now()
+        expected_month = reconciled_at.strftime("%Y-%m")
+        if billing_month != expected_month:
+            raise ControlPlaneError("Allowance data must be for the current month.")
+        last_day = monthrange(reconciled_at.year, reconciled_at.month)[1]
+        month_ends_at = datetime(
+            reconciled_at.year,
+            reconciled_at.month,
+            last_day,
+            23,
+            59,
+            59,
+            tzinfo=UTC,
+        )
+        changed_organizations = set()
+        async with self.sessions() as session:
+            organizations = (
+                await session.scalars(
+                    select(Organization).where(
+                        Organization.lifecycle_state != "archived"
+                    )
+                )
+            ).all()
+            results = []
+            for organization in organizations:
+                actual = max(Decimal("0"), Decimal(actual_costs.get(
+                    organization.id, Decimal("0")
+                )))
+                forecast = max(actual, Decimal(forecast_costs.get(
+                    organization.id, actual
+                )))
+                allowance = await session.scalar(
+                    select(ExtendedBetaAllowance).where(
+                        ExtendedBetaAllowance.organization_id == organization.id,
+                        ExtendedBetaAllowance.billing_month == billing_month,
+                    ).with_for_update()
+                )
+                if allowance is None:
+                    values = {
+                        "id": new_id(),
+                        "organization_id": organization.id,
+                        "billing_month": billing_month,
+                        "allowance_amount": EXTENDED_BETA_MONTHLY_ALLOWANCE,
+                        "actual_cost": actual,
+                        "forecast_cost": forecast,
+                        "billing_data_through": billing_data_through,
+                        "month_ends_at": month_ends_at,
+                        "created_at": reconciled_at,
+                        "updated_at": reconciled_at,
+                    }
+                    insert = (
+                        postgresql_insert(ExtendedBetaAllowance)
+                        if self.engine.dialect.name == "postgresql"
+                        else sqlite_insert(ExtendedBetaAllowance)
+                    ).values(**values)
+                    await session.execute(insert.on_conflict_do_nothing(
+                        index_elements=["organization_id", "billing_month"]
+                    ))
+                    allowance = await session.scalar(
+                        select(ExtendedBetaAllowance).where(
+                            ExtendedBetaAllowance.organization_id == organization.id,
+                            ExtendedBetaAllowance.billing_month == billing_month,
+                        ).with_for_update()
+                    )
+                allowance.actual_cost = actual
+                allowance.forecast_cost = forecast
+                allowance.billing_data_through = billing_data_through
+                allowance.month_ends_at = month_ends_at
+                allowance.updated_at = reconciled_at
+
+                notification_types = []
+                if forecast > EXTENDED_BETA_MONTHLY_ALLOWANCE:
+                    notification_types.append("beta_allowance_on_track")
+                if actual > EXTENDED_BETA_MONTHLY_ALLOWANCE:
+                    notification_types.append("beta_allowance_exceeded")
+                if (
+                    actual >= EXTENDED_BETA_VIDEO_CUTOFF
+                    and allowance.video_disabled_at is None
+                ):
+                    allowance.video_disabled_at = reconciled_at
+                    notification_types.append("beta_video_disabled")
+                    changed_organizations.add(organization.id)
+                    active_requests = (
+                        await session.scalars(
+                            select(VideoStreamRequest).where(
+                                VideoStreamRequest.organization_id == organization.id,
+                                VideoStreamRequest.state.in_((
+                                    "pending", "probing", "awaiting_approval",
+                                    "approved", "streaming",
+                                )),
+                            )
+                        )
+                    ).all()
+                    request_ids = [request.id for request in active_requests]
+                    for request in active_requests:
+                        request.state = "stopped"
+                        request.status_message = (
+                            "Remote video disabled for the remainder of the "
+                            "extended beta allowance month."
+                        )
+                        request.stopped_at = reconciled_at
+                    if request_ids:
+                        await session.execute(delete(VideoPreflightExchange).where(
+                            VideoPreflightExchange.request_id.in_(request_ids)
+                        ))
+                        await session.execute(delete(VideoMediaExchange).where(
+                            VideoMediaExchange.request_id.in_(request_ids)
+                        ))
+                    session.add(ControlPlaneAuditEvent(
+                        organization_id=organization.id,
+                        actor_type="billing_system",
+                        actor_id="extended-beta-allowance",
+                        event_type="billing.video_disabled",
+                        details_json=json.dumps({
+                            "billing_month": billing_month,
+                            "actual_cost": str(actual),
+                            "allowance": str(EXTENDED_BETA_MONTHLY_ALLOWANCE),
+                            "month_ends_at": month_ends_at.isoformat(),
+                        }),
+                        created_at=reconciled_at,
+                    ))
+                for notification_type in notification_types:
+                    values = {
+                        "id": new_id(),
+                        "organization_id": organization.id,
+                        "notification_type": notification_type,
+                        "event_key": (
+                            f"extended-beta:{organization.id}:{billing_month}:"
+                            f"{notification_type}"
+                        ),
+                        "state": "pending",
+                        "deadline_at": month_ends_at,
+                        "created_at": reconciled_at,
+                    }
+                    insert = (
+                        postgresql_insert(BillingNotification)
+                        if self.engine.dialect.name == "postgresql"
+                        else sqlite_insert(BillingNotification)
+                    ).values(**values)
+                    await session.execute(
+                        insert.on_conflict_do_nothing(index_elements=["event_key"])
+                    )
+                results.append(allowance)
+            for organization_id in changed_organizations:
+                await self._notify_video_stream_change(session, organization_id)
+            await session.commit()
+            return tuple(self._extended_beta_allowance_record(item) for item in results)
+
+    async def get_extended_beta_allowance(
+        self,
+        organization_id: str,
+        *,
+        now: Optional[datetime] = None,
+    ) -> Optional[ExtendedBetaAllowanceRecord]:
+        checked_at = now or utc_now()
+        async with self.sessions() as session:
+            allowance = await session.scalar(
+                select(ExtendedBetaAllowance).where(
+                    ExtendedBetaAllowance.organization_id == organization_id,
+                    ExtendedBetaAllowance.billing_month == checked_at.strftime("%Y-%m"),
+                )
+            )
+        return (
+            self._extended_beta_allowance_record(allowance)
+            if allowance is not None else None
+        )
+
     async def list_pending_billing_notifications(
         self,
         limit: int = 20,
@@ -4145,14 +4424,34 @@ class ControlPlaneStore:
                     .limit(safe_limit)
                 )
             ).all()
+            organization_ids = {organization.id for _, organization, _ in rows}
+            billing_users = (
+                await session.scalars(
+                    select(OrganizationUser).where(
+                        OrganizationUser.organization_id.in_(organization_ids),
+                        OrganizationUser.state == "active",
+                    ).order_by(OrganizationUser.created_at)
+                )
+            ).all() if organization_ids else []
+        billing_admins = {}
+        for user in billing_users:
+            if "billing_admin" in user.roles and user.organization_id not in billing_admins:
+                billing_admins[user.organization_id] = user
         return tuple(
             BillingNotificationRecord(
                 id=notification.id,
                 organization_id=organization.id,
                 designator=organization.designator,
                 organization_name=organization.legal_name,
-                administrator_name=contact.name,
-                administrator_email=(organization.notification_email or contact.email),
+                administrator_name=(
+                    billing_admins[organization.id].display_name
+                    if organization.id in billing_admins else contact.name
+                ),
+                administrator_email=(
+                    billing_admins[organization.id].email
+                    if organization.id in billing_admins
+                    else (organization.notification_email or contact.email)
+                ),
                 notification_type=notification.notification_type,
                 deadline_at=as_utc(notification.deadline_at),
             )
@@ -4510,21 +4809,79 @@ class ControlPlaneStore:
         self,
         limit: int = 100,
     ) -> tuple[AuditEventRecord, ...]:
-        safe_limit = max(1, min(limit, 500))
+        page = await self.search_audit_events(
+            page_size=max(1, min(limit, 500))
+        )
+        return page.events
+
+    async def search_audit_events(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = AUDIT_EVENT_PAGE_SIZE,
+        start_at: Optional[datetime] = None,
+        end_at: Optional[datetime] = None,
+        organization_designator: str = "",
+        actor_type: str = "",
+        event_type: str = "",
+        categories: Iterable[str] = (),
+    ) -> AuditEventPage:
+        safe_page = max(1, page)
+        safe_page_size = max(1, min(page_size, AUDIT_EVENT_EXPORT_LIMIT))
+        conditions = []
+        if start_at is not None:
+            conditions.append(ControlPlaneAuditEvent.created_at >= start_at)
+        if end_at is not None:
+            conditions.append(ControlPlaneAuditEvent.created_at < end_at)
+        normalized_designator = organization_designator.strip().upper()
+        if normalized_designator:
+            conditions.append(Organization.designator == normalized_designator)
+        normalized_actor_type = actor_type.strip().lower()
+        if normalized_actor_type:
+            conditions.append(
+                ControlPlaneAuditEvent.actor_type == normalized_actor_type
+            )
+        normalized_event_type = event_type.strip().lower()
+        if normalized_event_type:
+            conditions.append(
+                ControlPlaneAuditEvent.event_type == normalized_event_type
+            )
+        category_conditions = []
+        for category in categories:
+            for prefix in AUDIT_EVENT_CATEGORY_PREFIXES.get(category, ()):
+                category_conditions.append(
+                    ControlPlaneAuditEvent.event_type.like(f"{prefix}%")
+                )
+        if category_conditions:
+            conditions.append(or_(*category_conditions))
+
+        joined = (
+            select(ControlPlaneAuditEvent, Organization.designator)
+            .outerjoin(
+                Organization,
+                Organization.id == ControlPlaneAuditEvent.organization_id,
+            )
+            .where(*conditions)
+        )
         async with self.sessions() as session:
+            total = int((await session.execute(
+                select(func.count())
+                .select_from(ControlPlaneAuditEvent)
+                .outerjoin(
+                    Organization,
+                    Organization.id == ControlPlaneAuditEvent.organization_id,
+                )
+                .where(*conditions)
+            )).scalar_one())
             rows = (
                 await session.execute(
-                    select(ControlPlaneAuditEvent, Organization.designator)
-                    .outerjoin(
-                        Organization,
-                        Organization.id
-                        == ControlPlaneAuditEvent.organization_id,
-                    )
+                    joined
                     .order_by(ControlPlaneAuditEvent.created_at.desc())
-                    .limit(safe_limit)
+                    .offset((safe_page - 1) * safe_page_size)
+                    .limit(safe_page_size)
                 )
             ).all()
-        return tuple(
+        events = tuple(
             AuditEventRecord(
                 id=event.id,
                 organization_id=event.organization_id,
@@ -4534,9 +4891,104 @@ class ControlPlaneStore:
                 event_type=event.event_type,
                 details=json.loads(event.details_json or "{}"),
                 created_at=as_utc(event.created_at),
+                retention_hold=bool(event.retention_hold),
             )
             for event, designator in rows
         )
+        return AuditEventPage(
+            events=events,
+            total=total,
+            page=safe_page,
+            page_size=safe_page_size,
+        )
+
+    async def purge_expired_audit_events(
+        self,
+        *,
+        now: Optional[datetime] = None,
+        retention_days: int = AUDIT_EVENT_RETENTION_DAYS,
+    ) -> int:
+        reference = as_utc(now or utc_now())
+        cutoff = reference - timedelta(days=max(1, retention_days))
+        async with self.sessions() as session:
+            result = await session.execute(
+                delete(ControlPlaneAuditEvent).where(
+                    ControlPlaneAuditEvent.created_at < cutoff,
+                    ControlPlaneAuditEvent.retention_hold.is_(False),
+                )
+            )
+            await session.commit()
+            return max(0, int(result.rowcount or 0))
+
+    async def record_audit_access(
+        self,
+        *,
+        actor_id: str,
+        event_type: str = "audit.viewed",
+        details: Optional[dict] = None,
+        now: Optional[datetime] = None,
+    ) -> None:
+        if event_type not in {"audit.viewed", "audit.exported"}:
+            raise ValueError("Unsupported audit access event type.")
+        async with self.sessions() as session:
+            session.add(ControlPlaneAuditEvent(
+                organization_id=None,
+                actor_type="platform_admin",
+                actor_id=actor_id,
+                event_type=event_type,
+                details_json=json.dumps(details or {}, sort_keys=True),
+                created_at=as_utc(now or utc_now()),
+            ))
+            await session.commit()
+
+    async def set_audit_event_retention_hold(
+        self,
+        *,
+        event_id: str,
+        retention_hold: bool,
+        actor_id: str,
+        now: Optional[datetime] = None,
+    ) -> AuditEventRecord:
+        changed_at = as_utc(now or utc_now())
+        async with self.sessions() as session:
+            event = await session.get(ControlPlaneAuditEvent, event_id)
+            if event is None:
+                raise ControlPlaneError("Audit event was not found.")
+            event.retention_hold = retention_hold
+            session.add(ControlPlaneAuditEvent(
+                organization_id=event.organization_id,
+                actor_type="platform_admin",
+                actor_id=actor_id,
+                event_type=(
+                    "audit.retention_hold_placed"
+                    if retention_hold
+                    else "audit.retention_hold_released"
+                ),
+                details_json=json.dumps({
+                    "target_event_id": event.id,
+                    "target_event_type": event.event_type,
+                }, sort_keys=True),
+                created_at=changed_at,
+            ))
+            await session.commit()
+            designator = None
+            if event.organization_id:
+                designator = await session.scalar(
+                    select(Organization.designator).where(
+                        Organization.id == event.organization_id
+                    )
+                )
+            return AuditEventRecord(
+                id=event.id,
+                organization_id=event.organization_id,
+                designator=designator,
+                actor_type=event.actor_type,
+                actor_id=event.actor_id,
+                event_type=event.event_type,
+                details=json.loads(event.details_json or "{}"),
+                created_at=as_utc(event.created_at),
+                retention_hold=bool(event.retention_hold),
+            )
 
     async def create_enrollment_campaign(
         self,
@@ -5029,6 +5481,19 @@ class ControlPlaneStore:
     ) -> VideoStreamRequestRecord:
         requested_at = now or utc_now()
         async with self.sessions() as session:
+            allowance = await session.scalar(
+                select(ExtendedBetaAllowance).where(
+                    ExtendedBetaAllowance.organization_id == organization_id,
+                    ExtendedBetaAllowance.billing_month == requested_at.strftime("%Y-%m"),
+                    ExtendedBetaAllowance.video_disabled_at.is_not(None),
+                )
+            )
+            if allowance is not None:
+                raise ControlPlaneError(
+                    "Remote video streaming is disabled for the remainder of "
+                    f"the month ending {as_utc(allowance.month_ends_at).strftime('%d %b %Y')}. "
+                    "Flight logs and R2C-based drone-owner arbitration remain available."
+                )
             stream = await session.scalar(
                 select(ActiveVideoStream).where(
                     ActiveVideoStream.organization_id == organization_id,
@@ -6588,6 +7053,8 @@ class ControlPlaneStore:
             max(0, int(value))
             for value in (audio_bytes_sent, audio_bytes_received, video_bytes_received)
         )
+        relay_delta = 0
+        result_record = None
         async with self.sessions() as session:
             row = (await session.execute(
                 select(VideoStreamRequest, ActiveVideoStream)
@@ -6621,6 +7088,7 @@ class ControlPlaneStore:
                 segment.video_bytes_received,
             )
             deltas = tuple(max(0, current - prior) for current, prior in zip(counters, previous))
+            relay_delta = sum(deltas)
             request.audio_bytes_sent += deltas[0]
             request.audio_bytes_received += deltas[1]
             request.video_bytes_received += deltas[2]
@@ -6629,7 +7097,17 @@ class ControlPlaneStore:
             segment.video_bytes_received = max(previous[2], counters[2])
             segment.updated_at = measured_at
             await session.commit()
-            return self._video_stream_request_record(request, stream)
+            result_record = self._video_stream_request_record(request, stream)
+        if relay_delta:
+            # The active browser media path currently requires TURN. Attribute
+            # the measured RTP payload to the organization; provider analytics
+            # can later reconcile protocol overhead and free-tier adjustments.
+            await self.increment_daily_usage(
+                organization_id=organization_id,
+                turn_relay_bytes=relay_delta,
+                now=measured_at,
+            )
+        return result_record
 
     async def stop_video_stream(
         self, *, request_id: str, organization_id: str, requester_user_id: str,
@@ -6812,6 +7290,7 @@ class ControlPlaneStore:
             id=item.id,
             organization_id=item.organization_id,
             device_credential_id=item.device_credential_id,
+            device_name=stream.device_name or "Unknown device",
             stream_session_id=stream.session_id,
             drone_designator=stream.drone_designator,
             requester_user_id=item.requester_user_id,

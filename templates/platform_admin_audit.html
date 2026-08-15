@@ -1,0 +1,190 @@
+{% extends "base.html" %}
+
+{% block title %}Platform Audit Log{% endblock %}
+
+{% block extra_head %}
+<style>
+  :root {
+      color-scheme: light;
+      --audit-navy: #17324d;
+      --audit-blue: #236a9f;
+      --audit-muted: #667784;
+      --audit-line: #d8e1e7;
+  }
+  body { margin: 0; background: #f4f7f9; color: #20303d; }
+  main { max-width: 1440px; margin: 0 auto; padding: 24px; }
+  footer { display: none; }
+  .audit-shell { display: grid; gap: 18px; }
+  .audit-header {
+      display: flex; justify-content: space-between; align-items: flex-end;
+      gap: 20px; padding: 24px 26px; border-radius: 14px; color: white;
+      background: linear-gradient(118deg, var(--audit-navy), #225d80);
+  }
+  .audit-header h1 { margin: 0 0 7px; font-size: clamp(1.6rem, 3vw, 2.25rem); }
+  .audit-header p { margin: 0; max-width: 760px; color: #dcebf4; line-height: 1.45; }
+  .audit-header a { color: white; font-weight: 700; }
+  .policy-note {
+      padding: 14px 18px; border: 1px solid #b8cedd; border-radius: 10px;
+      background: #eaf4fb; color: #29445d; line-height: 1.45;
+  }
+  .audit-panel {
+      overflow: hidden; border: 1px solid var(--audit-line); border-radius: 12px;
+      background: white; box-shadow: 0 7px 20px rgba(22, 47, 65, 0.06);
+  }
+  .filter-form {
+      display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr));
+      gap: 12px; padding: 18px;
+  }
+  .filter-form label { display: grid; gap: 5px; color: var(--audit-muted); font-size: 0.8rem; font-weight: 700; }
+  .filter-form input, .filter-form select {
+      box-sizing: border-box; width: 100%; padding: 9px 10px;
+      border: 1px solid #b8c7d1; border-radius: 7px; background: white; font: inherit;
+  }
+  .filter-actions { display: flex; align-items: flex-end; gap: 9px; }
+  .button, .filter-actions button {
+      display: inline-flex; align-items: center; justify-content: center;
+      padding: 9px 13px; border: 1px solid var(--audit-blue); border-radius: 7px;
+      background: var(--audit-blue); color: white; font: inherit; font-weight: 700;
+      text-decoration: none; cursor: pointer;
+  }
+  .button.secondary { background: white; color: var(--audit-blue); }
+  .result-heading {
+      display: flex; justify-content: space-between; align-items: center;
+      gap: 14px; padding: 16px 18px; border-top: 1px solid var(--audit-line);
+      border-bottom: 1px solid var(--audit-line);
+  }
+  .result-heading strong { color: var(--audit-navy); }
+  .table-scroll { overflow-x: auto; }
+  table { min-width: 980px; box-shadow: none; }
+  th { padding: 10px 12px; background: #f3f7fa; color: #546673; font-size: 0.75rem; letter-spacing: 0.04em; text-transform: uppercase; }
+  td { padding: 12px; vertical-align: top; white-space: normal; }
+  .event-type { color: var(--audit-navy); font-weight: 750; }
+  .secondary { margin-top: 3px; color: var(--audit-muted); font-size: 0.8rem; }
+  .hold-badge { display: inline-block; padding: 3px 7px; border-radius: 999px; background: #fff0cf; color: #765000; font-size: 0.75rem; font-weight: 700; }
+  .hold-form { margin: 0; }
+  .hold-form button { padding: 6px 9px; border: 1px solid #8ba6b8; border-radius: 6px; background: white; color: #29445d; cursor: pointer; }
+  .pagination { display: flex; justify-content: space-between; align-items: center; gap: 14px; padding: 16px 18px; }
+  .pagination-links { display: flex; gap: 8px; }
+  @media (max-width: 820px) {
+      main { padding: 14px; }
+      .audit-header { align-items: flex-start; flex-direction: column; }
+      .filter-form { grid-template-columns: 1fr 1fr; }
+  }
+  @media (max-width: 520px) {
+      .filter-form { grid-template-columns: 1fr; }
+      .result-heading, .pagination { align-items: flex-start; flex-direction: column; }
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="audit-shell">
+  <header class="audit-header">
+    <div>
+      <h1>Platform audit log</h1>
+      <p>Administrative and operational accountability records. Credentials, raw media, and tenant flight content are not recorded here.</p>
+    </div>
+    <div><a href="/platform-admin/organizations">Back to organizations</a></div>
+  </header>
+
+  <div class="policy-note" role="note">
+    <strong>Retention policy:</strong> {{ audit_retention_days }} days from the event timestamp.
+    The newest {{ audit_hot_days }} days are the default search window. A retention hold prevents
+    scheduled deletion until an authorized platform administrator releases it. Audit-log views,
+    exports, and hold changes are themselves audited.
+  </div>
+
+  <section class="audit-panel">
+    <form class="filter-form" method="get" action="/platform-admin/audit">
+      <label>Start date
+        <input name="start_date" type="date" value="{{ audit_filters.start_date }}">
+      </label>
+      <label>End date
+        <input name="end_date" type="date" value="{{ audit_filters.end_date }}">
+      </label>
+      <label>Organization
+        <select name="organization">
+          <option value="">All organizations</option>
+          {% for organization in organizations %}
+          <option value="{{ organization.designator }}"{% if audit_filters.organization == organization.designator %} selected{% endif %}>{{ organization.designator }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Category
+        <select name="category">
+          <option value="">All categories</option>
+          {% for category in audit_categories %}
+          <option value="{{ category }}"{% if audit_filters.category == category %} selected{% endif %}>{{ category|capitalize }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Actor type
+        <select name="actor_type">
+          <option value="">All actor types</option>
+          {% for actor_type in audit_actor_types %}
+          <option value="{{ actor_type }}"{% if audit_filters.actor_type == actor_type %} selected{% endif %}>{{ actor_type|replace("_", " ")|title }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Exact event type
+        <input name="event_type" value="{{ audit_filters.event_type }}" placeholder="member.updated" maxlength="80">
+      </label>
+      <div class="filter-actions">
+        <button type="submit">Apply filters</button>
+        <a class="button secondary" href="/platform-admin/audit">Reset</a>
+      </div>
+    </form>
+
+    <div class="result-heading">
+      <div>
+        <strong>{{ audit_page.total }} matching event{% if audit_page.total != 1 %}s{% endif %}</strong>
+        <div class="secondary">Page {{ audit_page.page }} of {{ audit_page.total_pages }} · {{ audit_page.page_size }} per page</div>
+      </div>
+      <a class="button secondary" href="{{ export_url }}">Export filtered CSV</a>
+    </div>
+
+    <div class="table-scroll" tabindex="0">
+      <table>
+        <thead>
+          <tr>
+            <th>Event</th>
+            <th>Organization</th>
+            <th>Actor</th>
+            <th>Time</th>
+            <th>Retention</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for event in audit_page.events %}
+          <tr>
+            <td><div class="event-type">{{ event.event_type }}</div><div class="secondary">ID {{ event.id }}</div></td>
+            <td>{{ event.designator or "Platform" }}</td>
+            <td>{{ event.actor_type }}<div class="secondary">{{ event.actor_id }}</div></td>
+            <td>{{ event.created_at.strftime("%d %b %Y %H:%M UTC") }}</td>
+            <td>
+              {% if event.retention_hold %}<span class="hold-badge">Held</span>{% endif %}
+              <form class="hold-form" method="post" action="/platform-admin/audit/{{ event.id }}/retention-hold">
+                <input type="hidden" name="form_token" value="{{ audit_csrf_token }}">
+                <input type="hidden" name="return_to" value="{{ current_url }}">
+                <input type="hidden" name="action" value="{{ 'release' if event.retention_hold else 'place' }}">
+                <button type="submit">{{ "Release hold" if event.retention_hold else "Place hold" }}</button>
+              </form>
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="5" class="secondary">No audit events match these filters.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <nav class="pagination" aria-label="Audit pages">
+      <span>{{ audit_page.total }} retained matching event{% if audit_page.total != 1 %}s{% endif %}</span>
+      <div class="pagination-links">
+        {% if previous_url %}<a class="button secondary" href="{{ previous_url }}">Previous</a>{% endif %}
+        {% if next_url %}<a class="button secondary" href="{{ next_url }}">Next</a>{% endif %}
+      </div>
+    </nav>
+  </section>
+</div>
+{% endblock %}

@@ -153,7 +153,6 @@ class SecurityAuthorizationInventoryTest(unittest.TestCase):
         signed_or_vendor_callbacks = {
             "managed_access_request_ingest",
             "redeem_device_enrollment",
-            "stripe_billing_webhook",
         }
         for route in self.routes():
             methods = getattr(route, "methods", set()) or set()
@@ -187,7 +186,7 @@ class SecurityAuthorizationInventoryTest(unittest.TestCase):
         self.assertIn("pip install --no-cache-dir -r requirements.lock", dockerfile)
         self.assertIn("fastapi==", lock)
         self.assertIn("sqlalchemy==", lock)
-        self.assertIn("stripe==", lock)
+        self.assertNotIn("stripe==", lock)
 
     def test_security_gate_accepts_python_from_path(self):
         root = pathlib.Path(__file__).resolve().parents[1]

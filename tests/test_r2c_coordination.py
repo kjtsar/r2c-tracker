@@ -31,7 +31,8 @@ def load_coordination_classes():
     manager = types.SimpleNamespace(broadcast=_broadcast)
 
     class FakeVideoIceServerProvider:
-        async def get_ice_servers(self):
+        async def get_ice_servers(self, custom_identifier=""):
+            self.custom_identifier = custom_identifier
             return [{
                 "urls": ["turns:turn.example.test:443?transport=tcp"],
                 "username": "short-lived-user",
@@ -262,6 +263,7 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
         )
         exchange = types.SimpleNamespace(
             request_id="request-1",
+            organization_id="organization-1",
             device_credential_id="device-1",
             stream_session_id="stream-1",
             browser_offer_sdp="v=0\r\n",
@@ -281,6 +283,12 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             "short-lived-password",
             payload["iceServers"][0]["credential"],
+        )
+        self.assertEqual(
+            "organization:organization-1",
+            self.hub.send_video_media_offer.__globals__[
+                "video_ice_server_provider"
+            ].custom_identifier,
         )
 
     async def test_video_stream_request_is_delivered_to_online_tablet(self):
@@ -438,6 +446,7 @@ class R2CCoordinationHubTest(unittest.IsolatedAsyncioTestCase):
         self.hub._connections_by_device_credential_id.pop("device-1")
         exchange = types.SimpleNamespace(
             request_id="request-1",
+            organization_id="organization-1",
             device_credential_id="device-1",
             browser_offer_sdp="v=0\r\n",
             expires_at=datetime(2026, 7, 31, 22, 0, tzinfo=UTC),

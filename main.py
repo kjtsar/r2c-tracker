@@ -17,6 +17,7 @@ import logging
 import secrets
 import hashlib
 import anyio
+from calendar import monthrange
 from dataclasses import replace
 from decimal import Decimal
 import numpy as np
@@ -34,7 +35,6 @@ from fastapi import BackgroundTasks
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
-from starlette.background import BackgroundTask
 from starlette.status import HTTP_403_FORBIDDEN
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -51,6 +51,13 @@ from suncalc import get_times
 from google.cloud.sql.connector import Connector, IPTypes
 from faa_proxy import FaaNotamProxy, FaaProxyError
 from control_plane import (
+    AUDIT_EVENT_CATEGORY_PREFIXES,
+    AUDIT_EVENT_EXPORT_LIMIT,
+    AUDIT_EVENT_HOT_DAYS,
+    AUDIT_EVENT_PAGE_SIZE,
+    AUDIT_EVENT_RECENT_DAYS,
+    AUDIT_EVENT_RECENT_LIMIT,
+    AUDIT_EVENT_RETENTION_DAYS,
     ControlPlaneError,
     ControlPlaneStore,
     DeviceCredentialRecord,
@@ -93,7 +100,6 @@ from turn_credentials import (
     CloudflareTurnCredentialProvider,
     sanitize_ice_servers,
 )
-from stripe_checkout import StripeCheckoutError, StripeCheckoutProvider
 
 # --- CONFIGURATION & DATABASE SETUP ---
 DB_URL = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./test.db") # Defaults to local file if no Cloud SQL
@@ -346,7 +352,6 @@ smtp_email_sender = SmtpPlatformAdminEmailSender.from_environment()
 platform_admin_email_sender = (
     gmail_email_sender if gmail_email_sender.is_configured else smtp_email_sender
 )
-stripe_checkout_provider = StripeCheckoutProvider.from_environment()
 PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_TARGET = os.environ.get(
     "PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_TARGET", ""
 ).strip()
@@ -373,7 +378,6 @@ def organization_site_ready() -> bool:
 async def deliver_pending_billing_notifications() -> None:
     if control_plane_store is None or not platform_admin_email_sender.is_configured:
         return
-    await control_plane_store.queue_lifecycle_deadline_notifications()
     notifications = await control_plane_store.list_pending_billing_notifications()
     for notification in notifications:
         deadline = (
@@ -386,42 +390,27 @@ async def deliver_pending_billing_notifications() -> None:
                 f"{CONTROL_PLANE_PUBLIC_URL.rstrip('/')}/"
                 f"{notification.designator.lower()}/admin#service-status"
             )
-            if notification.notification_type == "funding_exhausted":
+            if notification.notification_type in {
+                "beta_allowance_on_track",
+                "beta_allowance_exceeded",
+                "beta_video_disabled",
+            }:
                 await asyncio.to_thread(
-                    platform_admin_email_sender.send_organization_funding_exhausted,
+                    platform_admin_email_sender.send_organization_extended_beta_allowance,
                     recipient=notification.administrator_email,
                     administrator_name=notification.administrator_name,
                     organization_name=notification.organization_name,
                     designator=notification.designator,
-                    grace_ends=deadline,
+                    notification_type=notification.notification_type,
+                    month_end=deadline,
                     administration_url=administration_url,
                 )
             else:
-                lifecycle, _, phase = notification.notification_type.partition("_")
-                timing = {
-                    "ending_7d": "ends within seven days",
-                    "ending_1d": "ends within one day",
-                    "ended": "has ended",
-                }.get(phase)
-                if lifecycle not in {"trial", "grace"} or timing is None:
-                    continue
-                await asyncio.to_thread(
-                    platform_admin_email_sender.send_organization_lifecycle_deadline,
-                    recipient=notification.administrator_email,
-                    administrator_name=notification.administrator_name,
-                    organization_name=notification.organization_name,
-                    designator=notification.designator,
-                    lifecycle_label=(
-                        "trial" if lifecycle == "trial" else "grace period"
-                    ),
-                    timing=timing,
-                    deadline=deadline,
-                    administration_url=administration_url,
-                    records_url=(
-                        f"{CONTROL_PLANE_PUBLIC_URL.rstrip('/')}/"
-                        f"{notification.designator.lower()}/admin/flights"
-                    ),
+                await control_plane_store.mark_billing_notification_failed(
+                    notification.id,
+                    "Unsupported legacy billing notification.",
                 )
+                continue
             await control_plane_store.mark_billing_notification_sent(notification.id)
         except Exception as exc:
             logging.exception("Organization notification delivery failed")
@@ -433,11 +422,67 @@ async def deliver_pending_billing_notifications() -> None:
 
 async def billing_notification_worker(stop: asyncio.Event) -> None:
     while not stop.is_set():
-        await deliver_pending_billing_notifications()
         try:
-            await asyncio.wait_for(stop.wait(), timeout=60)
+            await reconcile_extended_beta_allowances()
+            await deliver_pending_billing_notifications()
+        except Exception:
+            logging.exception("Extended-beta allowance reconciliation failed")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=60 * 60)
         except TimeoutError:
             pass
+
+
+def forecast_organization_cost(actual_cost: Decimal, through: datetime) -> Decimal:
+    days_in_month = monthrange(through.year, through.month)[1]
+    elapsed_days = max(
+        Decimal("1"),
+        Decimal(through.day - 1) + Decimal(
+            through.hour * 3600 + through.minute * 60 + through.second
+        ) / Decimal(86400),
+    )
+    return (actual_cost * Decimal(days_in_month) / elapsed_days).quantize(
+        Decimal("0.01")
+    )
+
+
+async def reconcile_extended_beta_allowances() -> None:
+    if control_plane_store is None:
+        return
+    snapshot, records, usage_aggregates = await asyncio.gather(
+        asyncio.to_thread(load_platform_billing_snapshot),
+        control_plane_store.list_organizations(),
+        control_plane_store.month_to_date_usage_aggregates(),
+    )
+    if (
+        snapshot.source_status != "ready"
+        or not snapshot.billing_period_is_current
+        or snapshot.billing_data_stale
+        or snapshot.billing_period != datetime.now(UTC).strftime("%Y-%m")
+    ):
+        return
+    allocation_inputs = platform_allocation_inputs(records, usage_aggregates)
+    allocated_costs, _unallocated = allocate_platform_costs(
+        snapshot.actual_cost_breakdown_mtd,
+        allocation_inputs,
+    )
+    actual_costs = {
+        organization_id: cost.total
+        for organization_id, cost in allocated_costs.items()
+    }
+    forecasts = {
+        organization_id: forecast_organization_cost(
+            cost,
+            snapshot.billing_data_through,
+        )
+        for organization_id, cost in actual_costs.items()
+    }
+    await control_plane_store.reconcile_extended_beta_allowances(
+        billing_month=snapshot.billing_period,
+        billing_data_through=snapshot.billing_data_through,
+        actual_costs=actual_costs,
+        forecast_costs=forecasts,
+    )
 
 
 def load_platform_billing_snapshot():
@@ -1030,6 +1075,25 @@ async def recording_spool_cleanup_worker(stop: asyncio.Event) -> None:
         except asyncio.TimeoutError:
             pass
 
+
+async def audit_retention_cleanup_worker(stop: asyncio.Event) -> None:
+    while not stop.is_set():
+        try:
+            if control_plane_store is not None:
+                removed = await control_plane_store.purge_expired_audit_events()
+                if removed:
+                    logger.info(
+                        "Removed %s audit events older than %s days",
+                        removed,
+                        AUDIT_EVENT_RETENTION_DAYS,
+                    )
+        except Exception as exc:
+            logger.warning("Audit retention cleanup failed: %s", exc)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=24 * 60 * 60)
+        except asyncio.TimeoutError:
+            pass
+
 if __name__ == "__main__":
     asyncio.run(init_db())
 
@@ -1045,7 +1109,11 @@ async def lifespan(app: FastAPI):
     recording_spool_cleanup_task = asyncio.create_task(
         recording_spool_cleanup_worker(recording_spool_cleanup_stop)
     )
-    if control_plane_store is not None and platform_admin_email_sender.is_configured:
+    audit_retention_cleanup_stop = asyncio.Event()
+    audit_retention_cleanup_task = asyncio.create_task(
+        audit_retention_cleanup_worker(audit_retention_cleanup_stop)
+    )
+    if control_plane_store is not None:
         billing_notification_task = asyncio.create_task(
             billing_notification_worker(billing_notification_stop)
         )
@@ -1055,9 +1123,11 @@ async def lifespan(app: FastAPI):
     await r2c_hub.stop()
     billing_notification_stop.set()
     recording_spool_cleanup_stop.set()
+    audit_retention_cleanup_stop.set()
     if billing_notification_task is not None:
         await billing_notification_task
     await recording_spool_cleanup_task
+    await audit_retention_cleanup_task
     if control_plane_store is not None:
         await control_plane_store.dispose()
     await engine.dispose()
@@ -1093,7 +1163,6 @@ async def protect_control_plane_pages(request: Request, call_next):
         r"/[a-z0-9]{2,16}/(?:"
         r"activate(?:/(?:google|microsoft))?|login|forgot-password|reset-password|"
         r"(?:google|microsoft)/start|logout|admin(?:/.*)?|settings|members|"
-        r"billing/checkout|"
         r"streams(?:/status|/[^/]+/request|/requests/[^/]+/"
         r"(?:cancel|preflight/(?:offer|status)))?|"
         r"enroll(?:/credential)?|"
@@ -2636,7 +2705,9 @@ class R2CCoordinationHub:
             return ()
 
     async def send_video_preflight_offer(self, exchange) -> bool:
-        ice_servers = await video_ice_server_provider.get_ice_servers()
+        ice_servers = await video_ice_server_provider.get_ice_servers(
+            f"organization:{exchange.organization_id}"
+        )
         async with self._lock:
             connections = self._device_connections_locked(
                 exchange.device_credential_id
@@ -2709,7 +2780,9 @@ class R2CCoordinationHub:
             return False
 
     async def send_video_media_offer(self, exchange) -> bool:
-        ice_servers = await video_ice_server_provider.get_ice_servers()
+        ice_servers = await video_ice_server_provider.get_ice_servers(
+            f"organization:{exchange.organization_id}"
+        )
         async with self._lock:
             connections = self._device_connections_locked(
                 exchange.device_credential_id
@@ -4440,6 +4513,25 @@ async def meter_organization_usage(
             credential.organization_id,
         )
 
+
+async def meter_organization_usage_by_id(
+    organization_id: str,
+    **increments,
+) -> None:
+    """Record aggregate usage when an authenticated organization user owns it."""
+    if not organization_id or control_plane_store is None:
+        return
+    try:
+        await control_plane_store.increment_daily_usage(
+            organization_id=organization_id,
+            **increments,
+        )
+    except Exception:
+        logger.exception(
+            "Unable to record aggregate organization usage: organization=%s",
+            organization_id,
+        )
+
 async def archive_flight_log(
     title,
     flight_timestamp,
@@ -6073,26 +6165,40 @@ async def platform_admin_organizations(
         request: Request,
         user=Depends(check_platform_admin)):
     snapshot = await asyncio.to_thread(load_platform_billing_snapshot)
+    audit_now = datetime.now(UTC)
     activation_url = request.session.pop("_platform_activation_url", None)
     provisioning_jobs = ()
     audit_events = ()
+    audit_event_total = 0
     managed_access_requests = ()
-    ledger_nonces = {}
     if control_plane_store is not None:
         (
             records,
             usage_aggregates,
             provisioning_jobs,
-            audit_events,
+            audit_page,
             managed_access_requests,
             collected_mtd,
         ) = await asyncio.gather(
             control_plane_store.list_organizations(),
             control_plane_store.month_to_date_usage_aggregates(),
             control_plane_store.list_provisioning_jobs(),
-            control_plane_store.list_audit_events(),
+            control_plane_store.search_audit_events(
+                page_size=AUDIT_EVENT_RECENT_LIMIT,
+                start_at=(
+                    audit_now - timedelta(days=AUDIT_EVENT_RECENT_DAYS)
+                ),
+                categories=("administration", "billing", "enrollment"),
+            ),
             control_plane_store.list_managed_access_requests(),
             control_plane_store.collected_month_to_date(),
+        )
+        audit_events = audit_page.events
+        audit_event_total = audit_page.total
+        await control_plane_store.record_audit_access(
+            actor_id=user.id,
+            details={"view": "recent_administrative_summary"},
+            now=audit_now,
         )
         allocation_inputs = platform_allocation_inputs(records, usage_aggregates)
         allocated_costs, allocation_unallocated = allocate_platform_costs(
@@ -6151,11 +6257,6 @@ async def platform_admin_organizations(
             collected_mtd=collected_mtd,
             organizations_are_illustrative=False,
         )
-        ledger_nonces = {
-            record.designator: secrets.token_urlsafe(24)
-            for record in records
-            if record.lifecycle_state != "archived"
-        }
     return templates.TemplateResponse(
         request=request,
         name="platform_admin.html",
@@ -6182,8 +6283,11 @@ async def platform_admin_organizations(
             "activation_url": activation_url,
             "provisioning_jobs": provisioning_jobs,
             "audit_events": audit_events,
+            "audit_event_total": audit_event_total,
+            "audit_recent_days": AUDIT_EVENT_RECENT_DAYS,
+            "audit_recent_limit": AUDIT_EVENT_RECENT_LIMIT,
+            "audit_retention_days": AUDIT_EVENT_RETENTION_DAYS,
             "managed_access_requests": managed_access_requests,
-            "ledger_nonces": ledger_nonces,
             "platform_admin": user,
             "account_csrf_token": csrf_token(
                 request,
@@ -6191,6 +6295,304 @@ async def platform_admin_organizations(
             ),
         },
     )
+
+
+AUDIT_ACTOR_TYPES = (
+    "platform_admin",
+    "organization_user",
+    "organization_device",
+    "device_enrollment",
+    "billing_system",
+)
+
+
+def platform_audit_filters(
+    *,
+    start_date: str,
+    end_date: str,
+    organization: str,
+    category: str,
+    actor_type: str,
+    event_type: str,
+    now: Optional[datetime] = None,
+) -> dict:
+    reference = now or datetime.now(UTC)
+
+    def parse_date(value: str, label: str, fallback: date) -> date:
+        if not value:
+            return fallback
+        try:
+            return date.fromisoformat(value)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{label} must use YYYY-MM-DD.",
+            ) from exc
+
+    today = reference.date()
+    parsed_start = parse_date(
+        start_date,
+        "Start date",
+        today - timedelta(days=AUDIT_EVENT_HOT_DAYS),
+    )
+    parsed_end = parse_date(end_date, "End date", today)
+    if parsed_start > parsed_end:
+        raise HTTPException(
+            status_code=400,
+            detail="Start date must be on or before end date.",
+        )
+    if (parsed_end - parsed_start).days > AUDIT_EVENT_RETENTION_DAYS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Audit searches are limited to {AUDIT_EVENT_RETENTION_DAYS} "
+                "days."
+            ),
+        )
+
+    normalized_organization = organization.strip().upper()
+    if normalized_organization and not re.fullmatch(
+        r"[A-Z][A-Z0-9]{1,15}", normalized_organization
+    ):
+        raise HTTPException(status_code=400, detail="Invalid organization filter.")
+    normalized_category = category.strip().lower()
+    if (
+        normalized_category
+        and normalized_category not in AUDIT_EVENT_CATEGORY_PREFIXES
+    ):
+        raise HTTPException(status_code=400, detail="Invalid audit category.")
+    normalized_actor = actor_type.strip().lower()
+    if normalized_actor and normalized_actor not in AUDIT_ACTOR_TYPES:
+        raise HTTPException(status_code=400, detail="Invalid actor type.")
+    normalized_event = event_type.strip().lower()
+    if normalized_event and not re.fullmatch(
+        r"[a-z0-9][a-z0-9_.-]{0,79}", normalized_event
+    ):
+        raise HTTPException(status_code=400, detail="Invalid event type.")
+
+    return {
+        "start_date": parsed_start.isoformat(),
+        "end_date": parsed_end.isoformat(),
+        "start_at": datetime.combine(parsed_start, datetime.min.time(), UTC),
+        "end_at": datetime.combine(
+            parsed_end + timedelta(days=1), datetime.min.time(), UTC
+        ),
+        "organization": normalized_organization,
+        "category": normalized_category,
+        "actor_type": normalized_actor,
+        "event_type": normalized_event,
+    }
+
+
+def platform_audit_url(path: str, filters: dict, *, page: Optional[int] = None) -> str:
+    params = {
+        key: filters[key]
+        for key in (
+            "start_date",
+            "end_date",
+            "organization",
+            "category",
+            "actor_type",
+            "event_type",
+        )
+        if filters.get(key)
+    }
+    if page is not None:
+        params["page"] = page
+    return path + ("?" + urlencode(params) if params else "")
+
+
+@app.get("/platform-admin/audit", response_class=HTMLResponse)
+async def platform_admin_audit(
+        request: Request,
+        start_date: str = Query("", max_length=10),
+        end_date: str = Query("", max_length=10),
+        organization: str = Query("", max_length=16),
+        category: str = Query("", max_length=32),
+        actor_type: str = Query("", max_length=32),
+        event_type: str = Query("", max_length=80),
+        page: int = Query(1, ge=1),
+        user=Depends(check_platform_admin)):
+    filters = platform_audit_filters(
+        start_date=start_date,
+        end_date=end_date,
+        organization=organization,
+        category=category,
+        actor_type=actor_type,
+        event_type=event_type,
+    )
+    audit_page, organizations = await asyncio.gather(
+        control_plane_store.search_audit_events(
+            page=page,
+            page_size=AUDIT_EVENT_PAGE_SIZE,
+            start_at=filters["start_at"],
+            end_at=filters["end_at"],
+            organization_designator=filters["organization"],
+            actor_type=filters["actor_type"],
+            event_type=filters["event_type"],
+            categories=(filters["category"],) if filters["category"] else (),
+        ),
+        control_plane_store.list_organizations(),
+    )
+    await control_plane_store.record_audit_access(
+        actor_id=user.id,
+        details={
+            "view": "audit_log",
+            "page": audit_page.page,
+            "organization": filters["organization"],
+            "category": filters["category"],
+            "actor_type": filters["actor_type"],
+            "event_type": filters["event_type"],
+        },
+    )
+    current_url = platform_audit_url(
+        "/platform-admin/audit", filters, page=audit_page.page
+    )
+    return templates.TemplateResponse(
+        request=request,
+        name="platform_admin_audit.html",
+        context={
+            "request": request,
+            "enable_live_refresh": False,
+            "include_leaflet": False,
+            "include_datetime_script": False,
+            "platform_admin": user,
+            "audit_page": audit_page,
+            "audit_filters": filters,
+            "audit_categories": tuple(AUDIT_EVENT_CATEGORY_PREFIXES),
+            "audit_actor_types": AUDIT_ACTOR_TYPES,
+            "organizations": organizations,
+            "audit_retention_days": AUDIT_EVENT_RETENTION_DAYS,
+            "audit_hot_days": AUDIT_EVENT_HOT_DAYS,
+            "audit_csrf_token": csrf_token(request, "platform_admin_audit"),
+            "current_url": current_url,
+            "previous_url": (
+                platform_audit_url(
+                    "/platform-admin/audit", filters, page=audit_page.page - 1
+                )
+                if audit_page.page > 1
+                else ""
+            ),
+            "next_url": (
+                platform_audit_url(
+                    "/platform-admin/audit", filters, page=audit_page.page + 1
+                )
+                if audit_page.page < audit_page.total_pages
+                else ""
+            ),
+            "export_url": platform_audit_url(
+                "/platform-admin/audit.csv", filters
+            ),
+        },
+    )
+
+
+@app.get("/platform-admin/audit.csv")
+async def platform_admin_audit_export(
+        start_date: str = Query("", max_length=10),
+        end_date: str = Query("", max_length=10),
+        organization: str = Query("", max_length=16),
+        category: str = Query("", max_length=32),
+        actor_type: str = Query("", max_length=32),
+        event_type: str = Query("", max_length=80),
+        user=Depends(check_platform_admin)):
+    filters = platform_audit_filters(
+        start_date=start_date,
+        end_date=end_date,
+        organization=organization,
+        category=category,
+        actor_type=actor_type,
+        event_type=event_type,
+    )
+    audit_page = await control_plane_store.search_audit_events(
+        page_size=AUDIT_EVENT_EXPORT_LIMIT,
+        start_at=filters["start_at"],
+        end_at=filters["end_at"],
+        organization_designator=filters["organization"],
+        actor_type=filters["actor_type"],
+        event_type=filters["event_type"],
+        categories=(filters["category"],) if filters["category"] else (),
+    )
+    if audit_page.total > AUDIT_EVENT_EXPORT_LIMIT:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "The filtered export is too large. Narrow the date range or "
+                "other filters."
+            ),
+        )
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow((
+        "created_at_utc",
+        "organization",
+        "event_type",
+        "actor_type",
+        "actor_id",
+        "retention_hold",
+    ))
+    for event in audit_page.events:
+        writer.writerow((
+            event.created_at.isoformat(),
+            event.designator or "Platform",
+            event.event_type,
+            event.actor_type,
+            event.actor_id,
+            "yes" if event.retention_hold else "no",
+        ))
+    await control_plane_store.record_audit_access(
+        actor_id=user.id,
+        event_type="audit.exported",
+        details={
+            "event_count": audit_page.total,
+            "organization": filters["organization"],
+            "category": filters["category"],
+            "actor_type": filters["actor_type"],
+            "event_type": filters["event_type"],
+        },
+    )
+    filename = (
+        "r2c_control_plane_audit_"
+        f"{filters['start_date']}_{filters['end_date']}.csv"
+    )
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/platform-admin/audit/{event_id}/retention-hold")
+async def platform_admin_audit_retention_hold(
+        request: Request,
+        event_id: str,
+        action: Annotated[str, Form()],
+        form_token: Annotated[str, Form()],
+        return_to: Annotated[str, Form()] = "/platform-admin/audit",
+        user=Depends(check_platform_admin)):
+    verify_csrf(request, "platform_admin_audit", form_token)
+    if action not in {"place", "release"}:
+        raise HTTPException(status_code=400, detail="Invalid retention-hold action.")
+    try:
+        await control_plane_store.set_audit_event_retention_hold(
+            event_id=event_id,
+            retention_hold=action == "place",
+            actor_id=user.id,
+        )
+        flash(
+            request,
+            "Retention hold placed." if action == "place" else "Retention hold released.",
+            "success",
+        )
+    except ControlPlaneError as exc:
+        flash(request, str(exc), "warning")
+    safe_return = (
+        return_to
+        if return_to.startswith("/platform-admin/audit")
+        and not return_to.startswith("//")
+        else "/platform-admin/audit"
+    )
+    return RedirectResponse(url=safe_return, status_code=status.HTTP_303_SEE_OTHER)
 
 
 @app.post("/platform-admin/organizations")
@@ -6432,56 +6834,6 @@ async def platform_admin_unarchive_organization(
             "success",
         )
     except (ControlPlaneError, InvalidOrganizationError, PlatformAdminAuthError, ValueError) as exc:
-        flash(request, str(exc), "warning")
-    return RedirectResponse(
-        url="/platform-admin/organizations",
-        status_code=status.HTTP_303_SEE_OTHER,
-    )
-
-
-@app.post("/platform-admin/organizations/{designator}/credit")
-async def platform_admin_add_organization_credit(
-        request: Request,
-        designator: str,
-        amount: Annotated[Decimal, Form()],
-        idempotency_key: Annotated[str, Form()],
-        form_token: Annotated[str, Form()],
-        user=Depends(check_platform_admin)):
-    verify_csrf(request, "platform_organizations", form_token)
-    if control_plane_store is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Control-plane database is not configured.",
-        )
-    organization = await control_plane_store.get_organization(designator)
-    if organization is None:
-        raise HTTPException(status_code=404, detail="Organization not found.")
-    try:
-        if amount <= 0 or amount > Decimal("100000"):
-            raise ControlPlaneError(
-                "Credit must be greater than zero and no more than $100,000."
-            )
-        if not re.fullmatch(r"[A-Za-z0-9_-]{16,160}", idempotency_key):
-            raise ControlPlaneError("Invalid credit request.")
-        await control_plane_store.append_ledger_entry(
-            organization_id=organization.id,
-            entry_type="credit",
-            amount=amount,
-            description=(
-                "Simulation prepaid account credit"
-                if CONTROL_PLANE_SIMULATION
-                else "Prepaid account credit"
-            ),
-            idempotency_key=f"ui-{organization.id}-{idempotency_key}",
-            created_by_type="platform_admin",
-            created_by_id=user.id,
-        )
-        flash(
-            request,
-            f"Added ${amount:.2f} credit for {organization.designator}.",
-            "success",
-        )
-    except ControlPlaneError as exc:
         flash(request, str(exc), "warning")
     return RedirectResponse(
         url="/platform-admin/organizations",
@@ -7364,11 +7716,13 @@ async def organization_admin(request: Request, designator: str):
     )
     organization_cost = None
     billing_snapshot = None
+    beta_allowance = None
     if {"organization_owner", "billing_admin"}.intersection(user.roles):
-        billing_snapshot, records, usage_aggregates = await asyncio.gather(
+        billing_snapshot, records, usage_aggregates, beta_allowance = await asyncio.gather(
             asyncio.to_thread(load_platform_billing_snapshot),
             control_plane_store.list_organizations(),
             control_plane_store.month_to_date_usage_aggregates(),
+            control_plane_store.get_extended_beta_allowance(organization.id),
         )
         allocation_inputs = platform_allocation_inputs(records, usage_aggregates)
         allocated_costs, _unallocated = allocate_platform_costs(
@@ -7390,6 +7744,7 @@ async def organization_admin(request: Request, designator: str):
             "enrollment_campaigns": campaigns,
             "ledger_entries": ledger_entries,
             "organization_cost": organization_cost,
+            "beta_allowance": beta_allowance,
             "billing_snapshot": billing_snapshot,
             "csrf_token": csrf_token(request, "organization_admin"),
             "simulation": CONTROL_PLANE_SIMULATION,
@@ -7397,105 +7752,10 @@ async def organization_admin(request: Request, designator: str):
             "invitation_email_enabled": (
                 platform_admin_email_sender.is_configured
             ),
-            "stripe_checkout_enabled": stripe_checkout_provider.is_configured,
             "organization_page_designator": organization.designator,
             "organization_identity_name": user.display_name,
         },
     )
-
-
-@app.post("/{designator}/billing/checkout")
-async def organization_billing_checkout(
-        request: Request,
-        designator: str,
-        amount: Annotated[Decimal, Form()],
-        form_token: Annotated[str, Form()]):
-    verify_csrf(request, "organization_admin", form_token)
-    organization, _user = await require_organization_user(
-        request,
-        designator,
-        required_roles=("organization_owner", "billing_admin"),
-        redirect_to_login=True,
-    )
-    try:
-        checkout_url = await asyncio.to_thread(
-            stripe_checkout_provider.create_checkout,
-            organization_id=organization.id,
-            designator=organization.designator,
-            administrator_email=organization.primary_admin_email,
-            amount=amount,
-            success_url=(
-                f"{CONTROL_PLANE_PUBLIC_URL.rstrip('/')}/"
-                f"{organization.designator.lower()}/admin?payment=success"
-                "#service-status"
-            ),
-            cancel_url=(
-                f"{CONTROL_PLANE_PUBLIC_URL.rstrip('/')}/"
-                f"{organization.designator.lower()}/admin?payment=cancelled"
-                "#service-status"
-            ),
-        )
-    except StripeCheckoutError as exc:
-        flash(request, str(exc), "warning")
-        return RedirectResponse(
-            url=f"/{organization.designator.lower()}/admin#service-status",
-            status_code=status.HTTP_303_SEE_OTHER,
-        )
-    return RedirectResponse(url=checkout_url, status_code=status.HTTP_303_SEE_OTHER)
-
-
-@app.post("/billing/stripe/webhook")
-async def stripe_billing_webhook(request: Request):
-    payload = await request.body()
-    signature = request.headers.get("Stripe-Signature", "")
-    try:
-        payment = await asyncio.to_thread(
-            stripe_checkout_provider.completed_payment,
-            payload,
-            signature,
-        )
-        if payment is None:
-            return {"received": True}
-        organization = await control_plane_store.get_organization(
-            payment.designator,
-            include_archived=True,
-        )
-        if (
-            organization is None
-            or organization.id != payment.organization_id
-            or organization.lifecycle_state == "archived"
-        ):
-            raise StripeCheckoutError("Stripe payment organization is unavailable.")
-        await control_plane_store.append_ledger_entry(
-            organization_id=organization.id,
-            entry_type="payment",
-            amount=payment.gross_amount,
-            description=f"Stripe payment received (${payment.gross_amount:.2f} gross)",
-            idempotency_key=f"stripe-payment-{payment.session_id}",
-            external_reference=payment.session_id,
-            created_by_type="payment_provider",
-            created_by_id="stripe",
-        )
-        await control_plane_store.append_ledger_entry(
-            organization_id=organization.id,
-            entry_type="charge",
-            amount=-payment.processing_fee,
-            description=(
-                f"Stripe processing fee; net account credit "
-                f"${payment.net_credit:.2f}"
-            ),
-            idempotency_key=f"stripe-fee-{payment.session_id}",
-            external_reference=payment.session_id,
-            created_by_type="payment_provider",
-            created_by_id="stripe",
-        )
-    except StripeCheckoutError as exc:
-        logging.warning("Stripe webhook rejected: %s", exc)
-        raise HTTPException(status_code=400, detail="Invalid Stripe event.") from exc
-    except Exception as exc:
-        logging.exception("Stripe payment reconciliation failed")
-        raise HTTPException(status_code=503, detail="Payment reconciliation pending.") from exc
-    return {"received": True}
 
 
 async def require_organization_records_admin(
@@ -8187,6 +8447,7 @@ async def organization_streams(
         video_ice_servers,
         connected_tablets,
         recording_download_requests,
+        beta_allowance,
     ) = await asyncio.gather(
             control_plane_store.list_active_video_streams(organization.id),
             control_plane_store.list_video_stream_requests(
@@ -8196,11 +8457,14 @@ async def organization_streams(
             control_plane_store.list_video_stream_requests(
                 organization_id=organization.id,
             ),
-            video_ice_server_provider.get_ice_servers(),
+            video_ice_server_provider.get_ice_servers(
+                f"organization:{organization.id}"
+            ),
             r2c_hub.list_connected_tablets(organization.id),
             control_plane_store.list_recording_download_requests(
                 organization_id=organization.id,
             ),
+            control_plane_store.get_extended_beta_allowance(organization.id),
         )
     if tablet_device is not None:
         streams = tuple(
@@ -8331,6 +8595,15 @@ async def organization_streams(
             "active_consumers_by_device_id": active_consumers_by_device_id,
             "remote_control_enabled": remote_control_enabled,
             "recording_downloads_enabled": RECORDING_DOWNLOADS_ENABLED,
+            "video_streaming_allowed": (
+                beta_allowance is None or beta_allowance.video_streaming_allowed
+            ),
+            "video_disabled_month_end": (
+                beta_allowance.month_ends_at
+                if beta_allowance is not None
+                and not beta_allowance.video_streaming_allowed
+                else None
+            ),
             "recording_downloads_by_session": {
                 item.stream_session_id: item
                 for item in recording_download_requests
@@ -8509,6 +8782,7 @@ async def organization_request_recording_download(
     )
     if not RECORDING_DOWNLOADS_ENABLED:
         raise HTTPException(status_code=404, detail="Recording downloads are not enabled.")
+    return_device_name = ""
     try:
         item = await control_plane_store.create_recording_download_request(
             organization_id=organization.id,
@@ -8519,6 +8793,7 @@ async def organization_request_recording_download(
             True if item.state == "ready"
             else await r2c_hub.send_recording_download_request(item)
         )
+        return_device_name = item.device_name
         flash(request, (
             "Recording is already available to download."
             if item.state == "ready"
@@ -8529,7 +8804,12 @@ async def organization_request_recording_download(
     except ControlPlaneError as exc:
         flash(request, str(exc), "warning")
     return RedirectResponse(
-        url=f"/{organization.designator.lower()}/streams",
+        url=(
+            f"/{organization.designator.lower()}/streams/"
+            f"{quote(return_device_name, safe='')}"
+            if return_device_name
+            else f"/{organization.designator.lower()}/streams"
+        ),
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -8619,7 +8899,6 @@ async def upload_recording_download(
     if match and received != range_end - range_start + 1:
         raise HTTPException(status_code=400, detail="Recording chunk length did not match Content-Range.")
     if match and range_end + 1 < total_bytes:
-        await meter_organization_usage(credential, network_bytes=received)
         return {"accepted": True, "state": "uploading", "bytes": range_end + 1}
     byte_count = total_bytes if match else received
     os.replace(partial_path, destination)
@@ -8637,7 +8916,6 @@ async def upload_recording_download(
         )
     except ControlPlaneError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    await meter_organization_usage(credential, network_bytes=received)
     logger.info(
         "Recording upload completed: request=%s device=%s bytes=%s",
         request_id,
@@ -8668,7 +8946,7 @@ async def authorized_recording_copy(
 
 
 async def delete_delivered_recording_copy(request_id: str, path: str) -> None:
-    """Remove a one-shot transfer spool after its HTTP response is sent."""
+    """Remove a one-shot transfer spool after its streamed response completes."""
     try:
         await control_plane_store.complete_recording_download_delivery(
             request_id=request_id,
@@ -8684,7 +8962,41 @@ async def delete_delivered_recording_copy(request_id: str, path: str) -> None:
         logger.warning("Unable to remove recording transfer spool %s: %s", request_id, exc)
 
 
-@app.get("/{designator}/streams/downloads/{request_id}", response_class=FileResponse)
+async def stream_recording_copy(item, path: str):
+    """Yield a temporary recording without triggering Cloud Run response buffering."""
+    sent = 0
+    completed = False
+    try:
+        async with await anyio.open_file(path, "rb") as source:
+            while chunk := await source.read(1024 * 1024):
+                sent += len(chunk)
+                yield chunk
+        completed = sent == item.byte_count
+    finally:
+        if sent:
+            await meter_organization_usage_by_id(
+                item.organization_id,
+                network_bytes=sent,
+            )
+        if completed:
+            completed_at = item.completed_at or datetime.now(UTC)
+            retained_seconds = max(
+                0,
+                int((datetime.now(UTC) - completed_at).total_seconds()),
+            )
+            storage_byte_days = max(
+                0,
+                round(item.byte_count * retained_seconds / 86_400),
+            )
+            if storage_byte_days:
+                await meter_organization_usage_by_id(
+                    item.organization_id,
+                    storage_byte_days=storage_byte_days,
+                )
+            await delete_delivered_recording_copy(item.id, path)
+
+
+@app.get("/{designator}/streams/downloads/{request_id}", response_class=StreamingResponse)
 async def organization_recording_download(
         request: Request, designator: str, request_id: str):
     organization, _user = await require_organization_user(
@@ -8698,12 +9010,19 @@ async def organization_recording_download(
             detail="Recording transfer downloads must be requested as a complete file.",
         )
     item, path = await authorized_recording_copy(organization, request_id)
-    return FileResponse(
-        path, media_type=item.media_type, filename=item.filename,
-        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
-        background=BackgroundTask(
-            delete_delivered_recording_copy, request_id, path,
-        ),
+    safe_filename = re.sub(r'["\\\r\n]+', "_", item.filename or "recording.mp4")
+    return StreamingResponse(
+        stream_recording_copy(item, path),
+        media_type=item.media_type,
+        headers={
+            "Cache-Control": "private, no-store",
+            "Content-Disposition": (
+                f'attachment; filename="{safe_filename}"; '
+                f"filename*=UTF-8''{quote(item.filename or 'recording.mp4', safe='')}"
+            ),
+            "X-Content-Type-Options": "nosniff",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

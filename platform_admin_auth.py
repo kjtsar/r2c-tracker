@@ -440,10 +440,9 @@ def _organization_activation_message(
         "with one of the sign-in providers offered by R2C Tracker:\n"
         f"{activation_url}\n\n"
         f"By activating, you confirm that you are authorized to enable "
-        f"{organization_name}'s R2C Tracker account. If prepaid credit is not "
-        "available, the 30-day trial begins immediately. Prepaid credit keeps "
-        "the account funded until cumulative attributed GCP usage consumes it; "
-        "a 30-day grace period then begins. After activation, R2C "
+        f"{organization_name}'s R2C Tracker account in the open-ended extended "
+        "beta. R2C Tracker does not accept payments. The organization receives "
+        "a platform-funded $10.00 calendar-month usage allowance. After activation, R2C "
         "Tracker will sign you in and open the organization administration "
         "page.\n\n"
         "If you were not expecting this invitation, ignore this message. "
@@ -620,6 +619,60 @@ def _organization_lifecycle_deadline_message(
     return message
 
 
+def _organization_extended_beta_allowance_message(
+    from_address: str,
+    recipient: str,
+    administrator_name: str,
+    organization_name: str,
+    designator: str,
+    notification_type: str,
+    month_end: str,
+    administration_url: str,
+) -> EmailMessage:
+    subjects = {
+        "beta_allowance_on_track": (
+            f"{designator} is projected to exceed its extended-beta allowance"
+        ),
+        "beta_allowance_exceeded": (
+            f"{designator} has exceeded its extended-beta allowance"
+        ),
+        "beta_video_disabled": (
+            f"{designator} remote video streaming is disabled through {month_end}"
+        ),
+    }
+    introductions = {
+        "beta_allowance_on_track": (
+            f"Current usage for {organization_name} ({designator}) is projected "
+            "to exceed its $10.00 platform-funded allowance this calendar month."
+        ),
+        "beta_allowance_exceeded": (
+            f"Allocated platform usage for {organization_name} ({designator}) "
+            "has exceeded its $10.00 platform-funded allowance this calendar month."
+        ),
+        "beta_video_disabled": (
+            f"Allocated platform usage for {organization_name} ({designator}) "
+            "has reached 90% of its $10.00 platform-funded allowance. Remote "
+            f"video streaming is disabled for the remainder of the month ending {month_end}."
+        ),
+    }
+    if notification_type not in subjects:
+        raise PlatformAdminAuthError("Unknown extended-beta allowance notification.")
+    message = EmailMessage()
+    message["Subject"] = subjects[notification_type]
+    message["From"] = from_address
+    message["To"] = recipient
+    message.set_content(
+        f"Hello {administrator_name},\n\n"
+        f"{introductions[notification_type]}\n\n"
+        "R2C Tracker is an open-ended extended beta and does not accept "
+        "payments. This usage allocation is not a bill or charge. Flight logs "
+        "and R2C-based drone-owner arbitration will continue to operate.\n\n"
+        f"Review service status: {administration_url}\n\n"
+        f"Questions may be sent to {from_address}."
+    )
+    return message
+
+
 class GmailApiPlatformAdminEmailSender:
     def __init__(
         self,
@@ -768,6 +821,19 @@ class GmailApiPlatformAdminEmailSender:
             kwargs["records_url"],
         )
         self._send(message, "Lifecycle notification email could not be sent.")
+
+    def send_organization_extended_beta_allowance(self, **kwargs) -> None:
+        message = _organization_extended_beta_allowance_message(
+            self.from_address,
+            kwargs["recipient"],
+            kwargs["administrator_name"],
+            kwargs["organization_name"],
+            kwargs["designator"],
+            kwargs["notification_type"],
+            kwargs["month_end"],
+            kwargs["administration_url"],
+        )
+        self._send(message, "Extended-beta allowance email could not be sent.")
 
 
 class SmtpPlatformAdminEmailSender:
@@ -1030,4 +1096,28 @@ class SmtpPlatformAdminEmailSender:
         except Exception as exc:
             raise PlatformAdminAuthError(
                 "Lifecycle notification email could not be sent."
+            ) from exc
+
+    def send_organization_extended_beta_allowance(self, **kwargs) -> None:
+        if not self.is_configured:
+            raise PlatformAdminAuthError("Administrator email is not configured.")
+        message = _organization_extended_beta_allowance_message(
+            self.from_address,
+            kwargs["recipient"],
+            kwargs["administrator_name"],
+            kwargs["organization_name"],
+            kwargs["designator"],
+            kwargs["notification_type"],
+            kwargs["month_end"],
+            kwargs["administration_url"],
+        )
+        try:
+            with smtplib.SMTP(self.host, self.port, timeout=15) as smtp:
+                smtp.starttls(context=ssl.create_default_context())
+                if self.username:
+                    smtp.login(self.username, self.password)
+                smtp.send_message(message)
+        except Exception as exc:
+            raise PlatformAdminAuthError(
+                "Extended-beta allowance email could not be sent."
             ) from exc

@@ -3,7 +3,7 @@
 ## Purpose
 
 The platform control plane manages organization provisioning, aggregate usage,
-Google Cloud cost allocation, trials, subscriptions, payments, and platform
+Google Cloud cost allocation, extended-beta allowances, organizations, and platform
 auditing. It is separate from every organization's operational tracker data.
 
 The website super-admin must not have an application-level path to:
@@ -72,7 +72,7 @@ identity generation unusable.
 - assigned tenant path;
 - lifecycle state;
 - provisioning state;
-- trial activation and expiration timestamps;
+- open-ended extended-beta lifecycle state;
 - tenant database/storage resource references, but no tenant credentials;
 - retention-policy identifiers.
 
@@ -87,17 +87,16 @@ identity generation unusable.
 
 The first contact may hold all roles, but each role can later be delegated.
 
-### subscriptions
+### extended_beta_allowances
 
 - organization ID;
-- state: trial, active, past due, suspended, canceled;
-- collection method;
-- billing cadence;
-- trial dates;
-- external payment-provider customer and subscription IDs;
-- service entitlement set.
+- calendar billing month;
+- $10.00 platform-funded allowance;
+- allocated actual and projected cost;
+- billing-data cutoff;
+- month-end boundary and video-disabled timestamp.
 
-Payment credentials and card data remain with the payment provider.
+The platform has no payment credentials, checkout route, or payment webhook.
 
 ### usage_daily
 
@@ -115,26 +114,19 @@ No incident, flight, aircraft, user, map, or file identifiers are allowed.
 
 ### billing_ledger
 
-An append-only ledger records charges, credits, payments, refunds, adjustments,
-and expirations. The ledger is authoritative for the balance shown by R2C.
-Payment-provider webhooks are reconciled into ledger entries using idempotency
-keys.
+The historical append-only ledger remains available for audit compatibility,
+but the extended beta has no payment, checkout, webhook, credit, trial, or grace
+workflow. Organizations receive open-ended access and a platform-funded $10.00
+calendar-month usage allowance.
 
-The implemented ledger is append-only at the service boundary and uses unique
-idempotency keys. Positive entries record deposited funds and negative entries
-record refunds or financial adjustments. Available credit is deposited funds
-minus cumulative GCP usage cost attributed to the organization. A funded account
-enters a 30-day grace period when that available credit reaches zero. Adding
-enough funds during the grace period returns the account to funded status.
-Payment collection remains disabled; platform administrators can record manual
-deposits while future payment-provider reconciliation remains pending.
-
-Trial and grace deadlines are notification deadlines, not automated shutdown
-triggers. The notification worker sends the organization administrator an
-advance message within seven days, another within one day, and an expiration
-message if the account remains in that lifecycle state. Each message links to
-the organization-scoped CSV export and Flight Log Archive. Passing a deadline
-does not change lifecycle or provisioning state.
+The allowance worker reconciles current, non-stale Google Cloud billing export
+data to privacy-safe organization allocation weights. It sends a one-time monthly
+notice when projected usage exceeds $10.00 and another when actual allocated
+usage exceeds $10.00. At $9.00 actual allocated usage, it terminates active remote
+video requests, rejects new streaming requests through month end, and sends a
+separate notice. Flight logs, recording downloads, and R2C-based drone-owner
+arbitration remain enabled. Notices go to the first active billing administrator,
+falling back to the primary organization administrator.
 
 Archiving is a platform-administrator action only. Before the archive route can
 disable a tenant, the platform administrator must affirm direct contact with
@@ -152,7 +144,7 @@ Each organization onboarding request records independently retryable steps:
 5. configure tenant path routing;
 6. run health checks;
 7. issue a short-lived activation link;
-8. start the trial when the administrator activates the account.
+8. start open-ended extended-beta access when the administrator activates the account.
 
 ### managed_access_requests
 
@@ -167,7 +159,10 @@ the request stores its version and acknowledgement timestamp for review.
 
 Records commercial and provisioning changes without tenant content. Sensitive
 values such as activation tokens and credentials are never written to the
-audit trail.
+audit trail. The platform-administrator organizations page shows only a small
+30-day administrative summary. The dedicated audit view uses server-side
+pagination and date, organization, category, actor, and exact-event filters;
+views, exports, and retention-hold changes are themselves audited.
 
 ## Organization roles
 
@@ -189,10 +184,22 @@ the pilot's approval.
 - Raw flight logs: thirty days.
 - Pinned or archived logs: retained longer and billed as storage.
 - Organization-controlled export before scheduled deletion.
-- Trial or grace reminders link to both the flight-record CSV export and raw
-  Flight Log Archive before any administrator considers archival.
+- Extended-beta access has no expiry. Allowance notices explain that flight logs
+  and R2C-based owner arbitration continue if remote video is disabled.
 - Optional record-specific incident/legal hold.
 - Backups are disaster recovery, not permanent customer archives.
+
+Application audit events use a separate operational schedule:
+
+- Retain events for 365 days from the event timestamp.
+- Default searches to the newest 90 days and allow filtered review across the
+  retained period.
+- Delete expired, unheld events through the daily retention job.
+- Preserve event-specific incident, investigation, grant/contract, or legal
+  holds until an authorized platform administrator explicitly releases them.
+- Keep accounting source records and the billing ledger on their separately
+  approved financial records schedule rather than extending all audit events.
+- Review the audit schedule annually and when governing requirements change.
 
 ## Delivery sequence
 
@@ -202,8 +209,8 @@ the pilot's approval.
 4. Create the independent control-plane database and immutable billing ledger.
 5. Implement organization onboarding in simulation mode.
 6. Connect provisioning steps to Google Cloud resources.
-7. Add payment-provider integration in test mode.
-8. Run shadow billing before establishing prices.
+7. Reconcile the $10.00 monthly allowance from current billing exports.
+8. Enforce and notify the video-only $9.00 cutoff.
 
 ## Billing export integration
 
@@ -213,16 +220,15 @@ projects on the billing account. Until Google's first standard or detailed
 export table arrives, the dashboard reports an export-pending state with zero
 values rather than presenting illustrative costs as live.
 
-The live dashboard performs shadow allocation only. Compute, network (including
+The live dashboard and allowance worker allocate costs. Compute, network (including
 TURN relay), storage, and database costs are distributed in proportion to their
 matching privacy-safe organization meters. A category with no measured usage,
 and the billing export's unclassified `other` cost, is divided equally among
 fully provisioned, non-archived organizations. Pending applicants and archived
 organizations do not share platform costs. Sub-micro-dollar rounding is
 reconciled deterministically so attributed plus unallocated cost always matches
-the Google bill. Shadow allocations are not written to the billing ledger and
-do not consume prepaid credit. This lets the platform compare the allocation
-model with the Google bill before any organization is charged.
+the Google bill. Allocations are not written to the billing ledger and are not
+charges; they measure consumption of the platform-funded monthly allowance.
 
 ## Device enrollment QR boundary
 

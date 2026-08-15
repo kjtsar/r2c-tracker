@@ -294,7 +294,11 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn('payload.state === "uploading"', script)
         self.assertIn("[data-flash-message]", script)
         self.assertIn('"expired"', script)
-        self.assertIn("window.location.assign(item.dataset.downloadUrl)", script)
+        self.assertIn("startDownload(item.dataset.downloadUrl)", script)
+        self.assertIn('link.download = ""', script)
+        self.assertNotIn("window.location.assign(item.dataset.downloadUrl)", script)
+        self.assertIn('window.addEventListener("r2c:streams-changed", poll)', script)
+        self.assertNotIn("window.setTimeout(poll, 2000)", script)
         self.assertIn("data-download-url=", template)
         self.assertIn('class="stream-actions"', template)
         self.assertTrue(main.RECORDING_DOWNLOADS_ENABLED)
@@ -303,6 +307,8 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         template = Path("templates/organization_streams.html").read_text()
 
         self.assertIn('("Live sessions", live_streams, "live")', template)
+        self.assertIn("$0.05/GB", template)
+        self.assertIn("$0.12/GB", template)
         self.assertIn('("Recorded sessions", recorded_streams, "recording")', template)
         self.assertNotIn("Current tablet session", template)
         self.assertLess(
@@ -714,33 +720,14 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn("<td>Compute</td><td>$0.08</td>", billing_report.text)
         self.assertIn("<td>Storage</td><td>$0.25</td>", billing_report.text)
         self.assertIn("<td>Database</td><td>$1.07</td>", billing_report.text)
-        self.assertIn("shadow allocation for transparency", billing_report.text)
-        fake_checkout = SimpleNamespace(
-            is_configured=True,
-            create_checkout=Mock(
-                return_value="https://checkout.stripe.test/session"
-            ),
+        self.assertIn("not a bill or charge", billing_report.text)
+        self.assertIn("does not accept payments", billing_report.text)
+        self.assertNotIn("Continue to Stripe", billing_report.text)
+        checkout = self.client.post(
+            "/ncssar/billing/checkout",
+            data={"form_token": self.form_token(billing_report), "amount": "25.00"},
         )
-        with patch.object(main, "stripe_checkout_provider", fake_checkout):
-            billing_page = self.client.get("/ncssar/admin")
-            self.assertIn("Continue to Stripe", billing_page.text)
-            checkout = self.client.post(
-                "/ncssar/billing/checkout",
-                data={
-                    "form_token": self.form_token(billing_page),
-                    "amount": "25.00",
-                },
-                follow_redirects=False,
-            )
-        self.assertEqual(303, checkout.status_code)
-        self.assertEqual(
-            "https://checkout.stripe.test/session",
-            checkout.headers["location"],
-        )
-        self.assertEqual(
-            Decimal("25.00"),
-            fake_checkout.create_checkout.call_args.kwargs["amount"],
-        )
+        self.assertEqual(404, checkout.status_code)
 
     def test_records_viewer_lands_on_dashboard_and_directory_shows_identity(self):
         organization = asyncio.run(
@@ -1564,26 +1551,15 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn("NCSSAR", created.text)
         self.assertIn("100 Rescue Way", created.text)
         self.assertIn("Provisioning jobs", created.text)
-        self.assertIn("Control-plane audit", created.text)
+        self.assertIn("Recent administrative activity", created.text)
+        self.assertIn("View audit log", created.text)
         self.assertIn("organization.created", created.text)
         self.assertNotIn("pilot_acknowledged", created.text)
         self.assertIn("Designators must be unique", created.text)
         activation_match = ACTIVATION_LINK_RE.search(created.text)
         self.assertIsNotNone(activation_match)
-        idempotency_match = IDEMPOTENCY_RE.search(created.text)
-        self.assertIsNotNone(idempotency_match)
-        credited = self.client.post(
-            "/platform-admin/organizations/ncssar/credit",
-            data={
-                "form_token": self.platform_form_token(created),
-                "idempotency_key": idempotency_match.group(1),
-                "amount": "10.00",
-            },
-            follow_redirects=True,
-        )
-        self.assertEqual(200, credited.status_code)
-        self.assertIn("Added $10.00 credit", credited.text)
-        self.assertIn("r2c-tracker.com/ncssar", credited.text)
+        self.assertIn("$10.00", created.text)
+        self.assertIn("no payments", created.text)
         activation_url = html.unescape(activation_match.group(1))
         activation_path = urlparse(activation_url).path + "?" + urlparse(
             activation_url
@@ -1592,6 +1568,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         with patch.object(main, "google_oidc_client", FakeGoogleOidcClient()):
             activation_page = self.client.get(activation_path)
             self.assertEqual(200, activation_page.status_code)
+
             activation_token = urlparse(activation_url).query.split("token=", 1)[1]
             self.assertIn("or create an R2C Tracker password", activation_page.text)
             oauth_start = self.client.post(
@@ -1610,9 +1587,9 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             )
         self.assertEqual(200, activated.status_code)
         self.assertIn("NCSSAR administration", activated.text)
-        self.assertIn("Credit balance:", activated.text)
+        self.assertIn("open-ended extended beta", activated.text)
         self.assertIn("$10.00", activated.text)
-        self.assertIn("Simulation prepaid account credit", activated.text)
+        self.assertIn("does not accept payments", activated.text)
 
         campaign_created = self.client.post(
             "/ncssar/enrollments",
@@ -1673,7 +1650,92 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             ):
                 pass
 
-    def test_platform_admin_can_add_credit_in_live_mode(self):
+    def test_platform_audit_page_filters_exports_and_manages_retention_holds(self):
+        organization = asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Primary Administrator",
+                admin_email="admin@ncssar.example",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        created_event = next(
+            event
+            for event in asyncio.run(self.store.list_audit_events())
+            if event.event_type == "organization.created"
+        )
+
+        audit_page = self.client.get(
+            "/platform-admin/audit?category=administration&organization=NCSSAR"
+        )
+
+        self.assertEqual(200, audit_page.status_code)
+        self.assertEqual("no-store", audit_page.headers["cache-control"])
+        self.assertIn("Platform audit log", audit_page.text)
+        self.assertIn("365 days from the event timestamp", audit_page.text)
+        self.assertIn("organization.created", audit_page.text)
+        self.assertNotIn("audit.viewed", audit_page.text)
+        self.assertIn("Export filtered CSV", audit_page.text)
+
+        held = self.client.post(
+            f"/platform-admin/audit/{created_event.id}/retention-hold",
+            data={
+                "form_token": self.form_token(audit_page),
+                "action": "place",
+                "return_to": (
+                    "/platform-admin/audit?category=administration"
+                    "&organization=NCSSAR"
+                ),
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(303, held.status_code)
+        refreshed = asyncio.run(self.store.search_audit_events(
+            event_type="organization.created",
+        ))
+        self.assertTrue(refreshed.events[0].retention_hold)
+
+        exported = self.client.get(
+            "/platform-admin/audit.csv?category=administration"
+            "&organization=NCSSAR"
+        )
+        self.assertEqual(200, exported.status_code)
+        self.assertIn("text/csv", exported.headers["content-type"])
+        self.assertIn("organization.created", exported.text)
+        self.assertNotIn("audit.viewed", exported.text)
+        audit_events = asyncio.run(self.store.search_audit_events(
+            categories=("audit",),
+        )).events
+        self.assertTrue(any(
+            event.event_type == "audit.viewed" for event in audit_events
+        ))
+        self.assertTrue(any(
+            event.event_type == "audit.exported" for event in audit_events
+        ))
+        self.assertTrue(any(
+            event.event_type == "audit.retention_hold_placed"
+            for event in audit_events
+        ))
+        self.assertEqual(organization.id, created_event.organization_id)
+        self.client.cookies.clear()
+        signed_out_page = self.client.get(
+            "/platform-admin/audit", follow_redirects=False
+        )
+        signed_out_export = self.client.get(
+            "/platform-admin/audit.csv", follow_redirects=False
+        )
+        self.assertEqual(303, signed_out_page.status_code)
+        self.assertEqual(303, signed_out_export.status_code)
+        self.assertTrue(
+            signed_out_page.headers["location"].startswith(
+                "/platform-admin/login?"
+            )
+        )
+
+    def test_platform_admin_cannot_add_credit_in_live_mode(self):
         organization = asyncio.run(
             self.store.create_organization(
                 legal_name="North County Search and Rescue",
@@ -1687,24 +1749,20 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         )
         with patch.object(main, "CONTROL_PLANE_SIMULATION", False):
             page = self.client.get("/platform-admin/organizations")
-            nonce = IDEMPOTENCY_RE.search(page.text)
-            self.assertIsNotNone(nonce)
             credited = self.client.post(
                 "/platform-admin/organizations/ncssar/credit",
                 data={
                     "form_token": self.platform_form_token(page),
-                    "idempotency_key": nonce.group(1),
+                    "idempotency_key": "unused-payment-route",
                     "amount": "20.00",
                 },
-                follow_redirects=True,
             )
 
-        self.assertEqual(200, credited.status_code)
-        self.assertIn("Added $20.00 credit", credited.text)
-        funded = asyncio.run(self.store.get_organization("NCSSAR"))
-        self.assertEqual(organization.id, funded.id)
-        self.assertEqual("funded", funded.lifecycle_state)
-        self.assertEqual(Decimal("20.0000"), funded.credit_balance)
+        self.assertEqual(404, credited.status_code)
+        beta = asyncio.run(self.store.get_organization("NCSSAR"))
+        self.assertEqual(organization.id, beta.id)
+        self.assertEqual("extended_beta", beta.lifecycle_state)
+        self.assertEqual(Decimal("0.00"), beta.credit_balance)
 
     def test_platform_admin_archive_requires_designator_and_disables_site(self):
         organization = asyncio.run(
@@ -1911,10 +1969,10 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             sender.access_messages[0]["login_url"],
         )
         audit_events = asyncio.run(self.store.list_audit_events())
-        self.assertEqual(
-            "administrator.access_email_sent",
-            audit_events[0].event_type,
-        )
+        self.assertTrue(any(
+            event.event_type == "administrator.access_email_sent"
+            for event in audit_events
+        ))
 
     def test_active_organization_user_can_sign_in_with_google(self):
         organization = asyncio.run(
@@ -2276,6 +2334,10 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                     follow_redirects=False,
                 )
                 self.assertEqual(303, requested_download.status_code)
+                self.assertEqual(
+                    "/ncssar/streams/Android%20video%20tablet",
+                    requested_download.headers["location"],
+                )
                 transfer_request = live_websocket.receive_json()
                 self.assertEqual("recording_download_request", transfer_request["type"])
                 self.assertTrue(transfer_request["consentRequired"])
@@ -2338,6 +2400,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 )
                 self.assertEqual(200, downloaded.status_code)
                 self.assertEqual(b"original-recording-bytes", downloaded.content)
+                self.assertNotIn("content-length", downloaded.headers)
                 self.assertIn(
                     'attachment; filename="A5-flight.mp4"',
                     downloaded.headers["content-disposition"],
@@ -2350,6 +2413,8 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 )
                 self.assertEqual("downloaded", consumed.state)
                 self.assertEqual("", consumed.storage_relpath)
+                usage = asyncio.run(self.store.month_to_date_usage_aggregates())
+                self.assertEqual(24, usage[organization.id].network_bytes)
             live_websocket.send_json({
                 "type": "video_stream_advertisement",
                 "incidentName": "Alpha",

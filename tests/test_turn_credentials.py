@@ -99,7 +99,7 @@ class TurnCredentialProviderTest(unittest.TestCase):
             "Bearer turn-api-token",
             calls[0][1]["headers"]["Authorization"],
         )
-        self.assertNotIn(":53", str(first))
+        self.assertNotRegex(str(first), r":53(?:[?'\"]|$)")
         self.assertIn("turns:turn.cloudflare.com:443", str(first))
 
     def test_failure_returns_stun_fallback_without_exposing_secret(self):
@@ -122,6 +122,42 @@ class TurnCredentialProviderTest(unittest.TestCase):
             result,
         )
         self.assertNotIn("never-log-this-token", "\n".join(logs.output))
+
+    def test_tags_and_caches_credentials_per_organization(self):
+        calls = []
+
+        def post(url, **kwargs):
+            calls.append((url, kwargs))
+            suffix = kwargs["json"]["customIdentifier"]
+            return FakeResponse({
+                "username": f"user-{suffix}",
+                "credential": f"password-{suffix}",
+            })
+
+        provider = CloudflareTurnCredentialProvider(
+            key_id="turn-key-id",
+            api_token="turn-api-token",
+            fallback_ice_servers=[
+                {"urls": ["stun:stun.cloudflare.com:3478"]}
+            ],
+            credential_ttl_seconds=3600,
+            post=post,
+        )
+
+        first = asyncio.run(provider.get_ice_servers("organization:one"))
+        repeat = asyncio.run(provider.get_ice_servers("organization:one"))
+        second = asyncio.run(provider.get_ice_servers("organization:two"))
+
+        self.assertEqual(first, repeat)
+        self.assertNotEqual(first, second)
+        self.assertEqual(2, len(calls))
+        self.assertTrue(calls[0][0].endswith("/credentials/generate"))
+        self.assertEqual(
+            {"ttl": 3600, "customIdentifier": "organization:one"},
+            calls[0][1]["json"],
+        )
+        self.assertIn("turns:turn.cloudflare.com:443", str(first))
+        self.assertNotRegex(str(first), r":53(?:[?'\"]|$)")
 
 
 if __name__ == "__main__":

@@ -27,9 +27,13 @@ The browser and tablet must display:
 
 The platform control plane may store organization membership, active-stream
 metadata, request state, route type, aggregate byte counts, billing events, and
-consent audit events. It must not ingest, transcode, record, or expose the media
-itself. MediaMTX source paths and controller URLs never appear in browser HTML
-or platform-admin views.
+consent audit events. Live and playback media stays on WebRTC and is never
+ingested or transcoded by the tracker. An explicitly approved Download may use
+the tracker's private temporary archive as a bounded handoff: the tablet uploads
+one recording, the tracker streams it to the requesting browser, and the copy is
+deleted after successful delivery (with TTL cleanup for interrupted transfers).
+MediaMTX source paths and controller URLs never appear in browser HTML or
+platform-admin views.
 
 ## Request state machine
 
@@ -153,7 +157,8 @@ browser-to-Cloud-Run HTTP traffic would answer the wrong question.
 
 The preflight creates an encrypted WebRTC data channel without a video track:
 
-1. ICE gathers direct candidates and the configured TURN fallback.
+1. ICE gathers the configured candidates. Production currently requests a TURN
+   relay so setup behavior is predictable.
 2. The selected candidate pair determines `Direct` or `Routed`.
 3. The tablet sends paced, synthetic payload for approximately two seconds;
    the browser acknowledges sequence numbers and received bytes.
@@ -172,7 +177,9 @@ uses Cloudflare's public STUN endpoint so browsers that hide host addresses
 behind mDNS can still discover a direct path to the tablet. A managed TURN
 service and short-lived TURN credentials remain required before Routed can be
 relied upon across arbitrary cellular, Starlink, and agency firewall
-combinations.
+combinations. Cloudflare credentials are generated per organization with an
+opaque organization identifier so provider analytics can be reconciled with
+the tracker's organization-scoped byte counters.
 
 ## Quality choices
 
@@ -195,19 +202,40 @@ options later; source-resolution/lower-frame-rate remains the first target.
 
 ## Media signaling and transport
 
-The tracker relays short-lived authenticated WHEP/ICE signaling messages only.
-The browser offer is forwarded to the enrolled tablet, which exchanges it with
-the tablet-local MediaMTX WHEP endpoint. Media then follows the selected ICE
-path directly or through TURN. A request authorizes one viewer for ten minutes.
+The tracker relays short-lived authenticated WebRTC signaling messages only.
+The browser offer is forwarded to the enrolled tablet, which attaches the
+approved tablet-local source. Live and playback media currently use a forced
+TURN path for fast, predictable establishment. A request authorizes one viewer
+for ten minutes.
 The current implementation never serves two viewers concurrently from one R2C
 device; a newly approved higher-priority viewer replaces the existing viewer.
 
-Android already enables MediaMTX WebRTC, but its host/candidate and TURN
-configuration is not yet field-qualified. Apple currently disables MediaMTX
-WebRTC and needs equivalent configuration plus physical-device qualification.
-Neither platform should advertise production remote video until direct NAT,
-TURN fallback, interruption/reconnect, thermal load, and sustained cellular
-data tests pass.
+### Relay-first direct upgrade exploration
+
+A continuous relay-to-direct transition is technically possible on the same
+`RTCPeerConnection`, but it is an ICE restart rather than a second connection:
+
+1. establish TURN-only media and wait for the first decoded frame;
+2. retain the same transceivers and tracks, change the browser ICE policy to
+   `all`, and create an ICE-restart offer;
+3. relay that restart through the existing authenticated request to the same
+   Android or Apple peer;
+4. accept the answer and let ICE nominate a direct candidate pair;
+5. keep the existing TURN candidate available until direct media has remained
+   healthy through a bounded observation window.
+
+This should preserve media continuity when browser and mobile WebRTC stacks
+renominate successfully. It requires a versioned restart offer/answer exchange,
+idempotency, rollback, and physical Android/iOS qualification across Wi-Fi,
+cellular, and changing networks. It is therefore not enabled by this change.
+The initial TURN route remains the production default; a later opt-in field
+trial should record restart latency, selected candidate type, interruption
+duration, and TURN bytes avoided before broad activation.
+
+Android and Apple both support the production routed viewer flow. Direct
+renomination, interruption/reconnect, thermal load, and sustained cellular data
+still require separate physical-device qualification before relay-first direct
+upgrade can be enabled.
 
 ## Incremental delivery
 
