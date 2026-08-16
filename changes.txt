@@ -1,4 +1,4 @@
-v1.4.49:
+v1.4.49: deployed
 * Restore consent-safe video preflight by attaching attributed Cloudflare credentials to returned TURN relay URLs and rejecting incomplete relay configurations.
 * Put Cancel request directly beside a live session owned by the requester while preserving another viewer's in-progress request.
 
