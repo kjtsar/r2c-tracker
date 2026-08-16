@@ -200,6 +200,43 @@ class TurnCredentialProviderTest(unittest.TestCase):
             result[1],
         )
 
+    def test_accepts_single_attributed_ice_server_object(self):
+        def post(_url, **_kwargs):
+            return FakeResponse({
+                "iceServers": {
+                    "urls": [
+                        "turn:turn.cloudflare.com:3478?transport=udp",
+                        "turn:turn.cloudflare.com:3478?transport=tcp",
+                        "turn:turn.cloudflare.com:80?transport=tcp",
+                        "turns:turn.cloudflare.com:443?transport=tcp",
+                    ],
+                    "username": "attributed-user",
+                    "credential": "attributed-password",
+                },
+            })
+
+        provider = CloudflareTurnCredentialProvider(
+            key_id="turn-key-id",
+            api_token="turn-api-token",
+            fallback_ice_servers=[
+                {"urls": ["stun:stun.cloudflare.com:3478"]}
+            ],
+            post=post,
+        )
+
+        result = asyncio.run(
+            provider.get_ice_servers("organization:one")
+        )
+
+        self.assertEqual(1, len(result))
+        self.assertEqual("attributed-user", result[0]["username"])
+        self.assertEqual("attributed-password", result[0]["credential"])
+        self.assertIn(
+            "turns:turn.cloudflare.com:443?transport=tcp",
+            result[0]["urls"],
+        )
+
+
 
 if __name__ == "__main__":
     unittest.main()

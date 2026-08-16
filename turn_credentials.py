@@ -130,9 +130,10 @@ class CloudflareTurnCredentialProvider:
                 credential = str(
                     response_payload.get("credential", "") or ""
                 )
-                generated = sanitize_ice_servers(
-                    response_payload.get("iceServers", [])
-                )
+                raw_ice_servers = response_payload.get("iceServers", [])
+                if isinstance(raw_ice_servers, dict):
+                    raw_ice_servers = [raw_ice_servers]
+                generated = sanitize_ice_servers(raw_ice_servers)
                 if username and credential:
                     generated = [
                         {
