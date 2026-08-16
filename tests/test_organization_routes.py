@@ -2887,8 +2887,11 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertEqual(200, request.status_code)
         self.assertIn("Video will remain off", request.text)
         self.assertIn("pending", request.text)
-        self.assertIn("Request in progress", request.text)
-        self.assertIn("request-button\" type=\"button\" disabled", request.text)
+        self.assertIn("Cancel request", request.text)
+        self.assertIn(
+            f"/ncssar/streams/requests/{request_id}/cancel",
+            request.text,
+        )
         self.assertRegex(request.text, r"\bP(?:S|D)T\b")
         self.assertIn("/static/video_preflight.js", request.text)
         offer_sdp = (

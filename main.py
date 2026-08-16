@@ -8957,6 +8957,12 @@ async def organization_streams(
         }
         and stream_request.expires_at >= datetime.now(UTC)
     }
+    cancellable_request_by_session = {
+        stream_request.stream_session_id: stream_request
+        for stream_request in requests
+        if stream_request.state in {"pending", "probing", "awaiting_approval"}
+        and stream_request.expires_at >= datetime.now(UTC)
+    }
     active_consumers_by_device_id = {
         stream_request.device_credential_id: stream_request.requester_email
         for stream_request in organization_requests
@@ -9011,6 +9017,7 @@ async def organization_streams(
             "request_in_progress_session_ids": (
                 request_in_progress_session_ids
             ),
+            "cancellable_request_by_session": cancellable_request_by_session,
             "active_consumers_by_device_id": active_consumers_by_device_id,
             "remote_control_enabled": remote_control_enabled,
             "recording_downloads_enabled": RECORDING_DOWNLOADS_ENABLED,

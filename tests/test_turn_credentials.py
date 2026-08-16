@@ -159,6 +159,47 @@ class TurnCredentialProviderTest(unittest.TestCase):
         self.assertIn("turns:turn.cloudflare.com:443", str(first))
         self.assertNotRegex(str(first), r":53(?:[?'\"]|$)")
 
+    def test_attaches_top_level_credentials_to_returned_turn_urls(self):
+        def post(_url, **_kwargs):
+            return FakeResponse({
+                "iceServers": [
+                    {"urls": ["stun:stun.cloudflare.com:3478"]},
+                    {
+                        "urls": [
+                            "turn:turn.cloudflare.com:3478?transport=udp",
+                            "turns:turn.cloudflare.com:443?transport=tcp",
+                        ],
+                    },
+                ],
+                "username": "attributed-user",
+                "credential": "attributed-password",
+            })
+
+        provider = CloudflareTurnCredentialProvider(
+            key_id="turn-key-id",
+            api_token="turn-api-token",
+            fallback_ice_servers=[
+                {"urls": ["stun:stun.cloudflare.com:3478"]}
+            ],
+            post=post,
+        )
+
+        result = asyncio.run(
+            provider.get_ice_servers("organization:one")
+        )
+
+        self.assertEqual(
+            {
+                "urls": [
+                    "turn:turn.cloudflare.com:3478?transport=udp",
+                    "turns:turn.cloudflare.com:443?transport=tcp",
+                ],
+                "username": "attributed-user",
+                "credential": "attributed-password",
+            },
+            result[1],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

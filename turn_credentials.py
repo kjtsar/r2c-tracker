@@ -126,14 +126,36 @@ class CloudflareTurnCredentialProvider:
                 )
                 response.raise_for_status()
                 response_payload = response.json()
+                username = str(response_payload.get("username", "") or "")
+                credential = str(
+                    response_payload.get("credential", "") or ""
+                )
                 generated = sanitize_ice_servers(
                     response_payload.get("iceServers", [])
                 )
+                if username and credential:
+                    generated = [
+                        {
+                            **server,
+                            "username": username,
+                            "credential": credential,
+                        }
+                        if any(
+                            str(url).lower().startswith(("turn:", "turns:"))
+                            for url in (
+                                server["urls"]
+                                if isinstance(server.get("urls"), list)
+                                else [server.get("urls", "")]
+                            )
+                        )
+                        and not (
+                            server.get("username")
+                            and server.get("credential")
+                        )
+                        else server
+                        for server in generated
+                    ]
                 if not generated:
-                    username = str(response_payload.get("username", "") or "")
-                    credential = str(
-                        response_payload.get("credential", "") or ""
-                    )
                     generated = sanitize_ice_servers([
                         {"urls": [_CLOUDFLARE_ICE_URLS[0]]},
                         {
@@ -152,6 +174,22 @@ class CloudflareTurnCredentialProvider:
                     )
                 ):
                     raise ValueError("credential response did not include TURN")
+                if any(
+                    str(url).lower().startswith(("turn:", "turns:"))
+                    and not (
+                        server.get("username")
+                        and server.get("credential")
+                    )
+                    for server in generated
+                    for url in (
+                        server["urls"]
+                        if isinstance(server.get("urls"), list)
+                        else [server.get("urls", "")]
+                    )
+                ):
+                    raise ValueError(
+                        "credential response included unauthenticated TURN"
+                    )
                 cached_until = now + max(
                     30,
                     min(

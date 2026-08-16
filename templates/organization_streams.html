@@ -479,9 +479,16 @@
                       title="This tablet is already sharing its single video feed">
                 Video in use
               </button>
+              {% elif stream.session_id in cancellable_request_by_session %}
+              {% set pending_request = cancellable_request_by_session[stream.session_id] %}
+              <form method="post"
+                    action="/{{ organization.designator|lower }}/streams/requests/{{ pending_request.id }}/cancel">
+                <input type="hidden" name="form_token" value="{{ csrf_token }}">
+                <button class="cancel-button" type="submit">Cancel request</button>
+              </form>
               {% elif stream.session_id in request_in_progress_session_ids %}
               <button class="request-button" type="button" disabled
-                      title="Cancel or stop the current request before requesting this stream again">
+                      title="Another authorized viewer has a request in progress">
                 Request in progress
               </button>
               {% else %}
