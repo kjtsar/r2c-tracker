@@ -753,8 +753,56 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         with self.client.websocket_connect(
             "/ncssar/ws/r2c", headers={"X-SAR-Token": device.token},
         ) as websocket:
+            live_connection = next(
+                connection for connection in main.r2c_hub._connections.values()
+                if connection.device_credential is not None
+                and connection.device_credential.id == device.id
+            )
+            live_connection.app_version = "2.0.3"
+            live_connection.app_version_code = 133
+
+            old_admin_page = self.client.get("/ncssar/admin")
+            self.assertIn("build 133", old_admin_page.text)
+            self.assertIn("upgrade required", old_admin_page.text)
+
+            asyncio.run(self.store.start_organization_config_proposal(
+                organization_id=organization.id,
+                device_credential_id=device.id,
+                requested_by_user_id=config_admin.id,
+                source_device_name=device.device_name,
+            ))
+            stale_request_page = self.client.get("/ncssar/admin")
+            self.assertIn(
+                "cannot return its organization configuration",
+                stale_request_page.text,
+            )
+            self.assertIn("Discard request", stale_request_page.text)
+            discarded_stale_request = self.client.post(
+                "/ncssar/admin/organization-config/reject",
+                data={"form_token": self.form_token(stale_request_page)},
+                follow_redirects=False,
+            )
+            self.assertEqual(303, discarded_stale_request.status_code)
+
+            old_admin_page = self.client.get("/ncssar/admin")
+            rejected_old_client = self.client.post(
+                "/ncssar/admin/organization-config/request",
+                data={"form_token": self.form_token(old_admin_page),
+                      "device_credential_id": device.id},
+                follow_redirects=True,
+            )
+            self.assertIn(
+                "Upgrade RID2Caltopo to build 134 or later",
+                rejected_old_client.text,
+            )
+            self.assertIsNone(asyncio.run(
+                self.store.get_organization_config_proposal(organization.id)
+            ))
+
+            live_connection.app_version_code = 134
             admin_page = self.client.get("/ncssar/admin")
             self.assertIn("Ken's A5 Pro", html.unescape(admin_page.text))
+            self.assertIn("build 134", admin_page.text)
             self.assertNotIn("Save member", admin_page.text)
             self.assertNotIn("Manage flight records", admin_page.text)
             self.assertNotIn("Month-to-date platform cost", admin_page.text)
@@ -1169,6 +1217,8 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         )
         self.assertIn("Save member", page.text)
         self.assertIn('aria-label="config_admin:', page.text)
+        self.assertIn("top: calc(100% + 8px)", page.text)
+        self.assertIn("role-help-wrap:focus-within", page.text)
         self.assertIn(
             "Pull configuration from a connected RID2Caltopo device",
             page.text,

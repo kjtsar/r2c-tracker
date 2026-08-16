@@ -1,3 +1,7 @@
+v1.4.47:
+* Identify connected RID2Caltopo build numbers before requesting organization configuration, require build 134 or later, and turn incompatible or disconnected pending requests into clear, discardable errors instead of waiting forever.
+* Keep delegated-role help bubbles fully visible below their icons instead of allowing the members table header to clip the explanation.
+
 v1.4.46: deployed
 * Replace dated trials and dormant payment capability with open-ended extended-beta access, a platform-funded $10 calendar-month allowance, projected and exceeded notices, and a video-only cutoff at $9 while flight logs and R2C owner arbitration continue.
 * Add a dedicated, filterable platform audit log with CSV export, a 90-day default review window, 365-day retention, explicit retention holds, access auditing, and daily cleanup.

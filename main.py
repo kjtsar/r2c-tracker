@@ -588,6 +588,9 @@ R2C_DB_CLEANUP_SEC = int(os.environ.get("R2C_DB_CLEANUP_SEC", "86400"))
 R2C_HEARTBEAT_ZONE_UPDATE_SEC = int(os.environ.get("R2C_HEARTBEAT_ZONE_UPDATE_SEC", "60"))
 R2C_IDLE_PARK_SEC = int(os.environ.get("R2C_IDLE_PARK_SEC", "120"))
 R2C_RECOMMENDED_APP_VERSION_CODE = int(os.environ.get("R2C_RECOMMENDED_APP_VERSION_CODE", "0") or "0")
+R2C_ORGANIZATION_CONFIG_MIN_APP_BUILD = int(
+    os.environ.get("R2C_ORGANIZATION_CONFIG_MIN_APP_BUILD", "134") or "134"
+)
 R2C_UPDATE_URL = os.environ.get("R2C_UPDATE_URL", "").strip()
 R2C_RECOMMENDED_IOS_APP_BUILD_NUMBER = int(
     os.environ.get("R2C_RECOMMENDED_IOS_APP_BUILD_NUMBER", "0") or "0"
@@ -1270,6 +1273,44 @@ class R2CZoneConnection:
         self.sent_confirmed_event_keys: set[str] = set()
 
 
+class ConnectedConfigSource:
+    def __init__(
+        self,
+        *,
+        id: str,
+        organization_id: str,
+        designator: str,
+        device_name: str,
+        platform: str,
+        app_version: str,
+        app_version_code: int,
+    ):
+        self.id = id
+        self.organization_id = organization_id
+        self.designator = designator
+        self.device_name = device_name
+        self.platform = platform
+        self.app_version = app_version
+        self.app_version_code = app_version_code
+
+    @property
+    def supports_organization_config(self) -> bool:
+        return self.app_version_code >= R2C_ORGANIZATION_CONFIG_MIN_APP_BUILD
+
+
+def organization_config_upgrade_message(source: ConnectedConfigSource) -> str:
+    installed = (
+        f"build {source.app_version_code}"
+        if source.app_version_code > 0
+        else "software that does not report its build number"
+    )
+    return (
+        f"{source.device_name} is running {installed} and cannot return its "
+        "organization configuration. Upgrade RID2Caltopo to build "
+        f"{R2C_ORGANIZATION_CONFIG_MIN_APP_BUILD} or later."
+    )
+
+
 class R2CCoordinationHub:
     STANDALONE_PREFIX = "Standalone_"
     STANDALONE_GROUP_RADIUS_M = 2.0 * 1609.344
@@ -1376,6 +1417,40 @@ class R2CCoordinationHub:
                 credential.device_name.casefold(),
                 credential.id,
             ),
+        ))
+
+    async def list_connected_config_sources(
+        self,
+        organization_id: str,
+    ) -> tuple[ConnectedConfigSource, ...]:
+        """List live tablets with the app build needed for config compatibility."""
+        async with self._lock:
+            latest_by_credential_id: dict[str, R2CZoneConnection] = {}
+            for connection in self._connections.values():
+                credential = connection.device_credential
+                if credential is None or connection.organization_id != organization_id:
+                    continue
+                current = latest_by_credential_id.get(credential.id)
+                if (
+                    current is None
+                    or connection.hello_received_at_ms > current.hello_received_at_ms
+                ):
+                    latest_by_credential_id[credential.id] = connection
+            sources = tuple(
+                ConnectedConfigSource(
+                    id=connection.device_credential.id,
+                    organization_id=connection.device_credential.organization_id,
+                    designator=connection.device_credential.designator,
+                    device_name=connection.device_credential.device_name,
+                    platform=connection.device_credential.platform,
+                    app_version=connection.app_version,
+                    app_version_code=connection.app_version_code,
+                )
+                for connection in latest_by_credential_id.values()
+            )
+        return tuple(sorted(
+            sources,
+            key=lambda source: (source.device_name.casefold(), source.id),
         ))
 
     async def resolve_stream_link_code(self, code: str):
@@ -7899,6 +7974,7 @@ async def organization_admin(request: Request, designator: str):
     config_proposal = None
     config_releases = ()
     current_config_version_ms = 0
+    config_proposal_wait_error = ""
     if {"organization_owner", "config_admin"}.intersection(user.roles):
         (
             connected_config_sources,
@@ -7906,11 +7982,28 @@ async def organization_admin(request: Request, designator: str):
             config_releases,
             current_config_version_ms,
         ) = await asyncio.gather(
-            r2c_hub.list_connected_tablets(organization.id),
+            r2c_hub.list_connected_config_sources(organization.id),
             control_plane_store.get_organization_config_proposal(organization.id),
             control_plane_store.list_organization_config_releases(organization.id),
             control_plane_store.get_organization_config_version_ms(organization.id),
         )
+        if config_proposal and config_proposal.state == "awaiting_device":
+            proposal_source = next(
+                (
+                    source for source in connected_config_sources
+                    if source.id == config_proposal.source_device_credential_id
+                ),
+                None,
+            )
+            if proposal_source is None:
+                config_proposal_wait_error = (
+                    f"{config_proposal.source_device_name} disconnected before "
+                    "returning its configuration. Discard this request and try again."
+                )
+            elif not proposal_source.supports_organization_config:
+                config_proposal_wait_error = organization_config_upgrade_message(
+                    proposal_source
+                )
     organization_cost = None
     billing_snapshot = None
     beta_allowance = None
@@ -7956,6 +8049,14 @@ async def organization_admin(request: Request, designator: str):
             "config_proposal": config_proposal,
             "config_releases": config_releases,
             "current_config_version_ms": current_config_version_ms,
+            "config_proposal_wait_error": config_proposal_wait_error,
+            "organization_config_min_app_build": (
+                R2C_ORGANIZATION_CONFIG_MIN_APP_BUILD
+            ),
+            "has_compatible_config_sources": any(
+                source.supports_organization_config
+                for source in connected_config_sources
+            ),
         },
     )
 
@@ -7972,13 +8073,19 @@ async def request_organization_config(
         required_roles=("organization_owner", "config_admin"),
         redirect_to_login=True,
     )
-    connected = await r2c_hub.list_connected_tablets(organization.id)
+    connected = await r2c_hub.list_connected_config_sources(organization.id)
     selected = next(
         (item for item in connected if item.id == device_credential_id), None
     )
     if selected is None:
         flash(request, "That RID2Caltopo device is no longer connected.", "warning")
         return RedirectResponse(f"/{organization.designator.lower()}/admin#organization-config", status_code=303)
+    if not selected.supports_organization_config:
+        flash(request, organization_config_upgrade_message(selected), "warning")
+        return RedirectResponse(
+            f"/{organization.designator.lower()}/admin#organization-config",
+            status_code=303,
+        )
     try:
         proposal = await control_plane_store.start_organization_config_proposal(
             organization_id=organization.id,

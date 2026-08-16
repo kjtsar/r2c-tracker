@@ -108,6 +108,7 @@
   }
   .role-help-wrap {
       position: relative;
+      z-index: 1;
       display: inline-flex;
       align-items: center;
       vertical-align: middle;
@@ -129,7 +130,7 @@
       position: absolute;
       z-index: 20;
       left: 50%;
-      bottom: calc(100% + 8px);
+      top: calc(100% + 8px);
       display: none;
       width: min(280px, 72vw);
       padding: 9px 11px;
@@ -142,6 +143,8 @@
       line-height: 1.35;
       transform: translateX(-50%);
   }
+  .role-help-wrap:hover,
+  .role-help-wrap:focus-within { z-index: 100; }
   .role-help-wrap:hover .role-help-text,
   .role-help:focus + .role-help-text { display: block; }
   .member-link {
@@ -276,24 +279,38 @@
           Connected RID2Caltopo device
           <select name="device_credential_id" required>
             {% for device in connected_config_sources %}
-            <option value="{{ device.id }}">{{ device.device_name }} · {{ device.platform }}</option>
+            <option value="{{ device.id }}"{% if not device.supports_organization_config %} disabled{% endif %}>
+              {{ device.device_name }} · {{ device.platform }} ·
+              {% if device.app_version_code %}build {{ device.app_version_code }}{% else %}build unknown{% endif %}
+              {% if not device.supports_organization_config %} — upgrade required{% endif %}
+            </option>
             {% else %}
             <option value="" disabled selected>No devices currently connected</option>
             {% endfor %}
           </select>
         </label>
         <div style="align-self:end">
-          <button class="primary-button" type="submit"{% if not connected_config_sources %} disabled{% endif %}>
+          <button class="primary-button" type="submit"{% if not has_compatible_config_sources %} disabled{% endif %}>
             Upload
           </button>
         </div>
       </form>
 
       {% if config_proposal and config_proposal.state == "awaiting_device" %}
+      {% if config_proposal_wait_error %}
+      <div class="org-banner" role="alert">
+        {{ config_proposal_wait_error }}
+      </div>
+      <form method="post" action="/{{ organization.designator|lower }}/admin/organization-config/reject">
+        <input type="hidden" name="form_token" value="{{ csrf_token }}">
+        <button type="submit">Discard request</button>
+      </form>
+      {% else %}
       <div class="org-banner" role="status">
         Waiting for {{ config_proposal.source_device_name }} to return its configuration…
       </div>
       <script>window.setTimeout(function () { window.location.reload(); }, 2000);</script>
+      {% endif %}
       {% elif config_proposal and config_proposal.state == "ready" %}
       <div class="config-diff">
         <h3>Proposed by {{ config_proposal.source_device_name }}</h3>
