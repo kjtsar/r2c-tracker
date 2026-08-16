@@ -1,3 +1,6 @@
+v1.4.48:
+* Automatically refresh organization configuration requests under the production browser security policy, bring completed proposals into view, and let administrators cancel a request while waiting for its device.
+
 v1.4.47: deployed
 * Identify connected RID2Caltopo build numbers before requesting organization configuration, require build 134 or later, and turn incompatible or disconnected pending requests into clear, discardable errors instead of waiting forever.
 * Keep delegated-role help bubbles fully visible below their icons instead of allowing the members table header to clip the explanation.

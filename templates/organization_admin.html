@@ -266,7 +266,8 @@
 
   <div class="org-grid">
     {% if "organization_owner" in organization_user.roles or "config_admin" in organization_user.roles %}
-    <section class="org-panel wide" id="organization-config">
+    <section class="org-panel wide" id="organization-config"
+             data-config-proposal-state="{{ config_proposal.state if config_proposal else 'none' }}">
       <h2>RID2Caltopo organization configuration</h2>
       <p>
         Pull the verified CalTopo credentials and drone list from a connected
@@ -301,18 +302,20 @@
       <div class="org-banner" role="alert">
         {{ config_proposal_wait_error }}
       </div>
-      <form method="post" action="/{{ organization.designator|lower }}/admin/organization-config/reject">
-        <input type="hidden" name="form_token" value="{{ csrf_token }}">
-        <button type="submit">Discard request</button>
-      </form>
       {% else %}
       <div class="org-banner" role="status">
         Waiting for {{ config_proposal.source_device_name }} to return its configuration…
       </div>
-      <script>window.setTimeout(function () { window.location.reload(); }, 2000);</script>
       {% endif %}
+      <form class="inline-form" method="post"
+            action="/{{ organization.designator|lower }}/admin/organization-config/reject">
+        <input type="hidden" name="form_token" value="{{ csrf_token }}">
+        <button class="danger-button" type="submit">
+          {% if config_proposal_wait_error %}Discard request{% else %}Cancel request{% endif %}
+        </button>
+      </form>
       {% elif config_proposal and config_proposal.state == "ready" %}
-      <div class="config-diff">
+      <div class="config-diff" id="organization-config-proposal" tabindex="-1">
         <h3>Proposed by {{ config_proposal.source_device_name }}</h3>
         <p>
           Organization CalTopo credentials: <strong>{{ config_proposal.diff.organizationCaltopo }}</strong><br>
@@ -377,12 +380,8 @@
           </tbody>
         </table>
       </div>
-      <script>
-        document.querySelectorAll('.config-version-time').forEach(function (element) {
-          element.textContent = new Date(Number(element.dataset.versionMs)).toLocaleString();
-        });
-      </script>
       {% endif %}
+      <script src="/static/organization_config_admin.js?v=20260816-1" defer></script>
     </section>
     {% endif %}
     {% if "organization_owner" in organization_user.roles or "records_admin" in organization_user.roles %}

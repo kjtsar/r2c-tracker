@@ -813,6 +813,14 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 follow_redirects=False,
             )
             self.assertEqual(303, requested.status_code)
+            waiting = self.client.get("/ncssar/admin")
+            self.assertIn('data-config-proposal-state="awaiting_device"', waiting.text)
+            self.assertIn("Cancel request", waiting.text)
+            self.assertIn(
+                'src="/static/organization_config_admin.js?v=20260816-1"',
+                waiting.text,
+            )
+            self.assertNotIn("window.setTimeout(function ()", waiting.text)
             pull = websocket.receive_json()
             self.assertEqual("organization_config_snapshot_request", pull["type"])
             websocket.send_json({
@@ -824,6 +832,13 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             review = self.client.get("/ncssar/admin")
             self.assertIn("Approve and publish", review.text)
             self.assertIn("RID-1", review.text)
+            self.assertIn('data-config-proposal-state="ready"', review.text)
+            self.assertIn('id="organization-config-proposal"', review.text)
+            config_script = self.client.get("/static/organization_config_admin.js")
+            self.assertEqual(200, config_script.status_code)
+            self.assertIn("window.location.reload()", config_script.text)
+            self.assertIn("proposal.scrollIntoView", config_script.text)
+            self.assertIn("proposal.focus", config_script.text)
             approved = self.client.post(
                 "/ncssar/admin/organization-config/approve",
                 data={"form_token": self.form_token(review),
