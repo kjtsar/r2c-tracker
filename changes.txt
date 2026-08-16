@@ -1,4 +1,4 @@
-v1.4.50:
+v1.4.50: deployed
 * Accept Cloudflare's attributed single-object TURN credential response so consent-safe preflight receives authenticated relay candidates.
 
 v1.4.49: deployed
