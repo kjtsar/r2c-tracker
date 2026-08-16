@@ -1,4 +1,4 @@
-v1.4.48:
+v1.4.48: deployed
 * Automatically refresh organization configuration requests under the production browser security policy, bring completed proposals into view, and let administrators cancel a request while waiting for its device.
 
 v1.4.47: deployed
