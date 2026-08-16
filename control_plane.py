@@ -848,6 +848,9 @@ class VideoStreamRequest(Base):
     status_message: Mapped[str] = mapped_column(String(400), default="")
     route_kind: Mapped[str] = mapped_column(String(16), default="unknown")
     estimated_uplink_bps: Mapped[int] = mapped_column(BigInteger, default=0)
+    quality_source_width: Mapped[int] = mapped_column(Integer, default=0)
+    quality_source_height: Mapped[int] = mapped_column(Integer, default=0)
+    quality_source_fps_milli: Mapped[int] = mapped_column(Integer, default=0)
     selected_width: Mapped[int] = mapped_column(Integer, default=0)
     selected_height: Mapped[int] = mapped_column(Integer, default=0)
     selected_fps_milli: Mapped[int] = mapped_column(Integer, default=0)
@@ -1715,6 +1718,16 @@ class ControlPlaneStore:
                     "ADD COLUMN remote_control_enabled BOOLEAN "
                     "DEFAULT FALSE NOT NULL"
                 ))
+            for column_name in (
+                "quality_source_width",
+                "quality_source_height",
+                "quality_source_fps_milli",
+            ):
+                if column_name not in request_columns:
+                    await connection.execute(text(
+                        "ALTER TABLE video_stream_requests "
+                        f"ADD COLUMN {column_name} INTEGER DEFAULT 0 NOT NULL"
+                    ))
             for column_name in (
                 "audio_bytes_sent",
                 "audio_bytes_received",
@@ -6887,6 +6900,9 @@ class ControlPlaneStore:
             request.state = "awaiting_approval"
             request.route_kind = clean_route
             request.estimated_uplink_bps = estimate
+            request.quality_source_width = stream.source_width
+            request.quality_source_height = stream.source_height
+            request.quality_source_fps_milli = stream.source_fps_milli
             await session.execute(
                 delete(VideoPreflightExchange).where(
                     VideoPreflightExchange.request_id == request.id
@@ -6987,9 +7003,18 @@ class ControlPlaneStore:
                     )
                 if requester_user_id:
                     allowed_choices = managed_video_quality_choices(
-                        source_width=stream.source_width,
-                        source_height=stream.source_height,
-                        source_fps=stream.source_fps_milli / 1000.0,
+                        source_width=(
+                            request.quality_source_width
+                            or stream.source_width
+                        ),
+                        source_height=(
+                            request.quality_source_height
+                            or stream.source_height
+                        ),
+                        source_fps=(
+                            request.quality_source_fps_milli
+                            or stream.source_fps_milli
+                        ) / 1000.0,
                         usable_uplink_bps=request.estimated_uplink_bps,
                     )
                     selected_choice = next((
@@ -7536,6 +7561,11 @@ class ControlPlaneStore:
         stream: ActiveVideoStream,
         exchange: VideoPreflightExchange,
     ) -> VideoPreflightExchangeRecord:
+        source_width = request.quality_source_width or stream.source_width
+        source_height = request.quality_source_height or stream.source_height
+        source_fps_milli = (
+            request.quality_source_fps_milli or stream.source_fps_milli
+        )
         return VideoPreflightExchangeRecord(
             request_id=request.id,
             organization_id=request.organization_id,
@@ -7546,9 +7576,9 @@ class ControlPlaneStore:
             route_kind=request.route_kind,
             estimated_uplink_bps=request.estimated_uplink_bps,
             remote_control_enabled=bool(request.remote_control_enabled),
-            source_width=stream.source_width,
-            source_height=stream.source_height,
-            source_fps=stream.source_fps_milli / 1000.0,
+            source_width=source_width,
+            source_height=source_height,
+            source_fps=source_fps_milli / 1000.0,
             browser_offer_sdp=exchange.browser_offer_sdp,
             device_answer_sdp=exchange.device_answer_sdp,
             expires_at=as_utc(request.expires_at),

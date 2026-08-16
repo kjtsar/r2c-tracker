@@ -254,6 +254,11 @@
       <p>{{ organization.legal_name }}{% if tablet_device %} • {{ tablet_device.platform|capitalize }} R2C instance{% endif %}</p>
     </div>
     <div class="header-actions">
+      {% if tablet_device %}
+      <a href="/{{ organization.designator|lower }}/streams">
+        Back to streams
+      </a>
+      {% endif %}
       <a href="{% if tablet_device %}/{{ organization.designator|lower }}/streams/{{ tablet_device.device_name|urlencode }}{% if stream_filter %}/{{ stream_filter|urlencode }}{% endif %}{% else %}/{{ organization.designator|lower }}/streams{% endif %}">
         Refresh now
       </a>

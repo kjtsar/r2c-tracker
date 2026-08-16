@@ -1539,6 +1539,28 @@ class ControlPlaneStoreTest(unittest.TestCase):
             estimated_uplink_bps=1_500_000,
             now=self.now + timedelta(seconds=3),
         ))
+        asyncio.run(self.store.advertise_video_stream(
+            organization_id=organization.id,
+            device_credential_id=device.id,
+            session_id=stream.session_id,
+            incident_name="Remote control test",
+            drone_designator="NCS1",
+            source_width=1920,
+            source_height=1080,
+            source_fps=14.3,
+            source_bitrate_bps=4_000_000,
+            remote_control_enabled=True,
+            now=self.now + timedelta(milliseconds=3250),
+        ))
+        preflight = asyncio.run(
+            self.store.get_video_preflight_exchange_for_requester(
+                request_id=request.id,
+                organization_id=organization.id,
+                requester_user_id=owner.id,
+                now=self.now + timedelta(milliseconds=3400),
+            )
+        )
+        self.assertEqual(30.0, preflight.source_fps)
         with self.assertRaisesRegex(
             ControlPlaneError,
             "bandwidth-qualified video choices",

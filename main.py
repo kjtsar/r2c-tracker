@@ -11536,7 +11536,11 @@ async def organization_tablet_streams(
     """Render the authenticated stream catalog for one R2C tablet."""
     tablet = await r2c_hub.resolve_connected_tablet(designator, device_name)
     if tablet is None:
-        raise HTTPException(status_code=404, detail="R2C tablet not found.")
+        return RedirectResponse(
+            url=f"/{designator.lower()}/streams",
+            status_code=status.HTTP_303_SEE_OTHER,
+            headers={"Cache-Control": "no-store"},
+        )
     tablet_code = tablet_link_code(tablet.designator, tablet.device_name)
     await require_organization_user(
         request,

@@ -1,3 +1,7 @@
+v1.4.51:
+* Snapshot each completed link test's source capabilities so fluctuating tablet frame-rate advertisements cannot invalidate a quality choice already shown to the requester.
+* Return disconnected tablet stream pages to the organization stream list and add direct Back to streams navigation on tablet-scoped pages.
+
 v1.4.50: deployed
 * Accept Cloudflare's attributed single-object TURN credential response so consent-safe preflight receives authenticated relay candidates.
 

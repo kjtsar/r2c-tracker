@@ -2555,6 +2555,8 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 )
             )
             self.assertIn("Android video tablet streams", tablet_page.text)
+            self.assertIn('href="/ncssar/streams"', tablet_page.text)
+            self.assertIn("Back to streams", tablet_page.text)
             self.assertIn("<td>10A</td>", tablet_page.text)
             self.assertIn("<td>2B</td>", tablet_page.text)
             thumbnail = self.client.get(
@@ -3031,6 +3033,20 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 cancellation["type"],
             )
             self.assertEqual(request_id, cancellation["requestId"])
+
+        disconnected_tablet_page = self.client.get(
+            "/ncssar/streams/Android%20video%20tablet",
+            follow_redirects=False,
+        )
+        self.assertEqual(303, disconnected_tablet_page.status_code)
+        self.assertEqual(
+            "/ncssar/streams",
+            disconnected_tablet_page.headers["location"],
+        )
+        self.assertEqual(
+            "no-store",
+            disconnected_tablet_page.headers["cache-control"],
+        )
 
         cancelled_page = self.client.get("/ncssar/streams")
         self.assertIn("cancelled", cancelled_page.text)
