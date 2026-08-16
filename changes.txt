@@ -1,4 +1,4 @@
-v1.4.46: pending review
+v1.4.46: deployed
 * Replace dated trials and dormant payment capability with open-ended extended-beta access, a platform-funded $10 calendar-month allowance, projected and exceeded notices, and a video-only cutoff at $9 while flight logs and R2C owner arbitration continue.
 * Add a dedicated, filterable platform audit log with CSV export, a 90-day default review window, 365-day retention, explicit retention holds, access auditing, and daily cleanup.
 * Attribute Cloudflare TURN credentials by opaque organization identifier and cache credentials separately per organization for provider-cost reconciliation.
@@ -8,7 +8,8 @@ v1.4.46: pending review
 * Add the delegable config_admin role and plain-language help bubbles describing every organization role without granting configuration administrators unrelated member, billing, policy, or flight-record authority.
 * Make complete pre-publication qualification the documented local gate, retain the rapid presentation-only testing path, refresh the tracked secret baseline, and update GitHub security actions for the current Node runtime.
 
-v1.4.45: superseded before deployment
+v1.4.45:
+* Superseded before deployment.
 * Replace dated trials and dormant payment capability with open-ended extended-beta access, a platform-funded $10 calendar-month allowance, projected and exceeded notices, and a video-only cutoff at $9 while flight logs and R2C owner arbitration continue.
 * Add a dedicated, filterable platform audit log with CSV export, a 90-day default review window, 365-day retention, explicit retention holds, access auditing, and daily cleanup.
 * Attribute Cloudflare TURN credentials by opaque organization identifier and cache credentials separately per organization for provider-cost reconciliation.
