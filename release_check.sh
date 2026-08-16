@@ -177,4 +177,7 @@ async def main():
 asyncio.run(main())
 PY
 
-echo "Release check passed."
+echo "Runtime and migration checks passed."
+if [ "${SKIP_UNIT_TESTS}" -eq 0 ]; then
+  echo "Run ./qualify_release.sh for complete pre-publication qualification."
+fi

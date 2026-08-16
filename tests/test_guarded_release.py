@@ -74,6 +74,10 @@ class GuardedReleaseTest(unittest.TestCase):
         self.assertIn("qualification-current", publisher.read_text())
         self.assertIn("--allow-non-presentation-changes", publisher.read_text())
         self.assertIn("./qualify_release.sh", publisher.read_text())
+        self.assertIn(
+            "Complete local qualification and candidate/public health checks remain required.",
+            publisher.read_text(),
+        )
         self.assertNotIn("./test_candidate.sh", publisher.read_text())
         self.assertIn('BYPASS_ALLOWED_PATH_PREFIXES = ("static/", "templates/", "tests/")', guard)
         self.assertIn('BYPASS_ALLOWED_PATHS = {"changes.txt"}', guard)

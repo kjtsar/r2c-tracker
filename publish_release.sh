@@ -29,6 +29,7 @@ esac
 
 echo "WARNING: --bypass-safety-checks is not a production release qualification."
 echo "It may disconnect active tracker clients and is restricted to presentation-only changes."
+echo "Complete local qualification and candidate/public health checks remain required."
 if [ "${allow_non_presentation_changes}" = "1" ]; then
   echo "WARNING: explicitly allowing qualified backend/deployment changes without hosted staging."
 fi

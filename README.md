@@ -144,20 +144,25 @@ python3 -m venv .venv
 The quickest complete local verification is:
 
 ```bash
-./release_check.sh
+./qualify_release.sh
 ```
 
-Presentation-only releases may use the intentionally conspicuous
+It runs the unit suite once, then runs the runtime/migration and security gates
+in parallel. `release_check.sh` remains available as the narrower runtime and
+migration check, but it is not complete pre-publication qualification by itself.
+
+Presentation-only test releases may continue to use the intentionally conspicuous
 `./publish_release.sh --bypass-safety-checks APP_VERSION_CODE` workflow after
 the source is reviewed, committed, and tagged. It still runs complete local
 qualification and candidate/public health checks, but skips idle and hosted
 staging/database safety checks. The command rejects non-UI changes and is not
 for production qualification; see [the release runbook](RELEASE.md).
 
-It creates isolated temporary SQLite data, runs the full unit suite, starts a
-localhost server, checks public and health routes, verifies that the deployment
-gate and FAA proxy reject unauthenticated requests, and exercises the R2C
-WebSocket hello/heartbeat protocol.
+The runtime portion creates isolated temporary SQLite data, starts a localhost
+server, checks public and health routes, verifies that the deployment gate and
+FAA proxy reject unauthenticated requests, and exercises the R2C WebSocket
+hello/heartbeat protocol. The parallel security portion checks dependencies,
+static analysis, tracked-source secrets, and the generated SBOM.
 
 For pilot-connected development, prepare the named Google Cloud configuration
 and a private, ignored local environment file:
