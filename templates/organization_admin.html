@@ -76,7 +76,8 @@
       font-weight: 750;
   }
   .org-form input,
-  .org-form select {
+  .org-form select,
+  .org-form textarea {
       box-sizing: border-box;
       width: 100%;
       padding: 10px;
@@ -105,6 +106,44 @@
       color: #24576a;
       font-size: 0.76rem;
   }
+  .role-help-wrap {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      vertical-align: middle;
+  }
+  .role-help {
+      display: inline-grid;
+      place-items: center;
+      width: 18px;
+      height: 18px;
+      border: 1px solid #6f8997;
+      border-radius: 50%;
+      color: #365c6d;
+      background: white;
+      font-size: 0.72rem;
+      font-weight: 850;
+      cursor: help;
+  }
+  .role-help-text {
+      position: absolute;
+      z-index: 20;
+      left: 50%;
+      bottom: calc(100% + 8px);
+      display: none;
+      width: min(280px, 72vw);
+      padding: 9px 11px;
+      border-radius: 7px;
+      background: #173746;
+      color: white;
+      box-shadow: 0 4px 14px rgba(18, 45, 58, 0.24);
+      font-size: 0.78rem;
+      font-weight: 600;
+      line-height: 1.35;
+      transform: translateX(-50%);
+  }
+  .role-help-wrap:hover .role-help-text,
+  .role-help:focus + .role-help-text { display: block; }
   .member-link {
       color: var(--org-teal);
       font-weight: 800;
@@ -173,6 +212,10 @@
       color: var(--org-teal);
       font-weight: 750;
   }
+  .config-diff { margin: 12px 0; padding: 14px; border-radius: 8px; background: #f4f8fa; }
+  .config-diff h3 { margin: 10px 0 5px; color: var(--org-navy); }
+  .config-diff ul { margin-top: 5px; }
+  .inline-form { display: inline-block; margin-right: 8px; }
   @media (max-width: 760px) {
       .org-header { flex-direction: column; }
       .org-grid { grid-template-columns: 1fr; }
@@ -184,6 +227,13 @@
 </style>
 {% endblock %}
 {% block content %}
+{% macro role_help(role) -%}
+<span class="role-help-wrap">
+  <span class="role-help" tabindex="0"
+        aria-label="{{ role }}: {{ role_descriptions[role] }}">?</span>
+  <span class="role-help-text" role="tooltip">{{ role_descriptions[role] }}</span>
+</span>
+{%- endmacro %}
 {% set can_manage_users = "organization_owner" in organization_user.roles or "user_admin" in organization_user.roles %}
 <div class="org-shell">
   <header class="org-header">
@@ -212,6 +262,112 @@
   {% endif %}
 
   <div class="org-grid">
+    {% if "organization_owner" in organization_user.roles or "config_admin" in organization_user.roles %}
+    <section class="org-panel wide" id="organization-config">
+      <h2>RID2Caltopo organization configuration</h2>
+      <p>
+        Pull the verified CalTopo credentials and drone list from a connected
+        RID2Caltopo device. Nothing is distributed until you review and approve it.
+      </p>
+      <form class="org-form two-column" method="post"
+            action="/{{ organization.designator|lower }}/admin/organization-config/request">
+        <input type="hidden" name="form_token" value="{{ csrf_token }}">
+        <label>
+          Connected RID2Caltopo device
+          <select name="device_credential_id" required>
+            {% for device in connected_config_sources %}
+            <option value="{{ device.id }}">{{ device.device_name }} · {{ device.platform }}</option>
+            {% else %}
+            <option value="" disabled selected>No devices currently connected</option>
+            {% endfor %}
+          </select>
+        </label>
+        <div style="align-self:end">
+          <button class="primary-button" type="submit"{% if not connected_config_sources %} disabled{% endif %}>
+            Upload
+          </button>
+        </div>
+      </form>
+
+      {% if config_proposal and config_proposal.state == "awaiting_device" %}
+      <div class="org-banner" role="status">
+        Waiting for {{ config_proposal.source_device_name }} to return its configuration…
+      </div>
+      <script>window.setTimeout(function () { window.location.reload(); }, 2000);</script>
+      {% elif config_proposal and config_proposal.state == "ready" %}
+      <div class="config-diff">
+        <h3>Proposed by {{ config_proposal.source_device_name }}</h3>
+        <p>
+          Organization CalTopo credentials: <strong>{{ config_proposal.diff.organizationCaltopo }}</strong><br>
+          Mutual-aid CalTopo credentials: <strong>{{ config_proposal.diff.mutualAidCaltopo }}</strong>
+        </p>
+        <h3>Added drones</h3>
+        <ul>{% for drone in config_proposal.diff.addedDrones %}<li>{{ drone.remoteId }}{% if drone.mappedId %} → {{ drone.mappedId }}{% endif %} · {{ drone.model }}</li>{% else %}<li>None</li>{% endfor %}</ul>
+        <h3>Removed drones</h3>
+        <ul>{% for drone in config_proposal.diff.removedDrones %}<li>{{ drone.remoteId }}{% if drone.mappedId %} → {{ drone.mappedId }}{% endif %} · {{ drone.model }}</li>{% else %}<li>None</li>{% endfor %}</ul>
+        <h3>Changed drones</h3>
+        <ul>{% for change in config_proposal.diff.changedDrones %}<li>{{ change.after.remoteId }}: {{ change.before.mappedId }} · {{ change.before.model }} · {{ change.before.owner }} → {{ change.after.mappedId }} · {{ change.after.model }} · {{ change.after.owner }}</li>{% else %}<li>None</li>{% endfor %}</ul>
+      </div>
+      <form class="org-form" method="post"
+            action="/{{ organization.designator|lower }}/admin/organization-config/approve">
+        <input type="hidden" name="form_token" value="{{ csrf_token }}">
+        <label>
+          Release notes (optional)
+          <textarea name="comment" maxlength="1000" rows="3"
+                    placeholder="Summarize the credential or drone-list changes"></textarea>
+        </label>
+        <div>
+          <button class="primary-button" type="submit">Approve and publish</button>
+        </div>
+      </form>
+      <form class="inline-form" method="post"
+            action="/{{ organization.designator|lower }}/admin/organization-config/reject">
+        <input type="hidden" name="form_token" value="{{ csrf_token }}">
+        <button class="danger-button" type="submit">Discard proposal</button>
+      </form>
+      {% endif %}
+
+      <h3>Published history</h3>
+      {% if not config_releases %}
+      <p>No configuration has been approved. Connected apps will not receive configuration updates.</p>
+      {% else %}
+      <div style="overflow-x:auto">
+        <table class="org-table">
+          <thead><tr><th>Approved</th><th>Source</th><th>Release notes</th><th>Status</th></tr></thead>
+          <tbody>
+          {% for release in config_releases %}
+            <tr>
+              <td><span class="config-version-time" data-version-ms="{{ release.version_ms }}">{{ release.version_ms }}</span></td>
+              <td>
+                {{ release.source_device_name }}<br>
+                {{ release.snapshot.sourcePlatform }} {{ release.snapshot.sourceAppVersion }}
+                (build {{ release.snapshot.sourceAppBuild }})
+              </td>
+              <td>{{ release.comment or "No release notes" }}</td>
+              <td>
+                {% if release.version_ms == current_config_version_ms %}
+                <strong>Current</strong>
+                {% else %}
+                <form method="post" action="/{{ organization.designator|lower }}/admin/organization-config/restore">
+                  <input type="hidden" name="form_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="version_ms" value="{{ release.version_ms }}">
+                  <button class="primary-button" type="submit">Restore</button>
+                </form>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <script>
+        document.querySelectorAll('.config-version-time').forEach(function (element) {
+          element.textContent = new Date(Number(element.dataset.versionMs)).toLocaleString();
+        });
+      </script>
+      {% endif %}
+    </section>
+    {% endif %}
     {% if "organization_owner" in organization_user.roles or "records_admin" in organization_user.roles %}
     <section class="org-panel wide" id="members">
       <h2>Flight records &amp; migration</h2>
@@ -403,6 +559,7 @@
               <td>
                 {% for role in member.roles %}
                 <span class="role-chip">{{ role }}</span>
+                {{ role_help(role) }}
                 {% endfor %}
               </td>
             </tr>
@@ -435,8 +592,8 @@
             <input type="email" name="email" maxlength="320" required value="{{ member.email }}">
           </label>
           <div class="role-grid span-all">
-            {% for role in ["billing_admin", "user_admin", "records_admin", "records_viewer", "video_requester"] %}
-            <label><input type="checkbox" name="roles" value="{{ role }}"{% if role in member.roles %} checked{% endif %}> {{ role }}</label>
+            {% for role in ["billing_admin", "config_admin", "user_admin", "records_admin", "records_viewer", "video_requester"] %}
+            <label><input type="checkbox" name="roles" value="{{ role }}"{% if role in member.roles %} checked{% endif %}> {{ role }} {{ role_help(role) }}</label>
             {% endfor %}
           </div>
           <div class="span-all">
@@ -478,8 +635,8 @@
           <input type="email" name="email" maxlength="320" required>
         </label>
         <div class="role-grid span-all">
-          {% for role in ["billing_admin", "user_admin", "records_admin", "records_viewer", "video_requester"] %}
-          <label><input type="checkbox" name="roles" value="{{ role }}"> {{ role }}</label>
+          {% for role in ["billing_admin", "config_admin", "user_admin", "records_admin", "records_viewer", "video_requester"] %}
+          <label><input type="checkbox" name="roles" value="{{ role }}"> {{ role }} {{ role_help(role) }}</label>
           {% endfor %}
         </div>
         <div class="span-all">

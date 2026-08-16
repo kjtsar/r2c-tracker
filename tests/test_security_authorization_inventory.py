@@ -29,6 +29,7 @@ class SecurityAuthorizationInventoryTest(unittest.TestCase):
 
     ORGANIZATION_SPECIAL_ENDPOINTS = {
         "upload",
+        "current_organization_config",
         "organization_stream_events",
         "organization_r2c_websocket_endpoint",
         "organization_public_dashboard",
@@ -73,6 +74,9 @@ class SecurityAuthorizationInventoryTest(unittest.TestCase):
 
     def test_special_organization_routes_enforce_their_scoped_mechanism(self):
         source = inspect.getsource(main.upload)
+        self.assertIn("require_scoped_upload_credential", source)
+
+        source = inspect.getsource(main.current_organization_config)
         self.assertIn("require_scoped_upload_credential", source)
 
         source = inspect.getsource(main.organization_stream_events)

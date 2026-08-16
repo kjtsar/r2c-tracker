@@ -72,6 +72,7 @@ smaller set to other active members.
 | --- | --- |
 | `organization_owner` | Organization settings, member and enrollment administration, records, billing, and delegated ownership actions |
 | `billing_admin` | Service status, balance, and optional funding actions |
+| `config_admin` | Pull, review, approve, discard, and restore organization CalTopo credentials and drone-list releases |
 | `user_admin` | Members, invitations, and enrollment campaigns |
 | `records_admin` | View, export, import, delete, and restore that organization's flight records and logs |
 | `records_viewer` | View a restricted organization dashboard |
@@ -91,6 +92,7 @@ route-by-route enforcement contract and negative-test expectations.
 | `/<designator>/admin/flights` | Organization-scoped records export, import, deletion, archive, and restore tools |
 | `/<designator>/streams` | Consent-controlled managed-video request interface |
 | `/<designator>/upload` | Organization-bound device flight upload |
+| `/<designator>/api/v1/organization-config/current` | Organization-bound device download of the approved configuration release |
 | `/<designator>/ws/r2c` | Organization-bound coordination and managed-video signaling socket |
 | `/api/v1/device-enrollment/redeem` | One-time app enrollment exchange |
 | `/faa/notams` | Authenticated FAA NOTAM proxy; FAA credentials remain server-side |

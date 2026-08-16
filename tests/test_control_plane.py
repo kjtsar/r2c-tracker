@@ -677,6 +677,7 @@ class ControlPlaneStoreTest(unittest.TestCase):
         )
         self.assertEqual("active", owner.state)
         self.assertEqual(set(DEFAULT_OWNER_ROLES), set(owner.roles))
+        self.assertIn("config_admin", owner.roles)
 
         authenticated = asyncio.run(
             self.store.authenticate_user(

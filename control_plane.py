@@ -40,18 +40,39 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 DESIGNATOR_RE = re.compile(r"^[A-Z][A-Z0-9]{1,15}$")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-ROLE_NAMES = frozenset(
-    {
-        "organization_owner",
-        "billing_admin",
-        "user_admin",
-        "records_admin",
-        "records_viewer",
-        "video_requester",
-    }
-)
+ROLE_DESCRIPTIONS = {
+    "organization_owner": (
+        "Full organization authority, including policies, members, enrollment, "
+        "configuration releases, flight records, and billing information."
+    ),
+    "billing_admin": (
+        "View organization service status, usage, allocated costs, and account "
+        "activity."
+    ),
+    "config_admin": (
+        "Pull configuration from a connected RID2Caltopo device; review, approve, "
+        "discard, and restore CalTopo credential and drone-list releases."
+    ),
+    "user_admin": (
+        "Add, edit, invite, disable, and restore organization members, and manage "
+        "device-enrollment campaigns."
+    ),
+    "records_admin": (
+        "View, export, import, delete, and restore this organization's flight "
+        "records and logs."
+    ),
+    "records_viewer": (
+        "View this organization's flight dashboard when its records are restricted."
+    ),
+    "video_requester": (
+        "View advertised streams and request organization video; the pilot must "
+        "still approve each request."
+    ),
+}
+ROLE_NAMES = frozenset(ROLE_DESCRIPTIONS)
 DEFAULT_OWNER_ROLES = (
     "billing_admin",
+    "config_admin",
     "organization_owner",
     "records_admin",
     "records_viewer",
@@ -709,6 +730,61 @@ class DeviceCredential(Base):
     )
 
 
+class OrganizationConfigState(Base):
+    __tablename__ = "organization_config_states"
+
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id"), primary_key=True
+    )
+    current_version_ms: Mapped[int] = mapped_column(BigInteger, default=0)
+
+
+class OrganizationConfigProposal(Base):
+    __tablename__ = "organization_config_proposals"
+
+    # There is deliberately at most one proposed configuration per organization.
+    # Re-requesting from a device replaces the unapproved proposal.
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id"), primary_key=True
+    )
+    id: Mapped[str] = mapped_column(String(36), unique=True, index=True, default=new_id)
+    source_device_credential_id: Mapped[str] = mapped_column(
+        ForeignKey("device_credentials.id"), index=True
+    )
+    source_device_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    requested_by_user_id: Mapped[str] = mapped_column(
+        ForeignKey("organization_users.id")
+    )
+    state: Mapped[str] = mapped_column(String(24), default="awaiting_device")
+    snapshot_json: Mapped[str] = mapped_column(Text, default="")
+    diff_json: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class OrganizationConfigRelease(Base):
+    __tablename__ = "organization_config_releases"
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id", "version_ms", name="uq_org_config_release_version"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(
+        ForeignKey("organizations.id"), index=True
+    )
+    version_ms: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    snapshot_json: Mapped[str] = mapped_column(Text, nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_device_credential_id: Mapped[str] = mapped_column(
+        ForeignKey("device_credentials.id")
+    )
+    source_device_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    approved_by_user_id: Mapped[str] = mapped_column(
+        ForeignKey("organization_users.id")
+    )
+    comment: Mapped[str] = mapped_column(String(1000), default="")
+
+
 class ActiveVideoStream(Base):
     __tablename__ = "active_video_streams"
     __table_args__ = (
@@ -1083,6 +1159,29 @@ class DeviceCredentialRecord:
     device_name: str
     platform: str
     expires_at: datetime
+
+
+@dataclass(frozen=True)
+class OrganizationConfigProposalRecord:
+    id: str
+    organization_id: str
+    source_device_credential_id: str
+    source_device_name: str
+    requested_by_user_id: str
+    state: str
+    snapshot: dict
+    diff: dict
+
+
+@dataclass(frozen=True)
+class OrganizationConfigReleaseRecord:
+    organization_id: str
+    version_ms: int
+    snapshot: dict
+    source_device_credential_id: str
+    source_device_name: str
+    approved_by_user_id: str
+    comment: str
 
 
 @dataclass(frozen=True)
@@ -1714,7 +1813,11 @@ class ControlPlaneStore:
         """Ask the instance holding a tablet socket to refresh previews."""
         safe_ttl = max(10, min(int(ttl_seconds), 60))
         async with self.sessions() as session:
-            credential = await session.get(DeviceCredential, device_credential_id)
+            credential = await session.scalar(
+                select(DeviceCredential)
+                .where(DeviceCredential.id == device_credential_id)
+                .with_for_update()
+            )
             if (
                 credential is None
                 or credential.organization_id != organization_id
@@ -5242,6 +5345,228 @@ class ControlPlaneStore:
                 platform=credential.platform,
                 expires_at=expires_at,
             )
+
+    @staticmethod
+    def _config_proposal_record(
+        proposal: OrganizationConfigProposal,
+    ) -> OrganizationConfigProposalRecord:
+        return OrganizationConfigProposalRecord(
+            id=proposal.id,
+            organization_id=proposal.organization_id,
+            source_device_credential_id=proposal.source_device_credential_id,
+            source_device_name=proposal.source_device_name,
+            requested_by_user_id=proposal.requested_by_user_id,
+            state=proposal.state,
+            snapshot=json.loads(proposal.snapshot_json) if proposal.snapshot_json else {},
+            diff=json.loads(proposal.diff_json) if proposal.diff_json else {},
+        )
+
+    @staticmethod
+    def _config_release_record(
+        release: OrganizationConfigRelease,
+    ) -> OrganizationConfigReleaseRecord:
+        return OrganizationConfigReleaseRecord(
+            organization_id=release.organization_id,
+            version_ms=release.version_ms,
+            snapshot=json.loads(release.snapshot_json),
+            source_device_credential_id=release.source_device_credential_id,
+            source_device_name=release.source_device_name,
+            approved_by_user_id=release.approved_by_user_id,
+            comment=release.comment,
+        )
+
+    async def start_organization_config_proposal(
+        self,
+        *,
+        organization_id: str,
+        device_credential_id: str,
+        requested_by_user_id: str,
+        source_device_name: str = "",
+    ) -> OrganizationConfigProposalRecord:
+        async with self.sessions() as session:
+            credential = await session.get(DeviceCredential, device_credential_id)
+            user = await session.get(OrganizationUser, requested_by_user_id)
+            if (
+                credential is None
+                or credential.organization_id != organization_id
+                or credential.state != "active"
+            ):
+                raise ControlPlaneError("Active organization device not found.")
+            if user is None or user.organization_id != organization_id:
+                raise ControlPlaneError("Organization administrator not found.")
+            proposal = await session.get(OrganizationConfigProposal, organization_id)
+            if proposal is None:
+                proposal = OrganizationConfigProposal(organization_id=organization_id)
+                session.add(proposal)
+            proposal.id = new_id()
+            proposal.source_device_credential_id = device_credential_id
+            proposal.source_device_name = source_device_name.strip()[:160] or credential.device_name
+            proposal.requested_by_user_id = requested_by_user_id
+            proposal.state = "awaiting_device"
+            proposal.snapshot_json = ""
+            proposal.diff_json = "{}"
+            session.add(ControlPlaneAuditEvent(
+                organization_id=organization_id,
+                actor_type="organization_user",
+                actor_id=requested_by_user_id,
+                event_type="organization.config_pull_requested",
+                details_json=json.dumps({"device_name": credential.device_name}),
+            ))
+            await session.commit()
+            return self._config_proposal_record(proposal)
+
+    async def complete_organization_config_proposal(
+        self,
+        *,
+        proposal_id: str,
+        organization_id: str,
+        device_credential_id: str,
+        snapshot_json: str,
+        diff_json: str,
+    ) -> OrganizationConfigProposalRecord:
+        async with self.sessions() as session:
+            proposal = await session.scalar(select(OrganizationConfigProposal).where(
+                OrganizationConfigProposal.id == proposal_id,
+                OrganizationConfigProposal.organization_id == organization_id,
+            ))
+            if proposal is None or proposal.source_device_credential_id != device_credential_id:
+                raise ControlPlaneError("Configuration request not found for this device.")
+            if proposal.state != "awaiting_device":
+                raise ControlPlaneError("Configuration request is no longer awaiting a response.")
+            proposal.snapshot_json = snapshot_json
+            proposal.diff_json = diff_json
+            proposal.state = "ready"
+            session.add(ControlPlaneAuditEvent(
+                organization_id=organization_id,
+                actor_type="device_credential",
+                actor_id=device_credential_id,
+                event_type="organization.config_proposed",
+                details_json=json.dumps({"device_name": proposal.source_device_name}),
+            ))
+            await session.commit()
+            return self._config_proposal_record(proposal)
+
+    async def get_organization_config_proposal(
+        self, organization_id: str,
+    ) -> Optional[OrganizationConfigProposalRecord]:
+        async with self.sessions() as session:
+            proposal = await session.get(OrganizationConfigProposal, organization_id)
+            return self._config_proposal_record(proposal) if proposal else None
+
+    async def reject_organization_config_proposal(
+        self, *, organization_id: str, actor_user_id: str,
+    ) -> None:
+        async with self.sessions() as session:
+            proposal = await session.get(OrganizationConfigProposal, organization_id)
+            if proposal is None:
+                raise ControlPlaneError("No proposed configuration is available.")
+            await session.delete(proposal)
+            session.add(ControlPlaneAuditEvent(
+                organization_id=organization_id,
+                actor_type="organization_user",
+                actor_id=actor_user_id,
+                event_type="organization.config_rejected",
+                details_json=json.dumps({"device_name": proposal.source_device_name}),
+            ))
+            await session.commit()
+
+    async def approve_organization_config_proposal(
+        self,
+        *,
+        organization_id: str,
+        actor_user_id: str,
+        comment: str,
+        now: Optional[datetime] = None,
+    ) -> OrganizationConfigReleaseRecord:
+        approved_at = now or utc_now()
+        version_ms = int(approved_at.timestamp() * 1000)
+        async with self.sessions() as session:
+            proposal = await session.get(OrganizationConfigProposal, organization_id)
+            if proposal is None or proposal.state != "ready" or not proposal.snapshot_json:
+                raise ControlPlaneError("No completed configuration proposal is available.")
+            release = OrganizationConfigRelease(
+                organization_id=organization_id,
+                version_ms=version_ms,
+                snapshot_json=proposal.snapshot_json,
+                content_sha256=hashlib.sha256(proposal.snapshot_json.encode("utf-8")).hexdigest(),
+                source_device_credential_id=proposal.source_device_credential_id,
+                source_device_name=proposal.source_device_name,
+                approved_by_user_id=actor_user_id,
+                comment=comment.strip()[:1000],
+            )
+            state = await session.get(OrganizationConfigState, organization_id)
+            if state is None:
+                state = OrganizationConfigState(organization_id=organization_id)
+                session.add(state)
+            state.current_version_ms = version_ms
+            session.add(release)
+            await session.delete(proposal)
+            session.add(ControlPlaneAuditEvent(
+                organization_id=organization_id,
+                actor_type="organization_user",
+                actor_id=actor_user_id,
+                event_type="organization.config_approved",
+                details_json=json.dumps({
+                    "version_ms": version_ms,
+                    "device_name": release.source_device_name,
+                    "comment": release.comment,
+                }),
+                created_at=approved_at,
+            ))
+            await session.commit()
+            return self._config_release_record(release)
+
+    async def get_current_organization_config_release(
+        self, organization_id: str,
+    ) -> Optional[OrganizationConfigReleaseRecord]:
+        async with self.sessions() as session:
+            state = await session.get(OrganizationConfigState, organization_id)
+            if state is None or state.current_version_ms == 0:
+                return None
+            release = await session.scalar(select(OrganizationConfigRelease).where(
+                OrganizationConfigRelease.organization_id == organization_id,
+                OrganizationConfigRelease.version_ms == state.current_version_ms,
+            ))
+            return self._config_release_record(release) if release else None
+
+    async def get_organization_config_version_ms(self, organization_id: str) -> int:
+        async with self.sessions() as session:
+            state = await session.get(OrganizationConfigState, organization_id)
+            return int(state.current_version_ms) if state else 0
+
+    async def list_organization_config_releases(
+        self, organization_id: str,
+    ) -> tuple[OrganizationConfigReleaseRecord, ...]:
+        async with self.sessions() as session:
+            releases = (await session.scalars(select(OrganizationConfigRelease).where(
+                OrganizationConfigRelease.organization_id == organization_id,
+            ).order_by(OrganizationConfigRelease.version_ms.desc()))).all()
+            return tuple(self._config_release_record(release) for release in releases)
+
+    async def restore_organization_config_release(
+        self, *, organization_id: str, version_ms: int, actor_user_id: str,
+    ) -> OrganizationConfigReleaseRecord:
+        async with self.sessions() as session:
+            release = await session.scalar(select(OrganizationConfigRelease).where(
+                OrganizationConfigRelease.organization_id == organization_id,
+                OrganizationConfigRelease.version_ms == version_ms,
+            ))
+            if release is None:
+                raise ControlPlaneError("Configuration release not found.")
+            state = await session.get(OrganizationConfigState, organization_id)
+            if state is None:
+                state = OrganizationConfigState(organization_id=organization_id)
+                session.add(state)
+            state.current_version_ms = version_ms
+            session.add(ControlPlaneAuditEvent(
+                organization_id=organization_id,
+                actor_type="organization_user",
+                actor_id=actor_user_id,
+                event_type="organization.config_restored",
+                details_json=json.dumps({"version_ms": version_ms}),
+            ))
+            await session.commit()
+            return self._config_release_record(release)
 
     async def advertise_video_stream(
         self,

@@ -63,6 +63,7 @@ from control_plane import (
     DeviceCredentialRecord,
     DuplicateOrganizationError,
     InvalidOrganizationError,
+    ROLE_DESCRIPTIONS,
     managed_video_quality_choices,
     normalize_video_preflight_answer,
     require_separate_database,
@@ -2194,6 +2195,49 @@ class R2CCoordinationHub:
             await self._handle_video_stream_terminated(websocket, payload)
         elif mtype == "recording_download_decision":
             await self._handle_recording_download_decision(websocket, payload)
+        elif mtype == "organization_config_snapshot_response":
+            await self._handle_organization_config_snapshot_response(websocket, payload)
+
+    async def _handle_organization_config_snapshot_response(
+        self, websocket: WebSocket, payload: dict,
+    ):
+        async with self._lock:
+            connection = self._connections.get(websocket)
+            credential = connection.device_credential if connection is not None else None
+        request_id = str(payload.get("requestId", "") or "").strip()
+        try:
+            if credential is None or control_plane_store is None:
+                raise ControlPlaneError("Organization device credential required.")
+            _snapshot, snapshot_json = validated_organization_config_snapshot(
+                payload.get("config")
+            )
+            current = await control_plane_store.get_current_organization_config_release(
+                credential.organization_id
+            )
+            diff = organization_config_diff(
+                current.snapshot if current is not None else None,
+                _snapshot,
+            )
+            await control_plane_store.complete_organization_config_proposal(
+                proposal_id=request_id,
+                organization_id=credential.organization_id,
+                device_credential_id=credential.id,
+                snapshot_json=snapshot_json,
+                diff_json=json.dumps(diff, separators=(",", ":"), sort_keys=True),
+            )
+            await websocket.send_text(json.dumps({
+                "type": "organization_config_snapshot_ack",
+                "requestId": request_id,
+                "accepted": True,
+            }))
+        except (ControlPlaneError, ValueError) as exc:
+            logger.warning("Organization config response rejected: request=%s error=%s", request_id, exc)
+            await websocket.send_text(json.dumps({
+                "type": "organization_config_snapshot_ack",
+                "requestId": request_id,
+                "accepted": False,
+                "error": str(exc),
+            }))
 
     async def _handle_recording_download_decision(self, websocket: WebSocket, payload: dict):
         async with self._lock:
@@ -2849,30 +2893,49 @@ class R2CCoordinationHub:
         if websocket is None:
             return False
         try:
-            await websocket.send_text(
-                json.dumps(
-                    {
-                        "type": "video_stream_request",
-                        "requestId": request_id,
-                        "requesterEmail": requester_email,
-                        "streamSessionId": stream_session_id,
-                        "incidentName": incident_name,
-                        "droneDesignator": drone_designator,
-                        "sourceWidth": source_width,
-                        "sourceHeight": source_height,
-                        "sourceFps": source_fps,
-                        "sourceBitrateBps": source_bitrate_bps,
-                        "sourceCodec": source_codec,
-                        "expiresAt": expires_at.isoformat(),
-                        "consentRequired": not remote_control_enabled,
-                        "remoteControlEnabled": remote_control_enabled,
-                    }
-                )
-            )
+            await websocket.send_text(json.dumps({
+                "type": "video_stream_request",
+                "requestId": request_id,
+                "requesterEmail": requester_email,
+                "streamSessionId": stream_session_id,
+                "incidentName": incident_name,
+                "droneDesignator": drone_designator,
+                "sourceWidth": source_width,
+                "sourceHeight": source_height,
+                "sourceFps": source_fps,
+                "sourceBitrateBps": source_bitrate_bps,
+                "sourceCodec": source_codec,
+                "expiresAt": expires_at.isoformat(),
+                "consentRequired": not remote_control_enabled,
+                "remoteControlEnabled": remote_control_enabled,
+            }))
             return True
         except Exception:
             logger.warning(
                 "Managed video request delivery failed for device=%s",
+                device_credential_id,
+                exc_info=True,
+            )
+            return False
+
+    async def send_organization_config_snapshot_request(
+        self, *, device_credential_id: str, request_id: str,
+    ) -> bool:
+        async with self._lock:
+            connections = self._device_connections_locked(device_credential_id)
+            connection = connections[0] if connections else None
+            websocket = connection.websocket if connection is not None else None
+        if websocket is None:
+            return False
+        try:
+            await websocket.send_text(json.dumps({
+                "type": "organization_config_snapshot_request",
+                "requestId": request_id,
+            }))
+            return True
+        except Exception:
+            logger.warning(
+                "Organization config request delivery failed for device=%s",
                 device_credential_id,
                 exc_info=True,
             )
@@ -3024,7 +3087,14 @@ class R2CCoordinationHub:
             "heartbeatSec": R2C_HEARTBEAT_SEC,
             "leaseSec": R2C_LEASE_SEC,
             "idleRecommended": True,
-            "idleParkSec": R2C_IDLE_PARK_SEC
+            "idleParkSec": R2C_IDLE_PARK_SEC,
+            "organizationConfigVersionMs": (
+                await globals()["control_plane_store"].get_organization_config_version_ms(
+                    organization_id
+                )
+                if conn.device_credential is not None and globals().get("control_plane_store") is not None
+                else 0
+            ),
         }
         app_platform = str(payload.get("appPlatform", "") or "").strip().lower()
         if app_platform in {"ios", "ipados"}:
@@ -4839,6 +4909,7 @@ def organization_landing_path(organization, user) -> str:
     administrative_roles = {
         "organization_owner",
         "billing_admin",
+        "config_admin",
         "user_admin",
         "records_admin",
     }
@@ -5173,6 +5244,115 @@ def require_scoped_upload_credential(
             detail="Device credential does not belong to this organization",
         )
     return credential
+
+
+ORG_CONFIG_MAX_BYTES = 256 * 1024
+ORG_CONFIG_MAX_DRONES = 500
+
+
+def validated_organization_config_snapshot(snapshot: object) -> tuple[dict, str]:
+    if not isinstance(snapshot, dict):
+        raise ValueError("Organization configuration must be a JSON object.")
+    allowed = {
+        "configSchemaVersion", "sourcePlatform", "sourceAppVersion",
+        "sourceAppBuild", "organizationCaltopoEnc", "mutualAidCaltopoEnc",
+        "droneSpecs",
+    }
+    if set(snapshot) - allowed:
+        raise ValueError("Organization configuration contains unsupported fields.")
+    if snapshot.get("configSchemaVersion") != 1:
+        raise ValueError("Unsupported organization configuration schema version.")
+    platform = str(snapshot.get("sourcePlatform", "")).strip().lower()
+    if platform not in {"android", "ios", "ipados"}:
+        raise ValueError("Invalid source platform.")
+    app_version = str(snapshot.get("sourceAppVersion", "")).strip()
+    app_build = snapshot.get("sourceAppBuild")
+    if not app_version or len(app_version) > 64:
+        raise ValueError("Invalid source app version.")
+    if not isinstance(app_build, int) or isinstance(app_build, bool) or app_build < 0:
+        raise ValueError("Invalid source app build.")
+    org_enc = snapshot.get("organizationCaltopoEnc")
+    ma_enc = snapshot.get("mutualAidCaltopoEnc", "")
+    if not isinstance(org_enc, str) or not org_enc or len(org_enc) > 65_536:
+        raise ValueError("Organization CalTopo configuration is missing or invalid.")
+    if not isinstance(ma_enc, str) or len(ma_enc) > 65_536:
+        raise ValueError("Mutual-aid CalTopo configuration is invalid.")
+    drones = snapshot.get("droneSpecs")
+    if not isinstance(drones, list) or len(drones) > ORG_CONFIG_MAX_DRONES:
+        raise ValueError("Drone specifications are missing or exceed the limit.")
+    normalized_drones = []
+    remote_ids = set()
+    allowed_drone_fields = {"remoteId", "mappedId", "org", "model", "owner"}
+    for item in drones:
+        if not isinstance(item, dict) or set(item) - allowed_drone_fields:
+            raise ValueError("A drone specification contains unsupported fields.")
+        normalized = {
+            key: str(item.get(key, "")).strip()
+            for key in ("remoteId", "mappedId", "org", "model", "owner")
+        }
+        remote_id = normalized["remoteId"]
+        if not remote_id or len(remote_id) > 160 or remote_id.casefold() in remote_ids:
+            raise ValueError("Drone remote IDs must be present and unique.")
+        if any(len(value) > 200 for value in normalized.values()):
+            raise ValueError("A drone specification field is too long.")
+        remote_ids.add(remote_id.casefold())
+        normalized_drones.append(normalized)
+    normalized_snapshot = {
+        "configSchemaVersion": 1,
+        "sourcePlatform": platform,
+        "sourceAppVersion": app_version,
+        "sourceAppBuild": app_build,
+        "organizationCaltopoEnc": org_enc,
+        "mutualAidCaltopoEnc": ma_enc,
+        "droneSpecs": sorted(normalized_drones, key=lambda item: item["remoteId"].casefold()),
+    }
+    encoded = json.dumps(normalized_snapshot, separators=(",", ":"), sort_keys=True)
+    if len(encoded.encode("utf-8")) > ORG_CONFIG_MAX_BYTES:
+        raise ValueError("Organization configuration exceeds the 256 KiB limit.")
+    if "r2c_dev_" in encoded:
+        raise ValueError("Organization configuration contains a device credential.")
+    return normalized_snapshot, encoded
+
+
+def organization_config_diff(current: Optional[dict], proposed: dict) -> dict:
+    current = current or {}
+    def credential_status(field: str) -> str:
+        old, new = str(current.get(field, "")), str(proposed.get(field, ""))
+        if not old and new:
+            return "added"
+        if old and not new:
+            return "removed"
+        return "changed" if old != new else "unchanged"
+    old_drones = {item["remoteId"].casefold(): item for item in current.get("droneSpecs", [])}
+    new_drones = {item["remoteId"].casefold(): item for item in proposed["droneSpecs"]}
+    return {
+        "organizationCaltopo": credential_status("organizationCaltopoEnc"),
+        "mutualAidCaltopo": credential_status("mutualAidCaltopoEnc"),
+        "addedDrones": [new_drones[key] for key in sorted(new_drones.keys() - old_drones.keys())],
+        "removedDrones": [old_drones[key] for key in sorted(old_drones.keys() - new_drones.keys())],
+        "changedDrones": [
+            {"before": old_drones[key], "after": new_drones[key]}
+            for key in sorted(old_drones.keys() & new_drones.keys())
+            if old_drones[key] != new_drones[key]
+        ],
+    }
+
+
+@app.get("/{designator}/api/v1/organization-config/current")
+async def current_organization_config(
+    designator: str,
+    credential: Optional[DeviceCredentialRecord] = Depends(get_api_key),
+):
+    credential = require_scoped_upload_credential(designator, credential)
+    release = await control_plane_store.get_current_organization_config_release(
+        credential.organization_id
+    )
+    if release is None:
+        return Response(status_code=204, headers={"Cache-Control": "private, no-store"})
+    return JSONResponse(
+        {"versionMs": release.version_ms, "config": release.snapshot},
+        headers={"Cache-Control": "private, no-store"},
+    )
 
 
 @app.put("/{designator}/upload")
@@ -7703,6 +7883,7 @@ async def organization_admin(request: Request, designator: str):
         required_roles=(
             "organization_owner",
             "billing_admin",
+            "config_admin",
             "user_admin",
             "records_admin",
         ),
@@ -7714,6 +7895,22 @@ async def organization_admin(request: Request, designator: str):
         control_plane_store.list_enrollment_campaigns(organization.id),
         control_plane_store.list_ledger(organization.id),
     )
+    connected_config_sources = ()
+    config_proposal = None
+    config_releases = ()
+    current_config_version_ms = 0
+    if {"organization_owner", "config_admin"}.intersection(user.roles):
+        (
+            connected_config_sources,
+            config_proposal,
+            config_releases,
+            current_config_version_ms,
+        ) = await asyncio.gather(
+            r2c_hub.list_connected_tablets(organization.id),
+            control_plane_store.get_organization_config_proposal(organization.id),
+            control_plane_store.list_organization_config_releases(organization.id),
+            control_plane_store.get_organization_config_version_ms(organization.id),
+        )
     organization_cost = None
     billing_snapshot = None
     beta_allowance = None
@@ -7754,8 +7951,123 @@ async def organization_admin(request: Request, designator: str):
             ),
             "organization_page_designator": organization.designator,
             "organization_identity_name": user.display_name,
+            "role_descriptions": ROLE_DESCRIPTIONS,
+            "connected_config_sources": connected_config_sources,
+            "config_proposal": config_proposal,
+            "config_releases": config_releases,
+            "current_config_version_ms": current_config_version_ms,
         },
     )
+
+
+@app.post("/{designator}/admin/organization-config/request")
+async def request_organization_config(
+        request: Request,
+        designator: str,
+        device_credential_id: Annotated[str, Form()],
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_admin", form_token)
+    organization, user = await require_organization_user(
+        request, designator,
+        required_roles=("organization_owner", "config_admin"),
+        redirect_to_login=True,
+    )
+    connected = await r2c_hub.list_connected_tablets(organization.id)
+    selected = next(
+        (item for item in connected if item.id == device_credential_id), None
+    )
+    if selected is None:
+        flash(request, "That RID2Caltopo device is no longer connected.", "warning")
+        return RedirectResponse(f"/{organization.designator.lower()}/admin#organization-config", status_code=303)
+    try:
+        proposal = await control_plane_store.start_organization_config_proposal(
+            organization_id=organization.id,
+            device_credential_id=selected.id,
+            requested_by_user_id=user.id,
+            source_device_name=selected.device_name,
+        )
+        delivered = await r2c_hub.send_organization_config_snapshot_request(
+            device_credential_id=selected.id,
+            request_id=proposal.id,
+        )
+        if not delivered:
+            await control_plane_store.reject_organization_config_proposal(
+                organization_id=organization.id, actor_user_id=user.id,
+            )
+            raise ControlPlaneError("The device disconnected before it could respond.")
+        flash(request, f"Requested configuration from {selected.device_name}.", "success")
+    except ControlPlaneError as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(f"/{organization.designator.lower()}/admin#organization-config", status_code=303)
+
+
+@app.post("/{designator}/admin/organization-config/approve")
+async def approve_organization_config(
+        request: Request,
+        designator: str,
+        comment: Annotated[str, Form()] = "",
+        form_token: Annotated[str, Form()] = ""):
+    verify_csrf(request, "organization_admin", form_token)
+    organization, user = await require_organization_user(
+        request, designator,
+        required_roles=("organization_owner", "config_admin"),
+        redirect_to_login=True,
+    )
+    try:
+        release = await control_plane_store.approve_organization_config_proposal(
+            organization_id=organization.id,
+            actor_user_id=user.id,
+            comment=comment,
+        )
+        flash(request, f"Published organization configuration {release.version_ms}.", "success")
+    except ControlPlaneError as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(f"/{organization.designator.lower()}/admin#organization-config", status_code=303)
+
+
+@app.post("/{designator}/admin/organization-config/reject")
+async def reject_organization_config(
+        request: Request,
+        designator: str,
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_admin", form_token)
+    organization, user = await require_organization_user(
+        request, designator,
+        required_roles=("organization_owner", "config_admin"),
+        redirect_to_login=True,
+    )
+    try:
+        await control_plane_store.reject_organization_config_proposal(
+            organization_id=organization.id, actor_user_id=user.id,
+        )
+        flash(request, "Discarded the proposed organization configuration.", "success")
+    except ControlPlaneError as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(f"/{organization.designator.lower()}/admin#organization-config", status_code=303)
+
+
+@app.post("/{designator}/admin/organization-config/restore")
+async def restore_organization_config(
+        request: Request,
+        designator: str,
+        version_ms: Annotated[int, Form()],
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_admin", form_token)
+    organization, user = await require_organization_user(
+        request, designator,
+        required_roles=("organization_owner", "config_admin"),
+        redirect_to_login=True,
+    )
+    try:
+        await control_plane_store.restore_organization_config_release(
+            organization_id=organization.id,
+            version_ms=version_ms,
+            actor_user_id=user.id,
+        )
+        flash(request, f"Restored organization configuration {version_ms}.", "success")
+    except ControlPlaneError as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(f"/{organization.designator.lower()}/admin#organization-config", status_code=303)
 
 
 async def require_organization_records_admin(

@@ -10,6 +10,7 @@ This matrix records the intended trust boundary for tenant and platform interfac
 | Activation or recovery user | Expiring activation/reset state plus CSRF and identity verification | One organization and one activation/reset transaction |
 | Organization member | Organization session; active user; designator and organization ID match | Assigned organization and role set |
 | Records administrator | Organization session with `organization_owner` or `records_admin` | That organization's flight records and namespaced flight-log files |
+| Configuration administrator | Organization session with `organization_owner` or `config_admin` | Pull, review, approve, reject, and restore that organization's configuration releases |
 | Video requester | Organization session with `video_requester` | Own organization's streams and the requester's own video request lifecycle |
 | Enrolled device | Revocable per-device credential whose stored hash resolves to one organization | Upload, coordination, FAA proxy, and signaling for the credential's organization |
 | Platform administrator | Separate platform-admin authentication and CSRF for state changes | Organization lifecycle and service metadata, not tenant flight content |
@@ -22,6 +23,8 @@ This matrix records the intended trust boundary for tenant and platform interfac
 | `/{designator}/admin` and settings/members/enrollments | `require_organization_user`; route-specific role; CSRF on mutations | Organization returned by the authenticated designator/session match |
 | `/{designator}/admin/flights/**` | `require_organization_records_admin`; CSRF on mutations | Database queries include `Flight.organization_id`; archive paths require `organizations/{designator}/` confinement |
 | `/{designator}/upload` | Device credential plus `require_scoped_upload_credential` | URL designator must match credential designator; created record receives credential organization ID |
+| `/{designator}/api/v1/organization-config/current` | Device credential plus `require_scoped_upload_credential` | URL designator must match credential; returns only the organization's current approved release |
+| `/{designator}/admin/organization-config/*` | Organization session, `organization_owner` or `config_admin`, and CSRF | Authorized configuration administrators pull from a live same-organization device, review diffs, approve, reject, or restore immutable releases |
 | `/{designator}/ws/r2c` | Device credential resolved by `authenticate_tracker_session` | Credential designator must match URL designator before socket acceptance; the resolved organization ID namespaces all runtime groups, broadcasts, ownership/confirmation keys, standalone proximity matching, and persisted coordination queries |
 | `/{designator}/streams/events` | Active organization session, matching organization ID/designator, `video_requester` role | Event hub and status queries keyed by organization ID and requester ID |
 | `/{designator}/streams/requests/**` | Organization session, `video_requester`, CSRF on mutations | Store methods require organization ID and requester user ID to match the request |

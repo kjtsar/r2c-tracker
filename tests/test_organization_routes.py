@@ -590,6 +590,226 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             result = await session.execute(select(main.Flight).order_by(main.Flight.id))
             return result.scalars().all()
 
+    def test_owner_approves_versioned_device_configuration_and_devices_pull_current(self):
+        organization = asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Primary Administrator",
+                admin_email="admin@ncssar.example",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        owner = asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+            )
+        )
+        campaign = asyncio.run(
+            self.store.create_enrollment_campaign(
+                organization_id=organization.id,
+                label="Config publisher",
+                created_by_user_id=owner.id,
+                expires_in_hours=24,
+                max_redemptions=1,
+            )
+        )
+        device = asyncio.run(
+            self.store.issue_device_credential(
+                campaign_id=campaign.id,
+                organization_id=organization.id,
+                device_name="iPad 1",
+                platform="ios",
+            )
+        )
+        empty = self.client.get(
+            "/ncssar/api/v1/organization-config/current",
+            headers={"X-SAR-Token": device.token},
+        )
+        self.assertEqual(204, empty.status_code)
+        self.assertEqual(0, asyncio.run(
+            self.store.get_organization_config_version_ms(organization.id)
+        ))
+        snapshot = {
+            "configSchemaVersion": 1,
+            "sourcePlatform": "ios",
+            "sourceAppVersion": "2.0.3",
+            "sourceAppBuild": 138,
+            "organizationCaltopoEnc": "opaque-org-credentials",
+            "mutualAidCaltopoEnc": "opaque-ma-credentials",
+            "droneSpecs": [{
+                "remoteId": "RID-1", "mappedId": "UAS-1", "org": "NCSSAR",
+                "model": "Matrice 30T", "owner": "Ken",
+            }],
+        }
+        normalized, snapshot_json = main.validated_organization_config_snapshot(snapshot)
+        proposal = asyncio.run(self.store.start_organization_config_proposal(
+            organization_id=organization.id,
+            device_credential_id=device.id,
+            requested_by_user_id=owner.id,
+        ))
+        diff = main.organization_config_diff(None, normalized)
+        asyncio.run(self.store.complete_organization_config_proposal(
+            proposal_id=proposal.id,
+            organization_id=organization.id,
+            device_credential_id=device.id,
+            snapshot_json=snapshot_json,
+            diff_json=json.dumps(diff),
+        ))
+        approved = asyncio.run(self.store.approve_organization_config_proposal(
+            organization_id=organization.id,
+            actor_user_id=owner.id,
+            comment="Initial verified drone list",
+            now=datetime(2026, 8, 15, 12, 34, 56, 789000, tzinfo=UTC),
+        ))
+        self.assertEqual(1786797296789, approved.version_ms)
+        self.assertEqual("Initial verified drone list", approved.comment)
+        self.assertIsNone(asyncio.run(
+            self.store.get_organization_config_proposal(organization.id)
+        ))
+
+        self.assertEqual(
+            403, self.client.get("/ncssar/api/v1/organization-config/current").status_code
+        )
+        current = self.client.get(
+            "/ncssar/api/v1/organization-config/current",
+            headers={"X-SAR-Token": device.token},
+        )
+        self.assertEqual(200, current.status_code, current.text)
+        self.assertEqual(approved.version_ms, current.json()["versionMs"])
+        self.assertEqual(normalized, current.json()["config"])
+        self.assertEqual("private, no-store", current.headers["cache-control"])
+
+    def test_managed_config_snapshot_excludes_organization_policy_and_device_secrets(self):
+        valid = {
+            "configSchemaVersion": 1, "sourcePlatform": "android",
+            "sourceAppVersion": "2.0.3", "sourceAppBuild": 138,
+            "organizationCaltopoEnc": "opaque", "mutualAidCaltopoEnc": "",
+            "droneSpecs": [],
+        }
+        normalized, _encoded = main.validated_organization_config_snapshot(valid)
+        self.assertNotIn("organization", normalized)
+        self.assertNotIn("organizationSettings", normalized)
+        for forbidden in ("requestedAtMs", "receivedAtMs", "organizationSettings"):
+            invalid = {**valid, forbidden: 1}
+            with self.assertRaises(ValueError):
+                main.validated_organization_config_snapshot(invalid)
+        invalid = {**valid, "organizationCaltopoEnc": "r2c_dev_forbidden"}
+        with self.assertRaises(ValueError):
+            main.validated_organization_config_snapshot(invalid)
+
+    def test_config_admin_pulls_reviews_and_approves_connected_device_configuration(self):
+        organization = asyncio.run(self.store.create_organization(
+            legal_name="North County Search and Rescue", designator="NCSSAR",
+            admin_name="Primary Administrator", admin_email="admin@ncssar.example",
+            postal_address="100 Rescue Way", actor_id="platform-admin", simulation=True,
+        ))
+        owner = asyncio.run(self.store.activate_owner(
+            organization.designator, organization.primary_admin_email,
+            "correct horse battery staple",
+        ))
+        campaign = asyncio.run(self.store.create_enrollment_campaign(
+            organization_id=organization.id, label="Config source",
+            created_by_user_id=owner.id, expires_in_hours=24, max_redemptions=1,
+        ))
+        device = asyncio.run(self.store.issue_device_credential(
+            campaign_id=campaign.id, organization_id=organization.id,
+            device_name="Ken's A5 Pro", platform="android",
+        ))
+        config_admin = asyncio.run(self.store.add_user(
+            organization_id=organization.id,
+            display_name="Configuration Administrator",
+            email="config@ncssar.example",
+            roles=("config_admin",),
+            actor_id=owner.id,
+        ))
+        invitation = asyncio.run(self.store.get_invitation(
+            organization.designator, config_admin.email,
+        ))
+        activation_url = self.tokens.activation_url(invitation)
+        activation_page = self.client.get(
+            urlparse(activation_url).path + "?" + urlparse(activation_url).query
+        )
+        activated = self.client.post("/ncssar/activate", data={
+            "form_token": self.form_token(activation_page),
+            "token": parse_qs(urlparse(activation_url).query)["token"][0],
+            "password": "correct horse battery staple",
+            "password_confirm": "correct horse battery staple",
+        }, follow_redirects=False)
+        self.assertEqual(303, activated.status_code)
+        self.assertEqual("/ncssar/admin", activated.headers["location"])
+
+        snapshot = {
+            "configSchemaVersion": 1, "sourcePlatform": "android",
+            "sourceAppVersion": "2.0.3", "sourceAppBuild": 138,
+            "organizationCaltopoEnc": "opaque-org", "mutualAidCaltopoEnc": "",
+            "droneSpecs": [{"remoteId": "RID-1", "mappedId": "UAS-1",
+                             "org": "NCSSAR", "model": "M30T", "owner": "Ken"}],
+        }
+        with self.client.websocket_connect(
+            "/ncssar/ws/r2c", headers={"X-SAR-Token": device.token},
+        ) as websocket:
+            admin_page = self.client.get("/ncssar/admin")
+            self.assertIn("Ken's A5 Pro", html.unescape(admin_page.text))
+            self.assertNotIn("Save member", admin_page.text)
+            self.assertNotIn("Manage flight records", admin_page.text)
+            self.assertNotIn("Month-to-date platform cost", admin_page.text)
+            requested = self.client.post(
+                "/ncssar/admin/organization-config/request",
+                data={"form_token": self.form_token(admin_page),
+                      "device_credential_id": device.id},
+                follow_redirects=False,
+            )
+            self.assertEqual(303, requested.status_code)
+            pull = websocket.receive_json()
+            self.assertEqual("organization_config_snapshot_request", pull["type"])
+            websocket.send_json({
+                "type": "organization_config_snapshot_response",
+                "requestId": pull["requestId"], "config": snapshot,
+            })
+            self.assertTrue(websocket.receive_json()["accepted"])
+
+            review = self.client.get("/ncssar/admin")
+            self.assertIn("Approve and publish", review.text)
+            self.assertIn("RID-1", review.text)
+            approved = self.client.post(
+                "/ncssar/admin/organization-config/approve",
+                data={"form_token": self.form_token(review),
+                      "comment": "Verified initial aircraft"},
+                follow_redirects=False,
+            )
+            self.assertEqual(303, approved.status_code)
+        current = self.client.get(
+            "/ncssar/api/v1/organization-config/current",
+            headers={"X-SAR-Token": device.token},
+        )
+        release = asyncio.run(
+            self.store.get_current_organization_config_release(organization.id)
+        )
+        self.assertEqual("Verified initial aircraft", release.comment)
+        self.assertEqual(snapshot["droneSpecs"], current.json()["config"]["droneSpecs"])
+
+        history = self.client.get("/ncssar/admin")
+        discarded = self.client.post(
+            "/ncssar/admin/organization-config/reject",
+            data={"form_token": self.form_token(history)},
+            follow_redirects=False,
+        )
+        self.assertEqual(303, discarded.status_code)
+        restored = self.client.post(
+            "/ncssar/admin/organization-config/restore",
+            data={
+                "form_token": self.form_token(history),
+                "version_ms": release.version_ms,
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(303, restored.status_code)
+
     @staticmethod
     def form_token(response):
         match = HIDDEN_TOKEN_RE.search(response.text)
@@ -948,20 +1168,28 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             page.text,
         )
         self.assertIn("Save member", page.text)
+        self.assertIn('aria-label="config_admin:', page.text)
+        self.assertIn(
+            "Pull configuration from a connected RID2Caltopo device",
+            page.text,
+        )
         updated = self.client.post(
             f"/ncssar/members/{member.id}",
             data={
                 "form_token": self.form_token(page),
                 "display_name": "Edited Member",
                 "email": "edited@ncssar.example",
-                "roles": ["records_admin", "video_requester"],
+                "roles": ["config_admin", "records_admin", "video_requester"],
             },
             follow_redirects=True,
         )
         self.assertIn("Updated member edited@ncssar.example", updated.text)
         current = asyncio.run(self.store.get_user(member.id))
         self.assertEqual("Edited Member", current.display_name)
-        self.assertEqual({"records_admin", "video_requester"}, set(current.roles))
+        self.assertEqual(
+            {"config_admin", "records_admin", "video_requester"},
+            set(current.roles),
+        )
 
         deleted = self.client.post(
             f"/ncssar/members/{member.id}/delete",
