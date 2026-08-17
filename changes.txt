@@ -1,4 +1,4 @@
-v1.4.52:
+v1.4.52: deployed
 * Replace Preview pending with the first live tablet thumbnail as soon as it arrives, without requiring a tracker page reload.
 
 v1.4.51: deployed
