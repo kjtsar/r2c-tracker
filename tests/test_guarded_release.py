@@ -20,6 +20,8 @@ class GuardedReleaseTest(unittest.TestCase):
         self.assertIn("recent_coordination_zones", source)
         self.assertIn("active_video_streams", source)
         self.assertIn("active_video_requests", source)
+        self.assertIn('"activity_details": activity_details', source)
+        self.assertIn("deployment_connection_details", source)
         self.assertIn("probe_flightlog_storage", source)
 
     def test_cloud_deploy_wires_probe_and_dedicated_gate_secret(self):
@@ -54,6 +56,7 @@ class GuardedReleaseTest(unittest.TestCase):
         self.assertIn('"ACTIVATE_LATEST_REVISION": "0"', guard)
         self.assertIn('"REVISION_TAG": "candidate"', guard)
         self.assertIn("deployment_readiness(PUBLIC_URL", guard)
+        self.assertIn('result.get("activity_details", {})', guard)
         self.assertIn("regression(candidate_url", guard)
         self.assertIn("--to-revisions=", guard)
         for name in (

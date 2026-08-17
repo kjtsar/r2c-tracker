@@ -101,6 +101,11 @@ class DeployScriptTest(unittest.TestCase):
             "PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN=${PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_SECRET_NAME}:latest",
             script,
         )
+        self.assertIn(
+            "APP_STORE_CONNECT_WEBHOOK_SECRET=${APP_STORE_CONNECT_WEBHOOK_SECRET_NAME}:latest",
+            script,
+        )
+        self.assertIn('"TESTFLIGHT_FEEDBACK_EMAIL": os.environ.get(', script)
         self.assertIn("roles/secretmanager.secretVersionAdder", script)
         self.assertIn('not os.environ.get("DATABASE_URL_SECRET_NAME")', script)
         self.assertIn('not os.environ.get("TRACKER_ADMIN_PASS_SECRET_NAME")', script)
@@ -131,6 +136,7 @@ class DeployScriptTest(unittest.TestCase):
             "platform_admin.py",
             "platform_admin_identity.py",
             "platform_admin_auth.py",
+            "app_store_connect_webhook.py",
             "turn_credentials.py",
         ):
             with self.subTest(module=module):
@@ -172,6 +178,14 @@ class DeployScriptTest(unittest.TestCase):
             'PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_SECRET_NAME="${PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_SECRET_NAME:-r2c-platform-email-gmail-refresh-token}"',
             script,
         )
+        self.assertIn(
+            'APP_STORE_CONNECT_WEBHOOK_SECRET_NAME="${APP_STORE_CONNECT_WEBHOOK_SECRET_NAME:-r2c-app-store-connect-webhook-secret}"',
+            script,
+        )
+        self.assertIn(
+            'TESTFLIGHT_FEEDBACK_EMAIL="${TESTFLIGHT_FEEDBACK_EMAIL:-kjtsar@kjt.us}"',
+            script,
+        )
         self.assertIn("stun:stun.cloudflare.com:3478", script)
         self.assertIn("r2c-cloudflare-turn-key-id", script)
         self.assertIn("r2c-cloudflare-turn-api-token", script)
@@ -198,6 +212,8 @@ class DeployScriptTest(unittest.TestCase):
         self.assertIn('RELEASE_STAGING_MODE="true"', script)
         self.assertIn('CONTROL_PLANE_MODE="simulation"', script)
         self.assertIn('PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_SECRET_NAME=""', script)
+        self.assertIn('APP_STORE_CONNECT_WEBHOOK_SECRET_NAME=""', script)
+        self.assertIn('TESTFLIGHT_FEEDBACK_EMAIL=""', script)
         self.assertNotIn("STRIPE_SECRET_KEY", script)
 
     def test_local_setup_uses_isolated_gcloud_configuration_and_private_env_file(self):

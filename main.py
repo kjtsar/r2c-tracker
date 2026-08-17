@@ -101,6 +101,11 @@ from turn_credentials import (
     CloudflareTurnCredentialProvider,
     sanitize_ice_servers,
 )
+from app_store_connect_webhook import (
+    AppStoreConnectSignatureError,
+    AppStoreConnectWebhookError,
+    authenticate_and_parse as authenticate_app_store_connect_webhook,
+)
 
 # --- CONFIGURATION & DATABASE SETUP ---
 DB_URL = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./test.db") # Defaults to local file if no Cloud SQL
@@ -352,6 +357,21 @@ gmail_email_sender = GmailApiPlatformAdminEmailSender.from_environment()
 smtp_email_sender = SmtpPlatformAdminEmailSender.from_environment()
 platform_admin_email_sender = (
     gmail_email_sender if gmail_email_sender.is_configured else smtp_email_sender
+)
+APP_STORE_CONNECT_WEBHOOK_SECRET = os.environ.get(
+    "APP_STORE_CONNECT_WEBHOOK_SECRET", ""
+).strip()
+TESTFLIGHT_FEEDBACK_EMAIL = os.environ.get(
+    "TESTFLIGHT_FEEDBACK_EMAIL", "kjtsar@kjt.us"
+).strip()
+TESTFLIGHT_APP_NAME = os.environ.get(
+    "TESTFLIGHT_APP_NAME", "RID2Caltopo"
+).strip()
+TESTFLIGHT_APP_APPLE_ID = os.environ.get(
+    "TESTFLIGHT_APP_APPLE_ID", "6792518823"
+).strip()
+TESTFLIGHT_APP_STORE_CONNECT_URL = (
+    f"https://appstoreconnect.apple.com/apps/{TESTFLIGHT_APP_APPLE_ID}/testflight"
 )
 PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_TARGET = os.environ.get(
     "PLATFORM_EMAIL_GMAIL_REFRESH_TOKEN_TARGET", ""
@@ -1207,25 +1227,36 @@ class OrganizationStreamEventHub:
 
     def __init__(self):
         self._lock = asyncio.Lock()
-        self._connections: dict[str, set[WebSocket]] = {}
+        self._connections: dict[
+            str, dict[WebSocket, tuple[str, str]]
+        ] = {}
 
-    async def connect(self, organization_id: str, websocket: WebSocket):
+    async def connect(
+        self,
+        organization_id: str,
+        organization_designator: str,
+        user_email: str,
+        websocket: WebSocket,
+    ):
         await websocket.accept()
         async with self._lock:
-            self._connections.setdefault(organization_id, set()).add(websocket)
+            self._connections.setdefault(organization_id, {})[websocket] = (
+                organization_designator,
+                user_email,
+            )
 
     async def disconnect(self, organization_id: str, websocket: WebSocket):
         async with self._lock:
             connections = self._connections.get(organization_id)
             if connections is None:
                 return
-            connections.discard(websocket)
+            connections.pop(websocket, None)
             if not connections:
                 self._connections.pop(organization_id, None)
 
     async def broadcast(self, organization_id: str):
         async with self._lock:
-            connections = tuple(self._connections.get(organization_id, ()))
+            connections = tuple(self._connections.get(organization_id, {}))
         failed = []
         for websocket in connections:
             try:
@@ -1238,6 +1269,20 @@ class OrganizationStreamEventHub:
     async def connection_count(self) -> int:
         async with self._lock:
             return sum(len(connections) for connections in self._connections.values())
+
+    async def deployment_connection_details(self) -> list[dict]:
+        async with self._lock:
+            return sorted(
+                (
+                    {
+                        "organization": designator,
+                        "user": user_email,
+                    }
+                    for connections in self._connections.values()
+                    for designator, user_email in connections.values()
+                ),
+                key=lambda item: (item["organization"], item["user"]),
+            )
 
 
 organization_stream_event_hub = OrganizationStreamEventHub()
@@ -1418,6 +1463,32 @@ class R2CCoordinationHub:
                 credential.id,
             ),
         ))
+
+    async def deployment_connection_details(self) -> list[dict]:
+        """Describe authenticated tablets currently connected to this revision."""
+        async with self._lock:
+            details = [
+                {
+                    "organization": connection.device_credential.designator,
+                    "device": connection.device_credential.device_name,
+                    "platform": connection.device_credential.platform,
+                    "device_credential_id": connection.device_credential.id,
+                    "map_id": connection.map_id,
+                    "zone_id": connection.zone_id,
+                    "app_version": connection.app_version,
+                    "app_version_code": connection.app_version_code,
+                }
+                for connection in self._connections.values()
+                if connection.device_credential is not None
+            ]
+        return sorted(
+            details,
+            key=lambda item: (
+                item["organization"],
+                item["device"],
+                item["zone_id"],
+            ),
+        )
 
     async def list_connected_config_sources(
         self,
@@ -5806,6 +5877,81 @@ async def readiness(response: Response):
     return {"status": "ready", "version": TRACKER_VERSION, "checks": checks}
 
 
+@app.post("/webhooks/app-store-connect", status_code=status.HTTP_204_NO_CONTENT)
+async def app_store_connect_webhook(request: Request):
+    if (
+        not APP_STORE_CONNECT_WEBHOOK_SECRET
+        or not TESTFLIGHT_FEEDBACK_EMAIL
+        or control_plane_store is None
+        or not platform_admin_email_sender.is_configured
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="TestFlight feedback notifications are not configured.",
+        )
+    body = await request.body()
+    if len(body) > 64 * 1024:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="App Store Connect webhook payload is too large.",
+        )
+    try:
+        event = authenticate_app_store_connect_webhook(
+            body,
+            request.headers.get("x-apple-signature", ""),
+            APP_STORE_CONNECT_WEBHOOK_SECRET,
+        )
+    except AppStoreConnectSignatureError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+        ) from exc
+    except AppStoreConnectWebhookError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    if event is None:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    claim = await control_plane_store.claim_external_webhook_delivery(
+        provider="app_store_connect",
+        event_id=event.event_id,
+        event_type=event.event_type,
+        resource_type=event.resource_type,
+        resource_id=event.feedback_id,
+    )
+    if claim != "claimed":
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    try:
+        await asyncio.to_thread(
+            platform_admin_email_sender.send_testflight_feedback,
+            recipient=TESTFLIGHT_FEEDBACK_EMAIL,
+            app_name=TESTFLIGHT_APP_NAME,
+            feedback_kind=event.feedback_kind,
+            feedback_id=event.feedback_id,
+            event_timestamp=(
+                event.timestamp.isoformat(timespec="seconds").replace("+00:00", "Z")
+            ),
+            app_store_connect_url=TESTFLIGHT_APP_STORE_CONNECT_URL,
+        )
+        await control_plane_store.mark_external_webhook_delivery_sent(
+            provider="app_store_connect",
+            event_id=event.event_id,
+        )
+    except Exception as exc:
+        logger.exception("TestFlight feedback notification delivery failed")
+        await control_plane_store.mark_external_webhook_delivery_failed(
+            provider="app_store_connect",
+            event_id=event.event_id,
+            error=str(exc),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="TestFlight feedback notification could not be delivered.",
+        ) from exc
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 def require_deployment_gate_key(request: Request) -> None:
     if not DEPLOYMENT_GATE_KEY:
         raise HTTPException(
@@ -5854,21 +6000,50 @@ async def deployment_readiness(
     now_ms = int(now.timestamp() * 1000)
     recent_zone_cutoff_ms = now_ms - (R2C_HEARTBEAT_SEC * 1000 * 2)
     async with AsyncSessionLocal() as session:
-        active_zones = await session.scalar(
-            select(func.count(R2CZoneState.id)).where(
+        active_zone_rows = (await session.scalars(
+            select(R2CZoneState).where(
                 R2CZoneState.last_seen_ms >= recent_zone_cutoff_ms,
                 func.lower(R2CZoneState.connection_state).not_in(("idle", "disconnected")),
             )
-        )
+        )).all()
     activity = {
         "local_coordination_connections": await r2c_hub.connection_count(),
-        "recent_coordination_zones": int(active_zones or 0),
+        "recent_coordination_zones": len(active_zone_rows),
         "video_dashboard_connections": await organization_stream_event_hub.connection_count(),
         "active_video_streams": 0,
         "active_video_requests": 0,
     }
+    activity_details = {
+        "local_coordination_connections": (
+            await r2c_hub.deployment_connection_details()
+        ),
+        "recent_coordination_zones": [
+            {
+                "organization_id": zone.organization_id,
+                "device": zone.name,
+                "map_id": zone.map_id,
+                "zone_id": zone.zone_id,
+                "app_version": zone.app_version,
+                "app_version_code": zone.app_version_code,
+                "connection_state": zone.connection_state,
+                "last_seen_at": datetime.fromtimestamp(
+                    zone.last_seen_ms / 1000,
+                    tz=UTC,
+                ).isoformat(),
+            }
+            for zone in active_zone_rows
+        ],
+        "video_dashboard_connections": (
+            await organization_stream_event_hub.deployment_connection_details()
+        ),
+        "active_video_streams": [],
+        "active_video_requests": [],
+    }
     if control_plane_store is not None:
         activity.update(await control_plane_store.deployment_activity(now=now))
+        activity_details.update(
+            await control_plane_store.deployment_activity_details(now=now)
+        )
     if storage_probe:
         await asyncio.to_thread(probe_flightlog_storage)
     reasons = [name for name, count in activity.items() if count > 0]
@@ -5878,6 +6053,7 @@ async def deployment_readiness(
         "version": TRACKER_VERSION,
         "checked_at": now.isoformat(),
         "activity": activity,
+        "activity_details": activity_details,
         "storage_probe": "passed" if storage_probe else "not_requested",
         "reasons": reasons,
     }
@@ -11385,7 +11561,12 @@ async def organization_stream_events(
             )
         return organization_stream_status(streams, requests)
 
-    await organization_stream_event_hub.connect(organization.id, websocket)
+    await organization_stream_event_hub.connect(
+        organization.id,
+        organization.designator,
+        user.email,
+        websocket,
+    )
     try:
         status_snapshot = await current_status()
         await websocket.send_json({

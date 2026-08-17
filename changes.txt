@@ -1,4 +1,10 @@
-v1.4.53:
+v1.4.54:
+* Warn organization administrators before R2C tablet authorizations expire, show a critical coordination-outage callout when none remain usable, and let authorized administrators extend one or every renewable tablet credential without rescanning.
+* Let administrators renew an unrevoked enrollment campaign for seven days and explicitly require downloading the newly signed QR before sharing it.
+* Accept signed App Store Connect webhooks for TestFlight crash and screenshot feedback, suppress duplicate deliveries, and email prompt feedback alerts to the platform administrator.
+* Identify the organizations, tablets, requesters, and browser sessions responsible when the guarded release activity check blocks a deployment.
+
+v1.4.53: superseded before deployment
 * Warn organization administrators before R2C tablet authorizations expire, show a critical coordination-outage callout when none remain usable, and let authorized administrators extend one or every renewable tablet credential without rescanning.
 * Let administrators renew an unrevoked enrollment campaign for seven days and explicitly require downloading the newly signed QR before sharing it.
 

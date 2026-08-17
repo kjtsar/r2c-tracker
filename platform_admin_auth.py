@@ -673,6 +673,34 @@ def _organization_extended_beta_allowance_message(
     return message
 
 
+def _testflight_feedback_message(
+    from_address: str,
+    recipient: str,
+    app_name: str,
+    feedback_kind: str,
+    feedback_id: str,
+    event_timestamp: str,
+    app_store_connect_url: str,
+) -> EmailMessage:
+    clean_kind = feedback_kind.strip().lower()
+    if clean_kind not in {"crash", "screenshot"}:
+        raise PlatformAdminAuthError("Unknown TestFlight feedback type.")
+    label = "crash feedback" if clean_kind == "crash" else "screenshot feedback"
+    message = EmailMessage()
+    message["Subject"] = f"[R2C] New TestFlight {label}"
+    message["From"] = from_address
+    message["To"] = recipient
+    message.set_content(
+        f"New TestFlight {label} was submitted for {app_name}.\n\n"
+        f"Submitted: {event_timestamp}\n"
+        f"Feedback ID: {feedback_id}\n\n"
+        "Open TestFlight Feedback in App Store Connect to view the tester's "
+        f"comment and diagnostic details:\n{app_store_connect_url}\n\n"
+        "This notification was generated automatically by R2C Tracker."
+    )
+    return message
+
+
 class GmailApiPlatformAdminEmailSender:
     def __init__(
         self,
@@ -835,6 +863,18 @@ class GmailApiPlatformAdminEmailSender:
         )
         self._send(message, "Extended-beta allowance email could not be sent.")
 
+    def send_testflight_feedback(self, **kwargs) -> None:
+        message = _testflight_feedback_message(
+            self.from_address,
+            kwargs["recipient"],
+            kwargs["app_name"],
+            kwargs["feedback_kind"],
+            kwargs["feedback_id"],
+            kwargs["event_timestamp"],
+            kwargs["app_store_connect_url"],
+        )
+        self._send(message, "TestFlight feedback email could not be sent.")
+
 
 class SmtpPlatformAdminEmailSender:
     def __init__(
@@ -888,6 +928,29 @@ class SmtpPlatformAdminEmailSender:
         except Exception as exc:
             raise PlatformAdminAuthError(
                 "Administrator email could not be sent."
+            ) from exc
+
+    def send_testflight_feedback(self, **kwargs) -> None:
+        if not self.is_configured:
+            raise PlatformAdminAuthError("Administrator email is not configured.")
+        message = _testflight_feedback_message(
+            self.from_address,
+            kwargs["recipient"],
+            kwargs["app_name"],
+            kwargs["feedback_kind"],
+            kwargs["feedback_id"],
+            kwargs["event_timestamp"],
+            kwargs["app_store_connect_url"],
+        )
+        try:
+            with smtplib.SMTP(self.host, self.port, timeout=15) as smtp:
+                smtp.starttls(context=ssl.create_default_context())
+                if self.username:
+                    smtp.login(self.username, self.password)
+                smtp.send_message(message)
+        except Exception as exc:
+            raise PlatformAdminAuthError(
+                "TestFlight feedback email could not be sent."
             ) from exc
 
     def send_organization_activation(

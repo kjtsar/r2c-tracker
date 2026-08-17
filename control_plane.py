@@ -683,6 +683,35 @@ class ControlPlaneAuditEvent(Base):
     retention_hold: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class ExternalWebhookDelivery(Base):
+    __tablename__ = "external_webhook_deliveries"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "event_id",
+            name="uq_external_webhook_delivery_provider_event",
+        ),
+        Index("idx_external_webhook_deliveries_created_at", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    provider: Mapped[str] = mapped_column(String(48), nullable=False)
+    event_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(120), nullable=False)
+    resource_type: Mapped[str] = mapped_column(String(120), nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    state: Mapped[str] = mapped_column(String(24), default="processing")
+    attempts: Mapped[int] = mapped_column(Integer, default=1)
+    last_error: Mapped[str] = mapped_column(String(500), default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
 class EnrollmentCampaign(Base):
     __tablename__ = "enrollment_campaigns"
 
@@ -1924,6 +1953,106 @@ class ControlPlaneStore:
         return {
             "active_video_streams": int(active_streams or 0),
             "active_video_requests": int(active_requests or 0),
+        }
+
+    async def deployment_activity_details(
+        self,
+        *,
+        now: Optional[datetime] = None,
+    ) -> dict[str, list[dict]]:
+        """Describe active video use for the authenticated release owner."""
+        checked_at = as_utc(now or utc_now())
+        active_request_states = (
+            "pending",
+            "probing",
+            "awaiting_approval",
+            "approved",
+            "streaming",
+        )
+        async with self.sessions() as session:
+            stream_rows = (await session.execute(
+                select(ActiveVideoStream, DeviceCredential, Organization)
+                .join(
+                    DeviceCredential,
+                    DeviceCredential.id == ActiveVideoStream.device_credential_id,
+                )
+                .join(Organization, Organization.id == ActiveVideoStream.organization_id)
+                .where(
+                    ActiveVideoStream.state == "active",
+                    ActiveVideoStream.expires_at >= checked_at,
+                )
+                .order_by(
+                    Organization.designator,
+                    DeviceCredential.device_name,
+                    ActiveVideoStream.drone_designator,
+                )
+            )).all()
+            request_rows = (await session.execute(
+                select(VideoStreamRequest, ActiveVideoStream, Organization)
+                .join(
+                    ActiveVideoStream,
+                    ActiveVideoStream.id == VideoStreamRequest.active_stream_id,
+                )
+                .join(Organization, Organization.id == VideoStreamRequest.organization_id)
+                .where(
+                    VideoStreamRequest.state.in_(active_request_states),
+                    VideoStreamRequest.expires_at >= checked_at,
+                )
+                .order_by(
+                    Organization.designator,
+                    VideoStreamRequest.requester_email,
+                    VideoStreamRequest.requested_at,
+                )
+            )).all()
+
+        grouped_streams: dict[tuple[str, str, str, str], dict] = {}
+        for stream, credential, organization in stream_rows:
+            key = (
+                organization.designator,
+                credential.id,
+                stream.device_name,
+                stream.incident_name,
+            )
+            detail = grouped_streams.setdefault(key, {
+                "organization": organization.designator,
+                "device": stream.device_name,
+                "platform": credential.platform,
+                "device_credential_id": credential.id,
+                "incident": stream.incident_name,
+                "stream_count": 0,
+                "streams": [],
+                "last_seen_at": as_utc(stream.last_seen_at).isoformat(),
+                "expires_at": as_utc(stream.expires_at).isoformat(),
+            })
+            detail["stream_count"] += 1
+            detail["streams"].append({
+                "drone": stream.drone_designator,
+                "media_kind": stream.media_kind,
+                "session_id": stream.session_id,
+            })
+            detail["last_seen_at"] = max(
+                detail["last_seen_at"],
+                as_utc(stream.last_seen_at).isoformat(),
+            )
+            detail["expires_at"] = max(
+                detail["expires_at"],
+                as_utc(stream.expires_at).isoformat(),
+            )
+
+        return {
+            "active_video_streams": list(grouped_streams.values()),
+            "active_video_requests": [
+                {
+                    "organization": organization.designator,
+                    "requester": request.requester_email,
+                    "device": stream.device_name,
+                    "drone": stream.drone_designator,
+                    "state": request.state,
+                    "request_id": request.id,
+                    "expires_at": as_utc(request.expires_at).isoformat(),
+                }
+                for request, stream, organization in request_rows
+            ],
         }
 
     async def ensure_platform_admin(
@@ -4958,6 +5087,121 @@ class ControlPlaneStore:
             page_size=max(1, min(limit, 500))
         )
         return page.events
+
+    async def claim_external_webhook_delivery(
+        self,
+        *,
+        provider: str,
+        event_id: str,
+        event_type: str,
+        resource_type: str,
+        resource_id: str,
+        now: Optional[datetime] = None,
+    ) -> str:
+        clean_provider = provider.strip()
+        clean_event_id = event_id.strip()
+        if not clean_provider or not clean_event_id:
+            raise ValueError("Webhook provider and event ID are required.")
+        claimed_at = as_utc(now or utc_now())
+        stale_before = claimed_at - timedelta(minutes=5)
+        async with self.sessions() as session:
+            delivery = await session.scalar(select(ExternalWebhookDelivery).where(
+                ExternalWebhookDelivery.provider == clean_provider,
+                ExternalWebhookDelivery.event_id == clean_event_id,
+            ))
+            if delivery is None:
+                session.add(ExternalWebhookDelivery(
+                    provider=clean_provider,
+                    event_id=clean_event_id,
+                    event_type=event_type.strip(),
+                    resource_type=resource_type.strip(),
+                    resource_id=resource_id.strip(),
+                    state="processing",
+                    attempts=1,
+                    created_at=claimed_at,
+                    updated_at=claimed_at,
+                ))
+                try:
+                    await session.commit()
+                    return "claimed"
+                except IntegrityError:
+                    await session.rollback()
+            delivery = await session.scalar(select(ExternalWebhookDelivery).where(
+                ExternalWebhookDelivery.provider == clean_provider,
+                ExternalWebhookDelivery.event_id == clean_event_id,
+            ))
+            if delivery is None:
+                raise ControlPlaneError("Webhook delivery claim could not be stored.")
+            if delivery.state == "sent":
+                return "sent"
+            result = await session.execute(
+                update(ExternalWebhookDelivery)
+                .where(
+                    ExternalWebhookDelivery.id == delivery.id,
+                    ExternalWebhookDelivery.state != "sent",
+                    or_(
+                        ExternalWebhookDelivery.state != "processing",
+                        ExternalWebhookDelivery.updated_at < stale_before,
+                    ),
+                )
+                .values(
+                    state="processing",
+                    attempts=ExternalWebhookDelivery.attempts + 1,
+                    last_error="",
+                    updated_at=claimed_at,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+            return "claimed" if int(result.rowcount or 0) else "processing"
+
+    async def mark_external_webhook_delivery_sent(
+        self,
+        *,
+        provider: str,
+        event_id: str,
+        now: Optional[datetime] = None,
+    ) -> None:
+        sent_at = as_utc(now or utc_now())
+        async with self.sessions() as session:
+            await session.execute(
+                update(ExternalWebhookDelivery)
+                .where(
+                    ExternalWebhookDelivery.provider == provider.strip(),
+                    ExternalWebhookDelivery.event_id == event_id.strip(),
+                )
+                .values(
+                    state="sent",
+                    last_error="",
+                    updated_at=sent_at,
+                    sent_at=sent_at,
+                )
+            )
+            await session.commit()
+
+    async def mark_external_webhook_delivery_failed(
+        self,
+        *,
+        provider: str,
+        event_id: str,
+        error: str,
+        now: Optional[datetime] = None,
+    ) -> None:
+        failed_at = as_utc(now or utc_now())
+        async with self.sessions() as session:
+            await session.execute(
+                update(ExternalWebhookDelivery)
+                .where(
+                    ExternalWebhookDelivery.provider == provider.strip(),
+                    ExternalWebhookDelivery.event_id == event_id.strip(),
+                )
+                .values(
+                    state="failed",
+                    last_error=error.strip()[:500],
+                    updated_at=failed_at,
+                )
+            )
+            await session.commit()
 
     async def search_audit_events(
         self,

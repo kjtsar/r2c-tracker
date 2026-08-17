@@ -12,10 +12,27 @@ from platform_admin_auth import (
     PlatformAdminAuthError,
     SmtpPlatformAdminEmailSender,
     _organization_extended_beta_allowance_message,
+    _testflight_feedback_message,
 )
 
 
 class PlatformAdminAuthHelpersTest(unittest.TestCase):
+    def test_testflight_feedback_notice_links_to_app_store_connect(self):
+        message = _testflight_feedback_message(
+            "kjtsar@kjt.us",
+            "kjtsar@kjt.us",
+            "RID2Caltopo",
+            "crash",
+            "feedback-123",
+            "2026-08-17T20:53:20Z",
+            "https://appstoreconnect.apple.com/apps/6792518823/testflight",
+        )
+
+        self.assertEqual("[R2C] New TestFlight crash feedback", message["Subject"])
+        self.assertEqual("kjtsar@kjt.us", message["To"])
+        self.assertIn("feedback-123", message.get_content())
+        self.assertIn("appstoreconnect.apple.com", message.get_content())
+
     def test_extended_beta_video_notice_preserves_non_video_services(self):
         message = _organization_extended_beta_allowance_message(
             "tracker@example.org",

@@ -77,6 +77,45 @@ class ControlPlaneStoreTest(unittest.TestCase):
         audit_events = asyncio.run(self.store.list_audit_events())
         self.assertEqual("organization.created", audit_events[0].event_type)
 
+    def test_external_webhook_delivery_claims_retry_and_deduplicates(self):
+        values = {
+            "provider": "app_store_connect",
+            "event_id": "event-1",
+            "event_type": "betaFeedbackCrashSubmissionCreated",
+            "resource_type": "betaFeedbackCrashSubmissions",
+            "resource_id": "feedback-1",
+            "now": self.now,
+        }
+
+        first = asyncio.run(
+            self.store.claim_external_webhook_delivery(**values)
+        )
+        processing_duplicate = asyncio.run(
+            self.store.claim_external_webhook_delivery(**values)
+        )
+        asyncio.run(self.store.mark_external_webhook_delivery_failed(
+            provider="app_store_connect",
+            event_id="event-1",
+            error="mail unavailable",
+            now=self.now + timedelta(seconds=1),
+        ))
+        retry = asyncio.run(self.store.claim_external_webhook_delivery(
+            **{**values, "now": self.now + timedelta(seconds=2)}
+        ))
+        asyncio.run(self.store.mark_external_webhook_delivery_sent(
+            provider="app_store_connect",
+            event_id="event-1",
+            now=self.now + timedelta(seconds=3),
+        ))
+        sent_duplicate = asyncio.run(self.store.claim_external_webhook_delivery(
+            **{**values, "now": self.now + timedelta(minutes=10)}
+        ))
+
+        self.assertEqual("claimed", first)
+        self.assertEqual("processing", processing_duplicate)
+        self.assertEqual("claimed", retry)
+        self.assertEqual("sent", sent_duplicate)
+
     def test_audit_search_paginates_filters_and_reports_total(self):
         organization = self.create_organization()
 
@@ -1179,6 +1218,42 @@ class ControlPlaneStoreTest(unittest.TestCase):
         )
         self.assertEqual("Ken's iPad", request.device_name)
         self.assertEqual("pending", request.state)
+        activity_details = asyncio.run(
+            self.store.deployment_activity_details(
+                now=self.now + timedelta(seconds=30),
+            )
+        )
+        self.assertEqual(
+            {
+                "organization": "NCSSAR",
+                "device": "Ken's iPad",
+                "platform": "android",
+                "stream_count": 1,
+                "streams": [{
+                    "drone": "10A",
+                    "media_kind": "live",
+                    "session_id": streams[0].session_id,
+                }],
+            },
+            {
+                key: activity_details["active_video_streams"][0][key]
+                for key in (
+                    "organization",
+                    "device",
+                    "platform",
+                    "stream_count",
+                    "streams",
+                )
+            },
+        )
+        self.assertEqual(
+            organization.primary_admin_email,
+            activity_details["active_video_requests"][0]["requester"],
+        )
+        self.assertEqual(
+            "Ken's iPad",
+            activity_details["active_video_requests"][0]["device"],
+        )
         self.assertEqual("unknown", request.route_kind)
         self.assertEqual(owner.email, request.requester_email)
         self.assertEqual("America/Los_Angeles", request.timezone_name)

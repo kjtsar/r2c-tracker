@@ -291,7 +291,10 @@ def deployment_readiness(
     result = json.loads(body)
     if not result.get("safe_to_deploy"):
         raise RuntimeError(
-            "Deployment blocked by active use: " + json.dumps(result.get("activity", {}), sort_keys=True)
+            "Deployment blocked by active use: "
+            + json.dumps(result.get("activity", {}), sort_keys=True)
+            + "; details: "
+            + json.dumps(result.get("activity_details", {}), sort_keys=True)
         )
     print("Activity gate: idle (safe to continue).")
     return result

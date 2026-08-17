@@ -155,6 +155,7 @@ class SecurityAuthorizationInventoryTest(unittest.TestCase):
             | self.PLATFORM_BOOTSTRAP_ENDPOINTS
         )
         signed_or_vendor_callbacks = {
+            "app_store_connect_webhook",
             "managed_access_request_ingest",
             "redeem_device_enrollment",
         }
@@ -181,6 +182,12 @@ class SecurityAuthorizationInventoryTest(unittest.TestCase):
                 or endpoint_name in signed_or_vendor_callbacks,
                 f"{route.path} ({endpoint_name}) changes state without a declared access mechanism",
             )
+
+    def test_app_store_connect_callback_verifies_vendor_signature(self):
+        source = inspect.getsource(main.app_store_connect_webhook)
+        self.assertIn("authenticate_app_store_connect_webhook", source)
+        self.assertIn('request.headers.get("x-apple-signature"', source)
+        self.assertIn("APP_STORE_CONNECT_WEBHOOK_SECRET", source)
 
     def test_container_uses_the_reviewed_dependency_lock(self):
         root = pathlib.Path(__file__).resolve().parents[1]

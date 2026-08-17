@@ -24,6 +24,7 @@ COPY enrollment.py .
 COPY platform_admin.py .
 COPY platform_admin_identity.py .
 COPY platform_admin_auth.py .
+COPY app_store_connect_webhook.py .
 COPY turn_credentials.py .
 COPY templates/ ./templates/
 COPY static/ ./static/
