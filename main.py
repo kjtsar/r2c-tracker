@@ -5912,6 +5912,18 @@ async def app_store_connect_webhook(request: Request):
             detail=str(exc),
         ) from exc
     if event is None:
+        try:
+            await asyncio.to_thread(
+                platform_admin_email_sender.send_testflight_webhook_test,
+                recipient=TESTFLIGHT_FEEDBACK_EMAIL,
+                app_name=TESTFLIGHT_APP_NAME,
+            )
+        except Exception as exc:
+            logger.exception("TestFlight webhook test notification failed")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="TestFlight webhook test email could not be delivered.",
+            ) from exc
         return Response(status_code=status.HTTP_204_NO_CONTENT)
     claim = await control_plane_store.claim_external_webhook_delivery(
         provider="app_store_connect",

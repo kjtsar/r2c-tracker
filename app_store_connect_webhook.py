@@ -10,7 +10,12 @@ FEEDBACK_EVENT_TYPES = {
     "betaFeedbackCrashSubmissionCreated": "crash",
     "betaFeedbackScreenshotSubmissionCreated": "screenshot",
 }
-PING_EVENT_TYPE = "webhookPings"
+PING_EVENT_TYPES = {
+    # App Store Connect uses webhookPings for the request that asks Apple to
+    # perform a test, but delivers the signed test event as webhookPingCreated.
+    "webhookPings",
+    "webhookPingCreated",
+}
 
 
 class AppStoreConnectWebhookError(ValueError):
@@ -59,7 +64,7 @@ def parse_event(body: bytes) -> AppStoreConnectWebhookEvent | None:
         )
     data = payload["data"]
     event_type = str(data.get("type", "")).strip()
-    if event_type == PING_EVENT_TYPE:
+    if event_type in PING_EVENT_TYPES:
         return None
     feedback_kind = FEEDBACK_EVENT_TYPES.get(event_type)
     if not feedback_kind:

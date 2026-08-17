@@ -1,3 +1,6 @@
+v1.4.56:
+* Accept App Store Connect's delivered test-ping event and email a clearly labeled end-to-end confirmation, while continuing to send separate alerts for user crash and screenshot feedback.
+
 v1.4.55: deployed
 * Correct the public release history so superseded v1.4.53 notes remain separate from the deployed v1.4.54 summary.
 

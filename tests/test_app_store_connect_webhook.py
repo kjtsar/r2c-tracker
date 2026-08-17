@@ -77,6 +77,19 @@ class AppStoreConnectWebhookParsingTest(unittest.TestCase):
     def test_accepts_authenticated_ping_without_creating_feedback(self):
         body = encoded_payload({
             "data": {
+                "type": "webhookPingCreated",
+                "version": 1,
+                "attributes": {
+                    "timestamp": "2026-08-17T15:10:22.160051015Z"
+                },
+            }
+        })
+
+        self.assertIsNone(authenticate_and_parse(body, signature(body), SECRET))
+
+    def test_accepts_webhook_ping_api_request_shape(self):
+        body = encoded_payload({
+            "data": {
                 "type": "webhookPings",
                 "relationships": {
                     "webhook": {"data": {"type": "webhooks", "id": "webhook-id"}}
@@ -117,11 +130,17 @@ class FakeFeedbackEmailSender:
     def __init__(self, error=None):
         self.error = error
         self.messages = []
+        self.test_messages = []
 
     def send_testflight_feedback(self, **message):
         if self.error:
             raise self.error
         self.messages.append(message)
+
+    def send_testflight_webhook_test(self, **message):
+        if self.error:
+            raise self.error
+        self.test_messages.append(message)
 
 
 class AppStoreConnectWebhookRouteTest(unittest.TestCase):
@@ -185,14 +204,15 @@ class AppStoreConnectWebhookRouteTest(unittest.TestCase):
         self.assertEqual(1, len(store.failed))
         self.assertIn("mail unavailable", store.failed[0]["error"])
 
-    def test_ping_checks_authentication_but_does_not_send_email(self):
+    def test_ping_checks_authentication_and_sends_test_email(self):
         store = FakeWebhookStore()
         sender = FakeFeedbackEmailSender()
         payload = {
             "data": {
-                "type": "webhookPings",
-                "relationships": {
-                    "webhook": {"data": {"type": "webhooks", "id": "webhook-id"}}
+                "type": "webhookPingCreated",
+                "version": 1,
+                "attributes": {
+                    "timestamp": "2026-08-17T15:10:22.160051015Z"
                 },
             }
         }
@@ -204,6 +224,30 @@ class AppStoreConnectWebhookRouteTest(unittest.TestCase):
         self.assertEqual(204, response.status_code)
         self.assertEqual([], store.claimed)
         self.assertEqual([], sender.messages)
+        self.assertEqual(1, len(sender.test_messages))
+        self.assertEqual("kjtsar@kjt.us", sender.test_messages[0]["recipient"])
+
+    def test_ping_email_failure_asks_apple_to_report_failure(self):
+        store = FakeWebhookStore()
+        sender = FakeFeedbackEmailSender(RuntimeError("mail unavailable"))
+        payload = {
+            "data": {
+                "type": "webhookPingCreated",
+                "version": 1,
+                "attributes": {
+                    "timestamp": "2026-08-17T15:10:22.160051015Z"
+                },
+            }
+        }
+        patches = self.configured(store, sender)
+
+        with patches[0], patches[1], patches[2], patches[3]:
+            response = self.post(payload)
+
+        self.assertEqual(503, response.status_code)
+        self.assertEqual([], store.claimed)
+        self.assertEqual([], sender.messages)
+        self.assertEqual([], sender.test_messages)
 
     def test_invalid_signature_is_rejected_before_claim(self):
         store = FakeWebhookStore()

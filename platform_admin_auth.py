@@ -701,6 +701,24 @@ def _testflight_feedback_message(
     return message
 
 
+def _testflight_webhook_test_message(
+    from_address: str,
+    recipient: str,
+    app_name: str,
+) -> EmailMessage:
+    message = EmailMessage()
+    message["Subject"] = "[R2C] App Store Connect webhook test succeeded"
+    message["From"] = from_address
+    message["To"] = recipient
+    message.set_content(
+        f"An App Store Connect test ping for {app_name} successfully reached "
+        "R2C Tracker, passed signature verification, and triggered this email.\n\n"
+        "This was a configuration test; no user feedback was submitted. Future "
+        "TestFlight crash and screenshot feedback will generate separate alerts."
+    )
+    return message
+
+
 class GmailApiPlatformAdminEmailSender:
     def __init__(
         self,
@@ -875,6 +893,14 @@ class GmailApiPlatformAdminEmailSender:
         )
         self._send(message, "TestFlight feedback email could not be sent.")
 
+    def send_testflight_webhook_test(self, **kwargs) -> None:
+        message = _testflight_webhook_test_message(
+            self.from_address,
+            kwargs["recipient"],
+            kwargs["app_name"],
+        )
+        self._send(message, "TestFlight webhook test email could not be sent.")
+
 
 class SmtpPlatformAdminEmailSender:
     def __init__(
@@ -951,6 +977,25 @@ class SmtpPlatformAdminEmailSender:
         except Exception as exc:
             raise PlatformAdminAuthError(
                 "TestFlight feedback email could not be sent."
+            ) from exc
+
+    def send_testflight_webhook_test(self, **kwargs) -> None:
+        if not self.is_configured:
+            raise PlatformAdminAuthError("Administrator email is not configured.")
+        message = _testflight_webhook_test_message(
+            self.from_address,
+            kwargs["recipient"],
+            kwargs["app_name"],
+        )
+        try:
+            with smtplib.SMTP(self.host, self.port, timeout=15) as smtp:
+                smtp.starttls(context=ssl.create_default_context())
+                if self.username:
+                    smtp.login(self.username, self.password)
+                smtp.send_message(message)
+        except Exception as exc:
+            raise PlatformAdminAuthError(
+                "TestFlight webhook test email could not be sent."
             ) from exc
 
     def send_organization_activation(

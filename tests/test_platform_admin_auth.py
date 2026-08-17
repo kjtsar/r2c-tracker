@@ -13,6 +13,7 @@ from platform_admin_auth import (
     SmtpPlatformAdminEmailSender,
     _organization_extended_beta_allowance_message,
     _testflight_feedback_message,
+    _testflight_webhook_test_message,
 )
 
 
@@ -32,6 +33,20 @@ class PlatformAdminAuthHelpersTest(unittest.TestCase):
         self.assertEqual("kjtsar@kjt.us", message["To"])
         self.assertIn("feedback-123", message.get_content())
         self.assertIn("appstoreconnect.apple.com", message.get_content())
+
+    def test_testflight_webhook_test_confirms_email_delivery(self):
+        message = _testflight_webhook_test_message(
+            "kjtsar@kjt.us",
+            "kjtsar@kjt.us",
+            "RID2Caltopo",
+        )
+
+        self.assertEqual(
+            "[R2C] App Store Connect webhook test succeeded",
+            message["Subject"],
+        )
+        self.assertIn("passed signature verification", message.get_content())
+        self.assertIn("no user feedback was submitted", message.get_content())
 
     def test_extended_beta_video_notice_preserves_non_video_services(self):
         message = _organization_extended_beta_allowance_message(
