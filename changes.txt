@@ -1,4 +1,4 @@
-v1.4.56:
+v1.4.56: deployed
 * Accept App Store Connect's delivered test-ping event and email a clearly labeled end-to-end confirmation, while continuing to send separate alerts for user crash and screenshot feedback.
 
 v1.4.55: deployed
