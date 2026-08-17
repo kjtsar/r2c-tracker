@@ -1,3 +1,7 @@
+v1.4.53:
+* Warn organization administrators before R2C tablet authorizations expire, show a critical coordination-outage callout when none remain usable, and let authorized administrators extend one or every renewable tablet credential without rescanning.
+* Let administrators renew an unrevoked enrollment campaign for seven days and explicitly require downloading the newly signed QR before sharing it.
+
 v1.4.52: deployed
 * Replace Preview pending with the first live tablet thumbnail as soon as it arrives, without requiring a tracker page reload.
 

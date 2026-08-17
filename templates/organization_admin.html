@@ -49,6 +49,14 @@
       overflow-wrap: anywhere;
   }
   .org-banner a { color: inherit; font-weight: 700; }
+  .org-banner.critical {
+      border: 2px solid #b42318;
+      background: #fff0ee;
+      color: #7a170f;
+      box-shadow: 0 5px 18px rgba(180, 35, 24, 0.14);
+  }
+  .org-banner.critical h2 { margin: 0 0 6px; color: #7a170f; }
+  .org-banner form { margin-top: 10px; }
   .org-grid {
       min-width: 0;
       display: grid;
@@ -261,6 +269,30 @@
   <div class="org-banner" role="status">
     <strong>Simulation invitation link:</strong>
     <a href="{{ invitation_url }}">{{ invitation_url }}</a>
+  </div>
+  {% endif %}
+  {% if can_manage_device_credentials and renewable_device_credentials and not usable_device_credentials %}
+  <div class="org-banner critical" role="alert">
+    <h2>R2C coordination unavailable</h2>
+    Every renewable R2C tablet authorization for this organization has expired.
+    The drone team cannot connect to Tracker or coordinate aircraft ownership until
+    authorization is restored.
+    <form method="post"
+          action="/{{ organization.designator|lower }}/device-credentials/extend">
+      <input type="hidden" name="form_token" value="{{ csrf_token }}">
+      <button class="primary-button" type="submit">Restore all tablet authorizations</button>
+    </form>
+  </div>
+  {% elif can_manage_device_credentials and expiring_device_credentials %}
+  <div class="org-banner" role="alert">
+    <strong>Tablet authorization expires soon:</strong>
+    {{ expiring_device_credentials|length }} R2C tablet authorization{% if expiring_device_credentials|length != 1 %}s{% endif %}
+    will expire within 30 days. Extend them below before an operation.
+  </div>
+  {% elif can_manage_device_credentials and not renewable_device_credentials %}
+  <div class="org-banner" role="alert">
+    <strong>No renewable R2C tablet authorizations remain.</strong>
+    Create an enrollment QR below and scan it on each team tablet before an operation.
   </div>
   {% endif %}
 
@@ -662,7 +694,57 @@
       {% endif %}
     </section>
 
-    <section class="org-panel wide">
+    {% if can_manage_device_credentials %}
+    <section class="org-panel wide" id="device-authorizations">
+      <h2>R2C tablet authorizations</h2>
+      <p>
+        A tablet authorization lasts one year after enrollment. Extending it keeps
+        the same credential on the tablet, so no rescan is required. Renew before
+        the listed date to avoid interrupting Tracker coordination.
+      </p>
+      {% if device_credentials %}
+      <div style="overflow-x:auto">
+        <table class="org-table">
+          <thead>
+            <tr><th>Tablet</th><th>Platform</th><th>Status</th><th>Last connected</th><th>Authorization expires</th><th>Action</th></tr>
+          </thead>
+          <tbody>
+          {% for credential in device_credentials %}
+            <tr>
+              <td><strong>{{ credential.device_name }}</strong></td>
+              <td>{{ credential.platform|capitalize }}</td>
+              <td>{{ credential.state }}</td>
+              <td>{% if credential.last_used_at %}{{ credential.last_used_at.strftime("%d %b %Y %H:%M UTC") }}{% else %}Never{% endif %}</td>
+              <td>{{ credential.expires_at.strftime("%d %b %Y %H:%M UTC") }}</td>
+              <td>
+                {% if credential.state != "revoked" %}
+                <form method="post"
+                      action="/{{ organization.designator|lower }}/device-credentials/{{ credential.id }}/extend">
+                  <input type="hidden" name="form_token" value="{{ csrf_token }}">
+                  <button class="primary-button" type="submit">Extend one year</button>
+                </form>
+                {% else %}
+                Re-enrollment required
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <form method="post"
+            action="/{{ organization.designator|lower }}/device-credentials/extend"
+            style="margin-top:14px">
+        <input type="hidden" name="form_token" value="{{ csrf_token }}">
+        <button class="primary-button" type="submit">Extend all renewable authorizations</button>
+      </form>
+      {% else %}
+      <p>No tablets have enrolled yet.</p>
+      {% endif %}
+    </section>
+    {% endif %}
+
+    <section class="org-panel wide" id="enrollment-qr">
       <h2>Drone-team enrollment QR codes</h2>
       <p>
         Each QR contains a signed organization locator and a revocable,
@@ -716,6 +798,13 @@
             <button class="danger-button" type="submit">Revoke QR</button>
           </form>
           {% endif %}
+          {% endif %}
+          {% if can_manage_users and campaign.state != "revoked" and campaign.redemption_count < campaign.max_redemptions %}
+          <form method="post"
+                action="/{{ organization.designator|lower }}/enrollments/{{ campaign.id }}/renew">
+            <input type="hidden" name="form_token" value="{{ csrf_token }}">
+            <button class="primary-button" type="submit">Renew QR for 7 days</button>
+          </form>
           {% endif %}
         </article>
       {% else %}

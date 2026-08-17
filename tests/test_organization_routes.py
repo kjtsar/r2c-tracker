@@ -10,7 +10,7 @@ import tarfile
 import tempfile
 import unittest
 from contextlib import ExitStack
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +25,7 @@ from starlette.websockets import WebSocketDisconnect
 import main
 from control_plane import (
     ControlPlaneStore,
+    DeviceCredential,
     DeviceCredentialRecord,
     MANAGED_ACCESS_TERMS_VERSION,
     OrganizationUser,
@@ -1948,6 +1949,77 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertTrue(
             asyncio.run(main.authenticate_tracker_token(installed_token))
         )
+        authorization_page = self.client.get("/ncssar/admin")
+        self.assertIn("R2C tablet authorizations", authorization_page.text)
+        self.assertIn("Android field tablet", authorization_page.text)
+        self.assertIn("Extend all renewable authorizations", authorization_page.text)
+
+        async def set_device_credential_expiry(expires_at):
+            async with self.store.sessions() as session:
+                stored = await session.get(
+                    DeviceCredential,
+                    redeemed.json()["credential"]["id"],
+                )
+                stored.expires_at = expires_at
+                await session.commit()
+
+        asyncio.run(set_device_credential_expiry(
+            datetime.now(UTC) + timedelta(days=20)
+        ))
+        expiring_page = self.client.get("/ncssar/admin")
+        self.assertIn("Tablet authorization expires soon", expiring_page.text)
+
+        asyncio.run(set_device_credential_expiry(
+            datetime(2020, 1, 1, tzinfo=UTC)
+        ))
+        expired_page = self.client.get("/ncssar/admin")
+        self.assertIn("R2C coordination unavailable", expired_page.text)
+        self.assertIn("Restore all tablet authorizations", expired_page.text)
+        restored_page = self.client.post(
+            "/ncssar/device-credentials/extend",
+            data={"form_token": self.form_token(expired_page)},
+            follow_redirects=True,
+        )
+        self.assertEqual(200, restored_page.status_code)
+        self.assertIn("Extended 1 R2C tablet authorization", restored_page.text)
+        self.assertNotIn("R2C coordination unavailable", restored_page.text)
+        self.assertTrue(
+            asyncio.run(main.authenticate_tracker_token(installed_token))
+        )
+
+        renewed_qr_page = self.client.post(
+            f"/ncssar/enrollments/{campaign.id}/renew",
+            data={"form_token": self.form_token(restored_page)},
+            follow_redirects=True,
+        )
+        self.assertEqual(200, renewed_qr_page.status_code)
+        self.assertIn("renewed for seven days", renewed_qr_page.text)
+        self.assertIn("Download the fresh QR", renewed_qr_page.text)
+        with patch.object(main, "DEVICE_CREDENTIAL_ISSUANCE_ENABLED", True):
+            stale_redemption = self.client.post(
+                "/api/v1/device-enrollment/redeem",
+                json={
+                    "token": enrollment_token,
+                    "device_name": "Stale QR tablet",
+                    "platform": "android",
+                },
+            )
+            renewed_campaign = asyncio.run(
+                self.store.get_enrollment_campaign(campaign.id)
+            )
+            fresh_redemption = self.client.post(
+                "/api/v1/device-enrollment/redeem",
+                json={
+                    "token": self.tokens.enrollment_token(
+                        organization,
+                        renewed_campaign,
+                    ),
+                    "device_name": "Fresh QR tablet",
+                    "platform": "android",
+                },
+            )
+        self.assertEqual(400, stale_redemption.status_code)
+        self.assertEqual(200, fresh_redemption.status_code)
         with self.assertRaises(WebSocketDisconnect):
             with self.client.websocket_connect(
                 "/othersar/ws/r2c",

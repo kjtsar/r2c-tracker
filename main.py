@@ -7970,6 +7970,27 @@ async def organization_admin(request: Request, designator: str):
         control_plane_store.list_enrollment_campaigns(organization.id),
         control_plane_store.list_ledger(organization.id),
     )
+    can_manage_device_credentials = bool(
+        {"organization_owner", "user_admin"}.intersection(user.roles)
+    )
+    device_credentials = (
+        await control_plane_store.list_device_credentials(organization.id)
+        if can_manage_device_credentials
+        else ()
+    )
+    credential_now = datetime.now(UTC)
+    usable_device_credentials = tuple(
+        credential for credential in device_credentials
+        if credential.state == "active" and credential.expires_at >= credential_now
+    )
+    renewable_device_credentials = tuple(
+        credential for credential in device_credentials
+        if credential.state != "revoked"
+    )
+    expiring_device_credentials = tuple(
+        credential for credential in usable_device_credentials
+        if credential.expires_at <= credential_now + timedelta(days=30)
+    )
     connected_config_sources = ()
     config_proposal = None
     config_releases = ()
@@ -8032,6 +8053,11 @@ async def organization_admin(request: Request, designator: str):
             "organization_user": user,
             "organization_users": users,
             "enrollment_campaigns": campaigns,
+            "device_credentials": device_credentials,
+            "usable_device_credentials": usable_device_credentials,
+            "renewable_device_credentials": renewable_device_credentials,
+            "expiring_device_credentials": expiring_device_credentials,
+            "can_manage_device_credentials": can_manage_device_credentials,
             "ledger_entries": ledger_entries,
             "organization_cost": organization_cost,
             "beta_allowance": beta_allowance,
@@ -10199,6 +10225,97 @@ async def organization_revoke_enrollment(
     )
 
 
+@app.post("/{designator}/enrollments/{campaign_id}/renew")
+async def organization_renew_enrollment(
+        request: Request,
+        designator: str,
+        campaign_id: str,
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_admin", form_token)
+    organization, user = await require_organization_user(
+        request,
+        designator,
+        ("organization_owner", "user_admin"),
+    )
+    try:
+        campaign = await control_plane_store.renew_enrollment_campaign(
+            campaign_id=campaign_id,
+            organization_id=organization.id,
+            actor_id=user.id,
+        )
+        flash(
+            request,
+            f"Enrollment QR “{campaign.label}” renewed for seven days. Download the fresh QR before sharing it.",
+            "success",
+        )
+    except ControlPlaneError as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(
+        url=f"/{organization.designator.lower()}/admin#enrollment-qr",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post("/{designator}/device-credentials/{credential_id}/extend")
+async def organization_extend_device_credential(
+        request: Request,
+        designator: str,
+        credential_id: str,
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_admin", form_token)
+    organization, user = await require_organization_user(
+        request,
+        designator,
+        ("organization_owner", "user_admin"),
+    )
+    try:
+        credential = await control_plane_store.extend_device_credential(
+            credential_id=credential_id,
+            organization_id=organization.id,
+            actor_id=user.id,
+        )
+        flash(
+            request,
+            f"Extended {credential.device_name} through {credential.expires_at.strftime('%d %b %Y')}.",
+            "success",
+        )
+    except ControlPlaneError as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(
+        url=f"/{organization.designator.lower()}/admin#device-authorizations",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post("/{designator}/device-credentials/extend")
+async def organization_extend_all_device_credentials(
+        request: Request,
+        designator: str,
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_admin", form_token)
+    organization, user = await require_organization_user(
+        request,
+        designator,
+        ("organization_owner", "user_admin"),
+    )
+    try:
+        credentials = await control_plane_store.extend_all_device_credentials(
+            organization_id=organization.id,
+            actor_id=user.id,
+        )
+        flash(
+            request,
+            f"Extended {len(credentials)} R2C tablet authorization{'s' if len(credentials) != 1 else ''} for at least one year.",
+            "success",
+        )
+    except ControlPlaneError as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(
+        url=f"/{organization.designator.lower()}/admin#device-authorizations",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
 @app.get(
     "/{designator}/enrollments/{campaign_id}/qr.svg",
     response_class=Response,
@@ -10272,6 +10389,10 @@ async def organization_enrollment_landing(
             or campaign is None
             or claims.organization_id != organization.id
             or campaign.organization_id != organization.id
+            or not secrets.compare_digest(
+                claims.token_generation,
+                campaign.token_generation,
+            )
             or not campaign.is_usable()
         ):
             raise EnrollmentTokenError(
@@ -10347,6 +10468,10 @@ async def redeem_device_enrollment(payload: DeviceEnrollmentRedeemRequest):
             or campaign is None
             or claims.organization_id != organization.id
             or campaign.organization_id != organization.id
+            or not secrets.compare_digest(
+                claims.token_generation,
+                campaign.token_generation,
+            )
         ):
             raise EnrollmentTokenError("Device enrollment code is invalid.")
         credential = await control_plane_store.issue_device_credential(

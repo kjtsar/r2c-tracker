@@ -13,6 +13,7 @@ from control_plane import (
     DEFAULT_OWNER_ROLES,
     ControlPlaneError,
     ControlPlaneStore,
+    DeviceCredential,
     DuplicateOrganizationError,
     InvalidOrganizationError,
     MANAGED_ACCESS_TERMS_VERSION,
@@ -963,6 +964,53 @@ class ControlPlaneStoreTest(unittest.TestCase):
         )
         self.assertEqual(organization.id, authenticated.organization_id)
         self.assertEqual("NCSSAR", authenticated.designator)
+        self.assertIsNone(asyncio.run(
+            self.store.authenticate_device_token(
+                issued.token,
+                self.now + timedelta(days=366),
+            )
+        ))
+        expired = asyncio.run(self.store.list_device_credentials(
+            organization.id,
+            now=self.now + timedelta(days=366),
+        ))
+        self.assertEqual("expired", expired[0].state)
+        extended = asyncio.run(self.store.extend_device_credential(
+            credential_id=issued.id,
+            organization_id=organization.id,
+            actor_id=owner.id,
+            now=self.now + timedelta(days=366),
+        ))
+        self.assertEqual("active", extended.state)
+        self.assertEqual(
+            self.now + timedelta(days=731),
+            extended.expires_at,
+        )
+        self.assertIsNotNone(asyncio.run(
+            self.store.authenticate_device_token(
+                issued.token,
+                self.now + timedelta(days=366, minutes=1),
+            )
+        ))
+        self.assertEqual(
+            "device.credential_extended",
+            asyncio.run(self.store.list_audit_events())[0].event_type,
+        )
+
+        async def revoke_credential():
+            async with self.store.sessions() as session:
+                stored = await session.get(DeviceCredential, issued.id)
+                stored.state = "revoked"
+                await session.commit()
+
+        asyncio.run(revoke_credential())
+        with self.assertRaisesRegex(ControlPlaneError, "revoked"):
+            asyncio.run(self.store.extend_device_credential(
+                credential_id=issued.id,
+                organization_id=organization.id,
+                actor_id=owner.id,
+                now=self.now + timedelta(days=367),
+            ))
         with self.assertRaises(ControlPlaneError):
             asyncio.run(
                 self.store.issue_device_credential(
@@ -973,6 +1021,57 @@ class ControlPlaneStoreTest(unittest.TestCase):
                     now=self.now,
                 )
             )
+
+    def test_expired_enrollment_campaign_can_be_renewed_with_uses_remaining(self):
+        organization = self.create_organization()
+        owner = asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+                self.now,
+            )
+        )
+        campaign = asyncio.run(self.store.create_enrollment_campaign(
+            organization_id=organization.id,
+            label="Operations QR",
+            created_by_user_id=owner.id,
+            expires_in_hours=24,
+            max_redemptions=5,
+            now=self.now,
+        ))
+
+        renewed = asyncio.run(self.store.renew_enrollment_campaign(
+            campaign_id=campaign.id,
+            organization_id=organization.id,
+            actor_id=owner.id,
+            now=self.now + timedelta(days=2),
+        ))
+
+        self.assertEqual("active", renewed.state)
+        self.assertEqual(
+            self.now + timedelta(days=9),
+            renewed.expires_at,
+        )
+        self.assertTrue(renewed.is_usable(self.now + timedelta(days=8)))
+        self.assertNotEqual(campaign.token_generation, renewed.token_generation)
+        self.assertEqual(
+            "enrollment.renewed",
+            asyncio.run(self.store.list_audit_events())[0].event_type,
+        )
+        asyncio.run(self.store.revoke_enrollment_campaign(
+            campaign_id=campaign.id,
+            organization_id=organization.id,
+            actor_id=owner.id,
+            now=self.now + timedelta(days=3),
+        ))
+        with self.assertRaisesRegex(ControlPlaneError, "revoked"):
+            asyncio.run(self.store.renew_enrollment_campaign(
+                campaign_id=campaign.id,
+                organization_id=organization.id,
+                actor_id=owner.id,
+                now=self.now + timedelta(days=4),
+            ))
 
     def test_video_streams_are_sorted_tenant_isolated_and_require_consent(self):
         organization = self.create_organization()

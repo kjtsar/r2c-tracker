@@ -28,6 +28,7 @@ class EnrollmentClaims:
     campaign_id: str
     organization_id: str
     designator: str
+    token_generation: str
 
 
 class ControlPlaneTokenService:
@@ -101,6 +102,7 @@ class ControlPlaneTokenService:
                 "campaign_id": campaign.id,
                 "organization_id": organization.id,
                 "designator": organization.designator,
+                "token_generation": campaign.token_generation,
             }
         )
 
@@ -133,6 +135,7 @@ class ControlPlaneTokenService:
                 campaign_id=payload["campaign_id"],
                 organization_id=payload["organization_id"],
                 designator=payload["designator"],
+                token_generation=str(payload.get("token_generation", "")),
             )
         except (KeyError, TypeError) as exc:
             raise EnrollmentTokenError("Device enrollment code is invalid.") from exc

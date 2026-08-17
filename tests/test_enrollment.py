@@ -74,6 +74,7 @@ class ControlPlaneTokenServiceTest(unittest.TestCase):
 
         self.assertEqual(self.campaign.id, claims.campaign_id)
         self.assertEqual(self.organization.id, claims.organization_id)
+        self.assertEqual(self.campaign.token_generation, claims.token_generation)
         self.assertNotIn("admin@example.org", url)
         self.assertNotIn("FAA", url)
         self.assertNotIn("password", url.lower())

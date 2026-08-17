@@ -697,6 +697,9 @@ class EnrollmentCampaign(Base):
     state: Mapped[str] = mapped_column(String(24), default="active")
     max_redemptions: Mapped[int] = mapped_column(Integer, default=25)
     redemption_count: Mapped[int] = mapped_column(Integer, default=0)
+    token_generation: Mapped[str] = mapped_column(
+        String(36), default="", nullable=False
+    )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
@@ -1031,6 +1034,7 @@ class EnrollmentCampaignRecord:
     expires_at: datetime
     created_at: datetime
     revoked_at: Optional[datetime]
+    token_generation: str = ""
 
     def is_usable(self, now: Optional[datetime] = None) -> bool:
         checked_at = now or utc_now()
@@ -1162,6 +1166,18 @@ class DeviceCredentialRecord:
     device_name: str
     platform: str
     expires_at: datetime
+
+
+@dataclass(frozen=True)
+class DeviceCredentialAdminRecord:
+    id: str
+    organization_id: str
+    device_name: str
+    platform: str
+    state: str
+    created_at: datetime
+    expires_at: datetime
+    last_used_at: Optional[datetime]
 
 
 @dataclass(frozen=True)
@@ -1612,6 +1628,19 @@ class ControlPlaneStore:
                     "ALTER TABLE control_plane_audit_events "
                     f"ADD COLUMN retention_hold {boolean_type} "
                     "DEFAULT FALSE NOT NULL"
+                ))
+            enrollment_campaign_columns = await connection.run_sync(
+                lambda sync_connection: {
+                    item["name"]
+                    for item in inspect(sync_connection).get_columns(
+                        "enrollment_campaigns"
+                    )
+                }
+            )
+            if "token_generation" not in enrollment_campaign_columns:
+                await connection.execute(text(
+                    "ALTER TABLE enrollment_campaigns "
+                    "ADD COLUMN token_generation VARCHAR(36) DEFAULT '' NOT NULL"
                 ))
             await connection.execute(text(
                 "CREATE INDEX IF NOT EXISTS "
@@ -5130,6 +5159,7 @@ class ControlPlaneStore:
             label=clean_label,
             created_by_user_id=created_by_user_id,
             max_redemptions=max_redemptions,
+            token_generation=new_id(),
             expires_at=created_at + timedelta(hours=expires_in_hours),
             created_at=created_at,
         )
@@ -5161,6 +5191,7 @@ class ControlPlaneStore:
         self,
         organization_id: str,
     ) -> tuple[EnrollmentCampaignRecord, ...]:
+        checked_at = utc_now()
         async with self.sessions() as session:
             campaigns = (
                 await session.scalars(
@@ -5169,7 +5200,10 @@ class ControlPlaneStore:
                     .order_by(EnrollmentCampaign.created_at.desc())
                 )
             ).all()
-        return tuple(self._campaign_record(campaign) for campaign in campaigns)
+        return tuple(
+            self._campaign_record(campaign, checked_at=checked_at)
+            for campaign in campaigns
+        )
 
     async def get_enrollment_campaign(
         self,
@@ -5192,6 +5226,9 @@ class ControlPlaneStore:
             campaign = await session.get(EnrollmentCampaign, campaign_id)
             if campaign is None or campaign.organization_id != organization_id:
                 raise ControlPlaneError("Enrollment campaign not found.")
+            user = await session.get(OrganizationUser, actor_id)
+            if user is None or user.organization_id != organization_id:
+                raise ControlPlaneError("Enrollment campaign administrator is invalid.")
             campaign.state = "revoked"
             campaign.revoked_at = revoked_at
             session.add(
@@ -5205,6 +5242,49 @@ class ControlPlaneStore:
                 )
             )
             await session.commit()
+
+    async def renew_enrollment_campaign(
+        self,
+        *,
+        campaign_id: str,
+        organization_id: str,
+        actor_id: str,
+        expires_in_hours: int = 7 * 24,
+        now: Optional[datetime] = None,
+    ) -> EnrollmentCampaignRecord:
+        renewed_at = as_utc(now or utc_now())
+        if not 1 <= expires_in_hours <= 24 * 30:
+            raise ControlPlaneError("Enrollment validity must be 1-720 hours.")
+        async with self.sessions() as session:
+            campaign = await session.get(EnrollmentCampaign, campaign_id)
+            if campaign is None or campaign.organization_id != organization_id:
+                raise ControlPlaneError("Enrollment campaign not found.")
+            user = await session.get(OrganizationUser, actor_id)
+            if user is None or user.organization_id != organization_id:
+                raise ControlPlaneError("Enrollment campaign administrator is invalid.")
+            if campaign.state == "revoked":
+                raise ControlPlaneError("A revoked enrollment QR cannot be renewed.")
+            if campaign.redemption_count >= campaign.max_redemptions:
+                raise ControlPlaneError("Enrollment campaign has no uses remaining.")
+            previous_expiry = as_utc(campaign.expires_at)
+            campaign.state = "active"
+            campaign.expires_at = renewed_at + timedelta(hours=expires_in_hours)
+            campaign.revoked_at = None
+            campaign.token_generation = new_id()
+            session.add(ControlPlaneAuditEvent(
+                organization_id=organization_id,
+                actor_type="organization_user",
+                actor_id=actor_id,
+                event_type="enrollment.renewed",
+                details_json=json.dumps({
+                    "campaign_id": campaign.id,
+                    "previous_expires_at": previous_expiry.isoformat(),
+                    "expires_in_hours": expires_in_hours,
+                }, sort_keys=True),
+                created_at=renewed_at,
+            ))
+            await session.commit()
+            return self._campaign_record(campaign)
 
     async def redeem_enrollment_campaign(
         self,
@@ -5357,6 +5437,118 @@ class ControlPlaneStore:
                 device_name=credential.device_name,
                 platform=credential.platform,
                 expires_at=expires_at,
+            )
+
+    async def list_device_credentials(
+        self,
+        organization_id: str,
+        now: Optional[datetime] = None,
+    ) -> tuple[DeviceCredentialAdminRecord, ...]:
+        checked_at = as_utc(now or utc_now())
+        async with self.sessions() as session:
+            credentials = (
+                await session.scalars(
+                    select(DeviceCredential)
+                    .where(DeviceCredential.organization_id == organization_id)
+                    .order_by(
+                        DeviceCredential.device_name.asc(),
+                        DeviceCredential.created_at.desc(),
+                    )
+                )
+            ).all()
+        return tuple(
+            self._device_credential_admin_record(credential, checked_at)
+            for credential in credentials
+        )
+
+    async def extend_device_credential(
+        self,
+        *,
+        credential_id: str,
+        organization_id: str,
+        actor_id: str,
+        now: Optional[datetime] = None,
+    ) -> DeviceCredentialAdminRecord:
+        extended_at = as_utc(now or utc_now())
+        async with self.sessions() as session:
+            credential = await session.get(DeviceCredential, credential_id)
+            if credential is None or credential.organization_id != organization_id:
+                raise ControlPlaneError("Device credential not found.")
+            if credential.state == "revoked":
+                raise ControlPlaneError("A revoked device credential cannot be extended.")
+            user = await session.get(OrganizationUser, actor_id)
+            if user is None or user.organization_id != organization_id:
+                raise ControlPlaneError("Device credential administrator is invalid.")
+            previous_state = credential.state
+            previous_expiry = as_utc(credential.expires_at)
+            credential.state = "active"
+            credential.expires_at = max(
+                previous_expiry,
+                extended_at + timedelta(days=365),
+            )
+            session.add(ControlPlaneAuditEvent(
+                organization_id=organization_id,
+                actor_type="organization_user",
+                actor_id=actor_id,
+                event_type="device.credential_extended",
+                details_json=json.dumps({
+                    "credential_id": credential.id,
+                    "device_name": credential.device_name,
+                    "previous_state": previous_state,
+                    "previous_expires_at": previous_expiry.isoformat(),
+                    "expires_at": as_utc(credential.expires_at).isoformat(),
+                }, sort_keys=True),
+                created_at=extended_at,
+            ))
+            await session.commit()
+            return self._device_credential_admin_record(credential, extended_at)
+
+    async def extend_all_device_credentials(
+        self,
+        *,
+        organization_id: str,
+        actor_id: str,
+        now: Optional[datetime] = None,
+    ) -> tuple[DeviceCredentialAdminRecord, ...]:
+        extended_at = as_utc(now or utc_now())
+        async with self.sessions() as session:
+            user = await session.get(OrganizationUser, actor_id)
+            if user is None or user.organization_id != organization_id:
+                raise ControlPlaneError("Device credential administrator is invalid.")
+            credentials = (
+                await session.scalars(
+                    select(DeviceCredential)
+                    .where(
+                        DeviceCredential.organization_id == organization_id,
+                        DeviceCredential.state != "revoked",
+                    )
+                    .with_for_update()
+                )
+            ).all()
+            if not credentials:
+                raise ControlPlaneError("No renewable device credentials were found.")
+            minimum_expiry = extended_at + timedelta(days=365)
+            for credential in credentials:
+                credential.state = "active"
+                credential.expires_at = max(
+                    as_utc(credential.expires_at),
+                    minimum_expiry,
+                )
+            session.add(ControlPlaneAuditEvent(
+                organization_id=organization_id,
+                actor_type="organization_user",
+                actor_id=actor_id,
+                event_type="device.credentials_extended",
+                details_json=json.dumps({
+                    "credential_count": len(credentials),
+                    "minimum_expires_at": minimum_expiry.isoformat(),
+                }, sort_keys=True),
+                created_at=extended_at,
+            ))
+            await session.commit()
+            return tuple(
+                self._device_credential_admin_record(credential, extended_at)
+                for credential in credentials
             )
 
     @staticmethod
@@ -7705,17 +7897,43 @@ class ControlPlaneStore:
     @staticmethod
     def _campaign_record(
         campaign: EnrollmentCampaign,
+        checked_at: Optional[datetime] = None,
     ) -> EnrollmentCampaignRecord:
+        expires_at = as_utc(campaign.expires_at)
+        state = campaign.state
+        if checked_at is not None and state == "active" and expires_at < checked_at:
+            state = "expired"
         return EnrollmentCampaignRecord(
             id=campaign.id,
             organization_id=campaign.organization_id,
             label=campaign.label,
-            state=campaign.state,
+            state=state,
             max_redemptions=campaign.max_redemptions,
             redemption_count=campaign.redemption_count,
-            expires_at=as_utc(campaign.expires_at),
+            expires_at=expires_at,
             created_at=as_utc(campaign.created_at),
             revoked_at=as_utc(campaign.revoked_at),
+            token_generation=campaign.token_generation or "",
+        )
+
+    @staticmethod
+    def _device_credential_admin_record(
+        credential: DeviceCredential,
+        checked_at: datetime,
+    ) -> DeviceCredentialAdminRecord:
+        expires_at = as_utc(credential.expires_at)
+        state = credential.state
+        if state == "active" and expires_at < checked_at:
+            state = "expired"
+        return DeviceCredentialAdminRecord(
+            id=credential.id,
+            organization_id=credential.organization_id,
+            device_name=credential.device_name,
+            platform=credential.platform,
+            state=state,
+            created_at=as_utc(credential.created_at),
+            expires_at=expires_at,
+            last_used_at=as_utc(credential.last_used_at),
         )
 
     @staticmethod
