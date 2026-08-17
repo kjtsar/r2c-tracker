@@ -262,6 +262,18 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn("new Image()", script)
         self.assertIn("image.dataset.thumbnailRevision", script)
 
+    def test_first_live_thumbnail_replaces_preview_pending_state(self):
+        script = Path("static/organization_streams_live.js").read_text()
+        template = Path("templates/organization_streams.html").read_text()
+
+        self.assertIn('class="stream-preview-cell"', template)
+        self.assertIn('class="stream-preview-image"', template)
+        self.assertIn('data-thumbnail-revision=""', template)
+        self.assertIn("stream-preview-pending", template)
+        self.assertIn("image.hidden = false", script)
+        self.assertIn("if (pending) pending.hidden = true", script)
+        self.assertIn("if (label) label.hidden = false", script)
+
     def test_preflight_owns_request_refresh_until_one_decision_navigation(self):
         live_script = Path("static/organization_streams_live.js").read_text()
         preflight_script = Path("static/video_preflight.js").read_text()

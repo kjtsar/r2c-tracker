@@ -83,6 +83,14 @@
     replacement.onload = function () {
       image.src = item.thumbnailUrl;
       image.dataset.thumbnailRevision = item.thumbnailRevision;
+      image.hidden = false;
+      const previewCell = image.closest(".stream-preview-cell");
+      const pending = previewCell &&
+        previewCell.querySelector(".stream-preview-pending");
+      const label = previewCell &&
+        previewCell.querySelector(".stream-preview-label");
+      if (pending) pending.hidden = true;
+      if (label) label.hidden = false;
       image.classList.remove("is-refreshing");
     };
     replacement.onerror = function () {

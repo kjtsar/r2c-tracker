@@ -410,7 +410,7 @@
           {% set active_consumer = active_consumers_by_device_id.get(stream.device_credential_id) %}
           {% set recording_download = recording_downloads_by_session.get(stream.session_id) %}
           <tr data-stream-session-id="{{ stream.session_id }}">
-            <td>
+            <td class="stream-preview-cell">
               {% if stream.thumbnail_revision %}
               {% if video_streaming_allowed and stream.session_id not in request_in_progress_session_ids and not (stream.remote_control_enabled and active_consumer) %}
               <form method="post"
@@ -429,7 +429,7 @@
                     loading="lazy"
                     style="display:block;width:160px;max-height:100px;object-fit:cover;border-radius:6px"
                   >
-                  <span class="secondary" style="display:block">Viewer preview</span>
+                  <span class="secondary stream-preview-label" style="display:block">Viewer preview</span>
                 </button>
               </form>
               {% else %}
@@ -442,10 +442,19 @@
                 loading="lazy"
                 style="display:block;width:160px;max-height:100px;object-fit:cover;background:#111;border-radius:6px"
               >
-              <span class="secondary" style="display:block">Viewer preview</span>
+              <span class="secondary stream-preview-label" style="display:block">Viewer preview</span>
               {% endif %}
               {% else %}
-              <span class="secondary">Preview pending</span>
+              <img
+                class="stream-preview-image"
+                data-stream-session-id="{{ stream.session_id }}"
+                data-thumbnail-revision=""
+                alt="{{ stream.drone_designator }} {{ stream.media_kind }} preview"
+                hidden
+                style="display:block;width:160px;max-height:100px;object-fit:cover;background:#111;border-radius:6px"
+              >
+              <span class="secondary stream-preview-pending">Preview pending</span>
+              <span class="secondary stream-preview-label" hidden>Viewer preview</span>
               {% endif %}
             </td>
             {% if session_kind == "recording" %}
@@ -629,7 +638,7 @@
      data-membership-revision="{{ stream_membership_revision }}"
      data-in-progress-session-ids="{{ request_in_progress_session_ids | list | sort | tojson | forceescape }}"
      data-status-url="/{{ organization.designator|lower }}/streams/live-status"></div>
-<script src="/static/organization_streams_live.js?v=20260814-3" defer></script>
+<script src="/static/organization_streams_live.js?v=20260816-1" defer></script>
 {% if recording_downloads_enabled %}
 {% for recording_download in recording_downloads_by_session.values() %}
 {% if recording_download.state in ("awaiting_approval", "approved", "uploading") %}

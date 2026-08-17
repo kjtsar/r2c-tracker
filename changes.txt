@@ -1,3 +1,6 @@
+v1.4.52:
+* Replace Preview pending with the first live tablet thumbnail as soon as it arrives, without requiring a tracker page reload.
+
 v1.4.51: deployed
 * Snapshot each completed link test's source capabilities so fluctuating tablet frame-rate advertisements cannot invalidate a quality choice already shown to the requester.
 * Return disconnected tablet stream pages to the organization stream list and add direct Back to streams navigation on tablet-scoped pages.
