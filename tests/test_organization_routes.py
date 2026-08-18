@@ -1828,6 +1828,35 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertEqual(303, response.status_code)
         self.assertEqual("/ncssar/login", response.headers["location"])
 
+    def test_mobile_enrollment_domain_associations_are_public(self):
+        android = self.client.get("/.well-known/assetlinks.json")
+        self.assertEqual(200, android.status_code)
+        self.assertEqual("public, max-age=3600", android.headers["cache-control"])
+        statement = android.json()[0]
+        self.assertEqual(
+            ["delegate_permission/common.handle_all_urls"],
+            statement["relation"],
+        )
+        self.assertEqual(
+            "org.ncssar.rid2caltopo",
+            statement["target"]["package_name"],
+        )
+        self.assertIn(
+            "21:88:EC:89:72:29:2D:83:97:07:EB:DE:09:2B:F8:C1:31:46:6C:93:37:89:BE:49:3D:3D:06:C0:F2:37:EB:3E",
+            statement["target"]["sha256_cert_fingerprints"],
+        )
+
+        apple = self.client.get("/.well-known/apple-app-site-association")
+        self.assertEqual(200, apple.status_code)
+        self.assertEqual(
+            "94UV79S6LR.org.ncssar.RID2CaltopoApple",
+            apple.json()["applinks"]["details"][0]["appID"],
+        )
+        self.assertEqual(
+            ["/*/enroll"],
+            apple.json()["applinks"]["details"][0]["paths"],
+        )
+
     def test_onboarding_activation_and_enrollment_qr_flow(self):
         platform_page = self.client.get(
             "/platform-admin/organizations",
@@ -1925,10 +1954,25 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         campaign = asyncio.run(
             self.store.list_enrollment_campaigns(organization.id)
         )[0]
+        with patch("qrcode.make") as make_qr:
+            make_qr.return_value.to_string.return_value = b"<svg/>"
+            encoded_qr_response = self.client.get(html.unescape(qr_match.group(1)))
+        self.assertEqual(200, encoded_qr_response.status_code)
+        qr_payload = make_qr.call_args.args[0]
+        self.assertTrue(qr_payload.startswith("r2cenroll://open?url="))
+        self.assertIn("https%3A%2F%2F", qr_payload)
+        self.assertIn("%2Fncssar%2Fenroll%3Ftoken%3D", qr_payload)
         enrollment_token = self.tokens.enrollment_token(
             organization,
             campaign,
         )
+        enrollment_landing = self.client.get(
+            f"/ncssar/enroll?token={enrollment_token}"
+        )
+        self.assertEqual(200, enrollment_landing.status_code)
+        self.assertIn("Open RID2Caltopo", enrollment_landing.text)
+        self.assertIn("r2cenroll://open?url=", enrollment_landing.text)
+        self.assertIn("%2Fncssar%2Fenroll%3Ftoken%3D", enrollment_landing.text)
         with patch.object(main, "DEVICE_CREDENTIAL_ISSUANCE_ENABLED", True):
             redeemed = self.client.post(
                 "/api/v1/device-enrollment/redeem",

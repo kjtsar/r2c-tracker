@@ -5559,6 +5559,47 @@ async def upload(
             }
             }
 
+ANDROID_APP_LINK_CERTIFICATES = (
+    # Google Play app-signing certificate. This is the certificate installed
+    # on operator devices, not the upload certificate used for AAB submission.
+    "21:88:EC:89:72:29:2D:83:97:07:EB:DE:09:2B:F8:C1:31:46:6C:93:37:89:BE:49:3D:3D:06:C0:F2:37:EB:3E",
+    # Direct release APKs are signed with the protected upload key.
+    "92:F8:E8:39:8B:4D:2B:85:BB:EB:1D:DF:15:B2:27:E4:4D:BC:AD:29:12:22:AF:58:1E:4A:38:6E:FD:2E:13:0A",
+)
+APPLE_APP_IDENTIFIER = "94UV79S6LR.org.ncssar.RID2CaltopoApple"
+
+
+@app.get("/.well-known/assetlinks.json", include_in_schema=False)
+async def android_asset_links():
+    return JSONResponse(
+        content=[{
+            "relation": ["delegate_permission/common.handle_all_urls"],
+            "target": {
+                "namespace": "android_app",
+                "package_name": "org.ncssar.rid2caltopo",
+                "sha256_cert_fingerprints": list(ANDROID_APP_LINK_CERTIFICATES),
+            },
+        }],
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+@app.get("/.well-known/apple-app-site-association", include_in_schema=False)
+async def apple_app_site_association():
+    return JSONResponse(
+        content={
+            "applinks": {
+                "apps": [],
+                "details": [{
+                    "appID": APPLE_APP_IDENTIFIER,
+                    "paths": ["/*/enroll"],
+                }],
+            },
+        },
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
 async def organization_directory(
         request: Request,
@@ -10531,8 +10572,12 @@ async def organization_enrollment_qr(
         organization,
         campaign,
     )
+    app_enrollment_url = (
+        "r2cenroll://open?url="
+        + quote(enrollment_url, safe="")
+    )
     image = qrcode.make(
-        enrollment_url,
+        app_enrollment_url,
         image_factory=SvgPathImage,
         box_size=8,
         border=4,
@@ -10624,6 +10669,10 @@ async def organization_enrollment_landing(
             ),
             "organization_page_designator": designator.upper(),
             "organization_identity_name": identity_name,
+            "app_enrollment_url": (
+                "r2cenroll://open?url="
+                + quote(str(request.url), safe="")
+            ),
         },
         status_code=(
             status.HTTP_400_BAD_REQUEST

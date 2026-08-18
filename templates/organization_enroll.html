@@ -25,6 +25,17 @@
       background: #fff0f0;
       color: #8b1f1f;
   }
+  .enroll-open-app {
+      display: inline-block;
+      margin-top: 18px;
+      padding: 12px 18px;
+      border-radius: 9px;
+      background: #12344d;
+      color: white;
+      font-weight: 700;
+      text-decoration: none;
+  }
+  .enroll-open-app:hover { background: #0b2639; color: white; }
 </style>
 {% endblock %}
 {% block content %}
@@ -49,6 +60,9 @@
     Open this link with the RID2Caltopo app to continue secure configuration.
     {% endif %}
   </div>
+  <a class="enroll-open-app" href="{{ app_enrollment_url }}">
+    Open RID2Caltopo
+  </a>
   <p>
     Enrollment: {{ campaign.label }}<br>
     Expires: {{ campaign.expires_at.strftime("%d %b %Y %H:%M UTC") }}

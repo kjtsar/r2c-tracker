@@ -1,3 +1,6 @@
+v1.4.57:
+* Make tracker enrollment QR codes launch RID2Caltopo directly on Android and Apple, retain a browser fallback, and publish verified mobile-app association metadata.
+
 v1.4.56: deployed
 * Accept App Store Connect's delivered test-ping event and email a clearly labeled end-to-end confirmation, while continuing to send separate alerts for user crash and screenshot feedback.
 
