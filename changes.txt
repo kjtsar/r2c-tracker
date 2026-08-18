@@ -1,5 +1,8 @@
-v1.4.60:
+v1.4.61:
 * Add the r2c_device member permission for RID2Caltopo operators and automatically include records_viewer whenever it is assigned; NCSSAR enrollment remains open during verification.
+
+v1.4.60:
+* Superseded before deployment after release qualification normalized the tracked secret-scanner baseline.
 
 v1.4.59: deployed
 * Introduce tracker functionality release 148 independently of Android and Apple distribution build numbers while leaving minimum-version enforcement disabled during NCSSAR field verification.
