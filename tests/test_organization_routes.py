@@ -1845,6 +1845,10 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             "21:88:EC:89:72:29:2D:83:97:07:EB:DE:09:2B:F8:C1:31:46:6C:93:37:89:BE:49:3D:3D:06:C0:F2:37:EB:3E",
             statement["target"]["sha256_cert_fingerprints"],
         )
+        self.assertIn(
+            "79:09:03:0E:C2:02:62:B1:23:4D:2C:D3:42:CB:D3:4E:72:0E:B4:DD:5D:FF:48:9D:14:9C:17:CD:FF:6C:21:AA",
+            statement["target"]["sha256_cert_fingerprints"],
+        )
 
         apple = self.client.get("/.well-known/apple-app-site-association")
         self.assertEqual(200, apple.status_code)

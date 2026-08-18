@@ -5643,6 +5643,10 @@ ANDROID_APP_LINK_CERTIFICATES = (
     "21:88:EC:89:72:29:2D:83:97:07:EB:DE:09:2B:F8:C1:31:46:6C:93:37:89:BE:49:3D:3D:06:C0:F2:37:EB:3E",
     # Direct release APKs are signed with the protected upload key.
     "92:F8:E8:39:8B:4D:2B:85:BB:EB:1D:DF:15:B2:27:E4:4D:BC:AD:29:12:22:AF:58:1E:4A:38:6E:FD:2E:13:0A",
+    # Locally installed test builds use the Android debug certificate. Keeping
+    # it associated lets field-test tablets exercise the same QR enrollment
+    # path before a Play release is published.
+    "79:09:03:0E:C2:02:62:B1:23:4D:2C:D3:42:CB:D3:4E:72:0E:B4:DD:5D:FF:48:9D:14:9C:17:CD:FF:6C:21:AA",
 )
 APPLE_APP_IDENTIFIER = "94UV79S6LR.org.ncssar.RID2CaltopoApple"
 

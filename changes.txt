@@ -1,3 +1,6 @@
+v1.4.66:
+* Let locally installed Android field-test builds open Tracker enrollment QR links directly by publishing their signing certificate alongside the Play and direct-release certificates.
+
 v1.4.65: deployed
 * Clarify reauthentication quarantine: RID2Caltopo remains usable offline, independent CalTopo credentials survive, and Tracker-issued CalTopo credentials are disabled until an authorized user restores access.
 
