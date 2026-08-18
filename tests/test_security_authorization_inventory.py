@@ -33,6 +33,7 @@ class SecurityAuthorizationInventoryTest(unittest.TestCase):
         "organization_stream_events",
         "organization_r2c_websocket_endpoint",
         "organization_public_dashboard",
+        "organization_device_reauthenticate",
     }
 
     PLATFORM_BOOTSTRAP_ENDPOINTS = {
@@ -97,6 +98,11 @@ class SecurityAuthorizationInventoryTest(unittest.TestCase):
         source = inspect.getsource(main.organization_public_dashboard)
         self.assertIn('records_visibility != "public"', source)
         self.assertIn("require_organization_user", source)
+
+        source = inspect.getsource(main.organization_device_reauthenticate)
+        self.assertIn("decode_device_reauthentication", source)
+        self.assertIn("get_device_reauthentication_record", source)
+        self.assertIn('"r2c_device" in user.roles', source)
 
     def test_tenant_browser_mutations_require_csrf(self):
         exempt = {

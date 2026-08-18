@@ -80,6 +80,7 @@ DEFAULT_OWNER_ROLES = (
     "organization_owner",
     "records_admin",
     "records_viewer",
+    "r2c_device",
     "user_admin",
     "video_requester",
 )
@@ -331,7 +332,12 @@ class OrganizationUser(Base):
     @property
     def roles(self) -> tuple[str, ...]:
         values = json.loads(self.roles_json or "[]")
-        return tuple(value for value in values if value in ROLE_NAMES)
+        normalized_roles = {value for value in values if value in ROLE_NAMES}
+        if "organization_owner" in normalized_roles:
+            normalized_roles.add("r2c_device")
+        if "r2c_device" in normalized_roles:
+            normalized_roles.add("records_viewer")
+        return tuple(sorted(normalized_roles))
 
     def set_roles(self, roles: tuple[str, ...]) -> None:
         invalid = set(roles) - ROLE_NAMES
@@ -5764,6 +5770,33 @@ class ControlPlaneStore:
                 )
             )
 
+    async def device_reauthentication_challenge(
+        self, token: str
+    ) -> Optional[tuple[DeviceCredentialAdminRecord, str]]:
+        if not token.startswith("r2c_dev_") or len(token) < 40:
+            return None
+        async with self.sessions() as session:
+            row = (
+                await session.execute(
+                    select(DeviceCredential, Organization.designator)
+                    .join(
+                        Organization,
+                        Organization.id == DeviceCredential.organization_id,
+                    )
+                    .where(
+                        DeviceCredential.token_hash == device_token_hash(token),
+                        DeviceCredential.state == "reauth_required",
+                    )
+                )
+            ).one_or_none()
+            if row is None:
+                return None
+            credential, designator = row
+            return (
+                self._device_credential_admin_record(credential, utc_now()),
+                designator,
+            )
+
     async def require_device_reauthentication(
         self,
         *,
@@ -5801,6 +5834,72 @@ class ControlPlaneStore:
             return self._device_credential_admin_record(
                 credential, requested_at
             )
+
+    async def get_device_reauthentication_record(
+        self,
+        *,
+        credential_id: str,
+        organization_id: str,
+    ) -> Optional[DeviceCredentialAdminRecord]:
+        async with self.sessions() as session:
+            credential = await session.get(DeviceCredential, credential_id)
+            if (
+                credential is None
+                or credential.organization_id != organization_id
+                or credential.state != "reauth_required"
+            ):
+                return None
+            return self._device_credential_admin_record(credential, utc_now())
+
+    async def complete_device_reauthentication(
+        self,
+        *,
+        credential_id: str,
+        organization_id: str,
+        user_id: str,
+        now: Optional[datetime] = None,
+    ) -> DeviceCredentialAdminRecord:
+        completed_at = as_utc(now or utc_now())
+        async with self.sessions() as session:
+            credential = await session.get(DeviceCredential, credential_id)
+            user = await session.get(OrganizationUser, user_id)
+            if (
+                credential is None
+                or credential.organization_id != organization_id
+                or credential.state != "reauth_required"
+            ):
+                raise ControlPlaneError("Device is not awaiting reauthentication.")
+            if (
+                user is None
+                or user.organization_id != organization_id
+                or user.state != "active"
+                or "r2c_device" not in user.roles
+            ):
+                raise ControlPlaneError(
+                    "This user is not authorized to operate RID2Caltopo devices."
+                )
+            credential.state = "active"
+            credential.authorized_user_id = user.id
+            credential.reauth_requested_at = None
+            credential.last_used_at = completed_at
+            session.add(ControlPlaneAuditEvent(
+                organization_id=organization_id,
+                actor_type="organization_user",
+                actor_id=user.id,
+                event_type="device.reauthentication_completed",
+                details_json=json.dumps({
+                    "credential_id": credential.id,
+                    "device_name": credential.device_name,
+                    "user_email": user.email,
+                    "message": (
+                        f"Authorized user {user.email} reauthenticated "
+                        f"{credential.device_name}."
+                    ),
+                }, sort_keys=True),
+                created_at=completed_at,
+            ))
+            await session.commit()
+            return self._device_credential_admin_record(credential, completed_at)
 
     async def list_device_credentials(
         self,

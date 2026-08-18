@@ -1134,6 +1134,21 @@ class ControlPlaneStoreTest(unittest.TestCase):
         self.assertEqual("device.reauthentication_required", event.event_type)
         self.assertIn("Lost tablet", event.details["message"])
 
+        restored = asyncio.run(self.store.complete_device_reauthentication(
+            credential_id=issued.id,
+            organization_id=organization.id,
+            user_id=owner.id,
+            now=self.now + timedelta(minutes=3),
+        ))
+        self.assertEqual("active", restored.state)
+        self.assertEqual(owner.id, restored.authorized_user_id)
+        self.assertIsNotNone(asyncio.run(
+            self.store.authenticate_device_token(issued.token)
+        ))
+        event = asyncio.run(self.store.list_audit_events())[0]
+        self.assertEqual("device.reauthentication_completed", event.event_type)
+        self.assertIn(owner.email, event.details["message"])
+
     def test_expired_enrollment_campaign_can_be_renewed_with_uses_remaining(self):
         organization = self.create_organization()
         owner = asyncio.run(

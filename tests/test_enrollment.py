@@ -79,6 +79,23 @@ class ControlPlaneTokenServiceTest(unittest.TestCase):
         self.assertNotIn("FAA", url)
         self.assertNotIn("password", url.lower())
 
+    def test_device_reauthentication_url_is_signed_and_device_bound(self):
+        url = self.service.device_reauthentication_url(
+            credential_id="device-credential-id",
+            organization_id=self.organization.id,
+            designator=self.organization.designator,
+            requested_at=self.now.isoformat(),
+        )
+        token = url.split("token=", 1)[1]
+
+        claims = self.service.decode_device_reauthentication(token)
+
+        self.assertEqual("device-credential-id", claims.credential_id)
+        self.assertEqual(self.organization.id, claims.organization_id)
+        self.assertEqual("NCSSAR", claims.designator)
+        with self.assertRaises(EnrollmentTokenError):
+            self.service.decode_device_reauthentication(token + "tampered")
+
     def test_simulation_configuration_never_contains_credentials(self):
         configuration = public_device_configuration(self.organization)
 

@@ -31,6 +31,14 @@ class EnrollmentClaims:
     token_generation: str
 
 
+@dataclass(frozen=True)
+class DeviceReauthenticationClaims:
+    credential_id: str
+    organization_id: str
+    designator: str
+    requested_at: str
+
+
 class ControlPlaneTokenService:
     def __init__(self, signing_key: str, public_base_url: str):
         if len(signing_key) < 32:
@@ -46,6 +54,63 @@ class ControlPlaneTokenService:
             signing_key,
             salt="r2c-device-enrollment-v1",
         )
+        self.device_reauthentication = URLSafeTimedSerializer(
+            signing_key,
+            salt="r2c-device-reauthentication-v1",
+        )
+
+    def device_reauthentication_token(
+        self,
+        *,
+        credential_id: str,
+        organization_id: str,
+        designator: str,
+        requested_at: str,
+    ) -> str:
+        return self.device_reauthentication.dumps({
+            "kind": "device_reauthentication",
+            "credential_id": credential_id,
+            "organization_id": organization_id,
+            "designator": designator,
+            "requested_at": requested_at,
+        })
+
+    def device_reauthentication_url(self, **kwargs) -> str:
+        token = self.device_reauthentication_token(**kwargs)
+        designator = str(kwargs["designator"]).lower()
+        return (
+            f"{self.public_base_url}/{designator}/device-reauthenticate?"
+            f"{urlencode({'token': token})}"
+        )
+
+    def decode_device_reauthentication(
+        self,
+        token: str,
+        max_age_seconds: int = 24 * 3600,
+    ) -> DeviceReauthenticationClaims:
+        try:
+            payload = self.device_reauthentication.loads(
+                token, max_age=max_age_seconds
+            )
+        except (BadSignature, SignatureExpired) as exc:
+            raise EnrollmentTokenError(
+                "Device reauthentication request is invalid or expired."
+            ) from exc
+        if payload.get("kind") != "device_reauthentication":
+            raise EnrollmentTokenError(
+                "Device reauthentication request is invalid."
+            )
+        try:
+            return DeviceReauthenticationClaims(
+                credential_id=payload["credential_id"],
+                organization_id=payload["organization_id"],
+                designator=payload["designator"],
+                requested_at=payload["requested_at"],
+            )
+        except (KeyError, TypeError) as exc:
+            raise EnrollmentTokenError(
+                "Device reauthentication request is invalid."
+            ) from exc
 
     def activation_token(self, invitation: InvitationRecord) -> str:
         return self.activation.dumps(

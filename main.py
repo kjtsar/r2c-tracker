@@ -2195,6 +2195,7 @@ class R2CCoordinationHub:
         device_credential_id: str,
         *,
         reason: str,
+        reauthentication_url: str = "",
     ) -> None:
         async with self._lock:
             connections = list(
@@ -2204,7 +2205,8 @@ class R2CCoordinationHub:
             try:
                 await connection.websocket.send_json({
                     "type": "reauthentication_required",
-                    "clearManagedConfiguration": True,
+                    "clearManagedConfiguration": False,
+                    "reauthenticationUrl": reauthentication_url,
                     "message": reason,
                 })
                 await connection.websocket.close(code=1008, reason=reason)
@@ -4758,13 +4760,23 @@ async def get_api_key(
         return credential
     normalized = _normalize_tracker_token(header_value)
     if control_plane_store is not None:
-        credential_state = await control_plane_store.device_token_state(normalized)
-        if credential_state == "reauth_required":
+        challenge = await control_plane_store.device_reauthentication_challenge(
+            normalized
+        )
+        if challenge is not None:
+            credential_record, designator = challenge
+            reauthentication_url = control_plane_tokens.device_reauthentication_url(
+                credential_id=credential_record.id,
+                organization_id=credential_record.organization_id,
+                designator=designator,
+                requested_at=credential_record.reauth_requested_at.isoformat(),
+            )
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={
                     "code": "reauthentication_required",
-                    "clear_managed_configuration": True,
+                    "clear_managed_configuration": False,
+                    "reauthentication_url": reauthentication_url,
                     "message": (
                         "This device must reauthenticate before Tracker access "
                         "can be restored."
@@ -7707,6 +7719,12 @@ def organization_safe_login_next(designator: str, requested: str) -> str:
         return requested
     if re.fullmatch(
         re.escape(organization_path)
+        + r"/device-reauthenticate\?token=[A-Za-z0-9._~-]{20,4096}",
+        requested,
+    ):
+        return requested
+    if re.fullmatch(
+        re.escape(organization_path)
         + r"/streams/(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2}){1,480}"
         + r"(?:/(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2}){1,480})?",
         requested,
@@ -8082,6 +8100,7 @@ async def organization_google_callback(
             url=fallback_url,
             status_code=status.HTTP_303_SEE_OTHER,
         )
+    google_identity = None
     try:
         google_identity = await asyncio.to_thread(
             google_oidc_client.exchange_code,
@@ -8105,6 +8124,10 @@ async def organization_google_callback(
     except (PlatformAdminAuthError, InvalidOrganizationError) as exc:
         logging.warning("Google organization login failed: %s", exc)
         user = None
+    next_path = organization_safe_login_next(
+        organization.designator,
+        str(flow.get("next", "")),
+    )
     if user is None:
         logging.warning(
             "Google organization login rejected for unauthorized email"
@@ -8114,6 +8137,18 @@ async def organization_google_callback(
             "That Google account is not an active member of this organization.",
             "warning",
         )
+        if "/device-reauthenticate?token=" in next_path:
+            request.session["device_reauthentication_failures"] = min(
+                99,
+                int(request.session.get("device_reauthentication_failures", 0)) + 1,
+            )
+            request.session["device_reauthentication_last_email"] = (
+                google_identity.email if google_identity is not None else ""
+            )
+            return RedirectResponse(
+                url=next_path,
+                status_code=status.HTTP_303_SEE_OTHER,
+            )
         return RedirectResponse(
             url=f"/{organization.designator.lower()}/login",
             status_code=status.HTTP_303_SEE_OTHER,
@@ -8124,13 +8159,112 @@ async def organization_google_callback(
     request.session["organization_google_subject"] = google_identity.subject
     if flow.get("activation_nonce"):
         flash(request, "Organization account activated.", "success")
-    next_path = organization_safe_login_next(
-        organization.designator,
-        str(flow.get("next", "")),
-    )
     return RedirectResponse(
         url=next_path or organization_landing_path(organization, user),
         status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.get("/{designator}/device-reauthenticate", response_class=HTMLResponse)
+async def organization_device_reauthenticate(
+        request: Request,
+        designator: str,
+        token: str = ""):
+    if not organization_site_ready():
+        raise HTTPException(status_code=503, detail="Organization login unavailable.")
+    try:
+        claims = control_plane_tokens.decode_device_reauthentication(token)
+        organization = await control_plane_store.get_organization(designator)
+    except (EnrollmentTokenError, InvalidOrganizationError):
+        organization = None
+        claims = None
+    if (
+        organization is None
+        or claims is None
+        or organization.id != claims.organization_id
+        or organization.designator != claims.designator
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Device reauthentication request is invalid or expired.",
+        )
+    credential = await control_plane_store.get_device_reauthentication_record(
+        credential_id=claims.credential_id,
+        organization_id=claims.organization_id,
+    )
+    if (
+        credential is None
+        or credential.reauth_requested_at is None
+        or credential.reauth_requested_at.isoformat() != claims.requested_at
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="This device is no longer awaiting reauthentication.",
+        )
+    user_id = request.session.get("organization_user_id")
+    session_designator = request.session.get("organization_designator")
+    user = (
+        await control_plane_store.get_user(user_id)
+        if isinstance(user_id, str)
+        and session_designator == organization.designator
+        else None
+    )
+    completed = False
+    authorized_email = ""
+    if (
+        user is not None
+        and user.state == "active"
+        and user.organization_id == organization.id
+        and "r2c_device" in user.roles
+    ):
+        await control_plane_store.complete_device_reauthentication(
+            credential_id=credential.id,
+            organization_id=organization.id,
+            user_id=user.id,
+        )
+        completed = True
+        authorized_email = user.email
+        request.session.pop("device_reauthentication_failures", None)
+        request.session.pop("device_reauthentication_last_email", None)
+        request.session.pop("device_reauthentication_last_user_id", None)
+    elif user is not None and user.state == "active":
+        if request.session.get("device_reauthentication_last_user_id") != user.id:
+            request.session["device_reauthentication_failures"] = min(
+                99,
+                int(request.session.get("device_reauthentication_failures", 0)) + 1,
+            )
+            request.session["device_reauthentication_last_user_id"] = user.id
+            request.session["device_reauthentication_last_email"] = user.email
+        clear_organization_session(request)
+    attempts = int(request.session.get("device_reauthentication_failures", 0))
+    next_path = (
+        f"/{organization.designator.lower()}/device-reauthenticate?"
+        + urlencode({"token": token})
+    )
+    google_start_url = (
+        f"/{organization.designator.lower()}/google/start?"
+        + urlencode({"next": next_path})
+    )
+    return templates.TemplateResponse(
+        request=request,
+        name="device_reauthenticate.html",
+        context={
+            "request": request,
+            "enable_live_refresh": False,
+            "include_leaflet": False,
+            "include_datetime_script": False,
+            "organization": organization,
+            "organization_page_designator": organization.designator,
+            "organization_identity_name": user.display_name if user else "Guest",
+            "device_name": credential.device_name,
+            "completed": completed,
+            "authorized_email": authorized_email,
+            "attempts": attempts,
+            "last_email": request.session.get(
+                "device_reauthentication_last_email", ""
+            ),
+            "google_start_url": google_start_url,
+        },
     )
 
 
@@ -10600,15 +10734,23 @@ async def organization_require_device_reauthentication(
             organization_id=organization.id,
             actor_id=user.id,
         )
+        reauthentication_url = control_plane_tokens.device_reauthentication_url(
+            credential_id=credential.id,
+            organization_id=credential.organization_id,
+            designator=organization.designator,
+            requested_at=credential.reauth_requested_at.isoformat(),
+        )
         await r2c_hub.disconnect_device_credential(
             credential.id,
             reason="Reauthentication required",
+            reauthentication_url=reauthentication_url,
         )
         flash(
             request,
             (
                 f"{credential.device_name} is blocked until it reauthenticates. "
-                "Its managed RID map and credentials will be cleared on contact."
+                "Its managed RID map and credentials remain on the device while "
+                "an authorized user signs in."
             ),
             "success",
         )
@@ -11809,16 +11951,24 @@ async def serve_r2c_websocket(
     token = websocket.headers.get(API_KEY_NAME)
     authenticated, device_credential = await authenticate_tracker_session(token)
     normalized_token = _normalize_tracker_token(token)
-    credential_state = (
-        await control_plane_store.device_token_state(normalized_token)
+    reauthentication_challenge = (
+        await control_plane_store.device_reauthentication_challenge(normalized_token)
         if not authenticated and control_plane_store is not None
         else None
     )
-    if credential_state == "reauth_required":
+    if reauthentication_challenge is not None:
+        credential_record, designator = reauthentication_challenge
+        reauthentication_url = control_plane_tokens.device_reauthentication_url(
+            credential_id=credential_record.id,
+            organization_id=credential_record.organization_id,
+            designator=designator,
+            requested_at=credential_record.reauth_requested_at.isoformat(),
+        )
         await websocket.accept()
         await websocket.send_json({
             "type": "reauthentication_required",
-            "clearManagedConfiguration": True,
+            "clearManagedConfiguration": False,
+            "reauthenticationUrl": reauthentication_url,
             "message": (
                 "This device must reauthenticate before Tracker access can be restored."
             ),
