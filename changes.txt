@@ -1,3 +1,6 @@
+v1.4.67:
+* Keep device reauthentication attached to its Google sign-in callback, return successful operators to RID2Caltopo automatically, and distinguish duplicate tablet enrollments in the administrator inventory.
+
 v1.4.66: deployed
 * Let locally installed Android field-test builds open Tracker enrollment QR links directly by publishing their signing certificate alongside the Play and direct-release certificates.
 

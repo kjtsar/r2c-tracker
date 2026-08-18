@@ -2013,6 +2013,8 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         authorization_page = self.client.get("/ncssar/admin")
         self.assertIn("R2C tablet authorizations", authorization_page.text)
         self.assertIn("Android field tablet", authorization_page.text)
+        self.assertIn(redeemed.json()["credential"]["id"][:8], authorization_page.text)
+        self.assertIn("Tracker compatibility 148", authorization_page.text)
         self.assertIn("Extend all renewable authorizations", authorization_page.text)
 
         async def set_device_credential_expiry(expires_at):
@@ -3325,6 +3327,98 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         )
         self.assertEqual(303, protected.status_code)
         self.assertEqual("/ncssar/login", protected.headers["location"])
+
+    def test_device_reauthentication_preserves_login_return_and_reopens_app(self):
+        organization = asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Primary Administrator",
+                admin_email="admin@ncssar.example",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        owner = asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+            )
+        )
+        campaign = asyncio.run(
+            self.store.create_enrollment_campaign(
+                organization_id=organization.id,
+                label="Reauthentication test",
+                created_by_user_id=owner.id,
+                expires_in_hours=24,
+                max_redemptions=1,
+            )
+        )
+        device = asyncio.run(
+            self.store.issue_device_credential(
+                campaign_id=campaign.id,
+                organization_id=organization.id,
+                device_name="S11U",
+                platform="android",
+                functionality_release=148,
+            )
+        )
+        blocked = asyncio.run(
+            self.store.require_device_reauthentication(
+                credential_id=device.id,
+                organization_id=organization.id,
+                actor_id=owner.id,
+            )
+        )
+        reauthentication_url = self.tokens.device_reauthentication_url(
+            credential_id=blocked.id,
+            organization_id=blocked.organization_id,
+            designator=organization.designator,
+            requested_at=blocked.reauth_requested_at.isoformat(),
+        )
+        reauthentication_path = (
+            urlparse(reauthentication_url).path
+            + "?"
+            + urlparse(reauthentication_url).query
+        )
+
+        with patch.object(
+            main,
+            "google_oidc_client",
+            FakeGoogleOidcClient(organization.primary_admin_email),
+        ):
+            first_visit = self.client.get(
+                reauthentication_path,
+                follow_redirects=False,
+            )
+            self.assertEqual(303, first_visit.status_code)
+            self.assertIn("/ncssar/google/start?next=", first_visit.headers["location"])
+            self.assertIn("device-reauthenticate", first_visit.headers["location"])
+
+            google_start = self.client.get(
+                first_visit.headers["location"],
+                follow_redirects=False,
+            )
+            self.assertEqual(303, google_start.status_code)
+            callback = self.client.get(
+                "/google/callback?code=test-code&state=organization-state",
+                follow_redirects=False,
+            )
+            self.assertEqual(303, callback.status_code)
+            self.assertEqual(reauthentication_path, callback.headers["location"])
+
+            completed = self.client.get(reauthentication_path)
+
+        self.assertEqual(200, completed.status_code)
+        self.assertIn("Access restored", completed.text)
+        self.assertIn('data-r2c-reauth-complete="r2creauth://complete"', completed.text)
+        self.assertIn('/static/device_reauthenticate.js', completed.text)
+        restored = asyncio.run(
+            self.store.authenticate_device_token(device.token)
+        )
+        self.assertIsNotNone(restored)
 
     def test_matching_google_email_activates_pending_member(self):
         organization = asyncio.run(

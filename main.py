@@ -8249,6 +8249,11 @@ async def organization_device_reauthenticate(
         f"/{organization.designator.lower()}/google/start?"
         + urlencode({"next": next_path})
     )
+    if user is None and attempts == 0:
+        return RedirectResponse(
+            url=google_start_url,
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
     return templates.TemplateResponse(
         request=request,
         name="device_reauthenticate.html",

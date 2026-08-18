@@ -6,7 +6,10 @@
   {% if completed %}
   <p><strong>Access restored.</strong> {{ authorized_email }} is authorized to operate RID2Caltopo devices for {{ organization.legal_name }}.</p>
   <p>The device configuration was preserved.</p>
-  <p><a class="primary-button" href="r2creauth://complete">Return to RID2Caltopo</a></p>
+  <p>Returning to RID2Caltopo automatically.</p>
+  <p><a class="primary-button" href="r2creauth://complete"
+        data-r2c-reauth-complete="r2creauth://complete">Return to RID2Caltopo</a></p>
+  <script src="/static/device_reauthenticate.js" defer></script>
   {% else %}
   <p>This device is temporarily blocked from Tracker. RID2Caltopo remains usable offline while you verify an authorized account. Independently supplied CalTopo credentials remain available; credentials issued through Tracker are disabled until access is restored.</p>
   {% if last_email %}

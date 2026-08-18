@@ -711,7 +711,10 @@
           <tbody>
           {% for credential in device_credentials %}
             <tr>
-              <td><strong>{{ credential.device_name }}</strong></td>
+              <td>
+                <strong>{{ credential.device_name }}</strong><br>
+                <small>Enrollment {{ credential.id[:8] }} · Tracker compatibility {{ credential.functionality_release }}</small>
+              </td>
               <td>{{ credential.platform|capitalize }}</td>
               <td>{{ credential.state }}</td>
               <td>{% if credential.last_used_at %}{{ credential.last_used_at.strftime("%d %b %Y %H:%M UTC") }}{% else %}Never{% endif %}</td>
