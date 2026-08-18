@@ -1,7 +1,7 @@
-v1.4.63:
+v1.4.63: deployed
 * Replace immediate device-configuration wiping with a recoverable reauthentication quarantine: preserve RID and CalTopo settings, let operators retry Google account selection, restore the existing credential for an authorized r2c_device user, and offer explicit erasure only after three unsuccessful identities.
 
-v1.4.62: superseded before deployment
+v1.4.62:
 * Superseded by v1.4.63 to record the normalized secret-scan baseline produced by release qualification.
 
 v1.4.61: deployed
