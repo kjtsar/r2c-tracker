@@ -1,4 +1,4 @@
-v1.4.65:
+v1.4.65: deployed
 * Clarify reauthentication quarantine: RID2Caltopo remains usable offline, independent CalTopo credentials survive, and Tracker-issued CalTopo credentials are disabled until an authorized user restores access.
 
 v1.4.64: deployed
