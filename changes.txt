@@ -1,7 +1,10 @@
-v1.4.58:
+v1.4.59:
 * Introduce tracker functionality release 148 independently of Android and Apple distribution build numbers while leaving minimum-version enforcement disabled during NCSSAR field verification.
 * Let organization administrators require a lost or misplaced RID2Caltopo device to reauthenticate, immediately block its tracker access, and instruct Android and Apple clients to clear managed RID-map, tracker, and CalTopo credentials.
 * Prepare unauthorized-user request email notifications with a direct link to the organization's administration page; closed enrollment remains disabled until its membership workflow is completed and verified.
+
+v1.4.58:
+* Superseded before deployment after release qualification normalized the tracked secret-scanner baseline.
 
 v1.4.57: deployed
 * Make tracker enrollment QR codes launch RID2Caltopo directly on Android and Apple, retain a browser fallback, and publish verified mobile-app association metadata.
