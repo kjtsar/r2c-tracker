@@ -1,4 +1,4 @@
-v1.4.70:
+v1.4.70: deployed
 * Let delegated enrollment administrators see and change the Closed or Open enrollment access mode alongside the QR controls they already manage.
 
 v1.4.69: deployed
