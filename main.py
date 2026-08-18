@@ -10417,7 +10417,6 @@ async def organization_update_settings(
         request: Request,
         designator: str,
         records_visibility: Annotated[str, Form()],
-        device_access_policy: Annotated[str, Form()],
         record_retention_days: Annotated[int, Form()],
         log_retention_days: Annotated[int, Form()],
         notification_email: Annotated[str, Form()],
@@ -10432,7 +10431,7 @@ async def organization_update_settings(
         await control_plane_store.update_settings(
             organization_id=organization.id,
             records_visibility=records_visibility,
-            device_access_policy=device_access_policy,
+            device_access_policy=organization.device_access_policy,
             record_retention_days=record_retention_days,
             log_retention_days=log_retention_days,
             notification_email=notification_email,
@@ -10443,6 +10442,34 @@ async def organization_update_settings(
         flash(request, str(exc), "warning")
     return RedirectResponse(
         url=f"/{organization.designator.lower()}/admin/configuration",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post("/{designator}/device-access-policy")
+async def organization_update_device_access_policy(
+        request: Request,
+        designator: str,
+        device_access_policy: Annotated[str, Form()],
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_admin", form_token)
+    organization, user = await require_organization_user(
+        request,
+        designator,
+        ("organization_owner",),
+    )
+    try:
+        await control_plane_store.update_device_access_policy(
+            organization_id=organization.id,
+            device_access_policy=device_access_policy,
+            actor_id=user.id,
+        )
+        mode = "Closed" if device_access_policy == "member_verified" else "Open"
+        flash(request, f"Enrollment access is now {mode}.", "success")
+    except ControlPlaneError as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(
+        url=f"/{organization.designator.lower()}/admin#enrollment-qr",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -10730,7 +10757,7 @@ async def organization_create_enrollment(
     except ControlPlaneError as exc:
         flash(request, str(exc), "warning")
     return RedirectResponse(
-        url=f"/{organization.designator.lower()}/admin/enrollments#enrollment-qr",
+        url=f"/{organization.designator.lower()}/admin#enrollment-qr",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -10754,7 +10781,7 @@ async def organization_revoke_enrollment(
     )
     flash(request, "Enrollment QR revoked.", "success")
     return RedirectResponse(
-        url=f"/{organization.designator.lower()}/admin/enrollments#enrollment-qr",
+        url=f"/{organization.designator.lower()}/admin#enrollment-qr",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -10785,7 +10812,7 @@ async def organization_renew_enrollment(
     except ControlPlaneError as exc:
         flash(request, str(exc), "warning")
     return RedirectResponse(
-        url=f"/{organization.designator.lower()}/admin/enrollments#enrollment-qr",
+        url=f"/{organization.designator.lower()}/admin#enrollment-qr",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 

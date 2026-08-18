@@ -1822,28 +1822,42 @@ class ControlPlaneStore:
             credential_rows = (await connection.execute(text(
                 "SELECT id, organization_id, installation_id, platform, device_name "
                 "FROM device_credentials "
-                "WHERE state IN ('active', 'expired') "
+                "WHERE state IN ('active', 'expired', 'reauth_required') "
                 "ORDER BY organization_id, created_at DESC"
             ))).mappings().all()
-            seen_devices = set()
+            seen_installations = set()
+            seen_named_devices = set()
+            seen_legacy_devices = set()
             duplicate_credential_ids = []
             for credential_row in credential_rows:
                 installation_id = (credential_row["installation_id"] or "").strip().lower()
-                device_key = (
+                installation_key = (
                     credential_row["organization_id"],
-                    f"installation:{installation_id}"
-                    if installation_id
-                    else (
-                        "legacy:"
-                        + (credential_row["platform"] or "").strip().lower()
-                        + ":"
-                        + (credential_row["device_name"] or "").strip().casefold()
-                    ),
+                    installation_id,
                 )
-                if device_key in seen_devices:
+                named_device_key = (
+                    credential_row["organization_id"],
+                    (credential_row["platform"] or "").strip().lower(),
+                    (credential_row["device_name"] or "").strip().casefold(),
+                )
+                is_duplicate = (
+                    installation_id
+                    and (
+                        installation_key in seen_installations
+                        or named_device_key in seen_legacy_devices
+                    )
+                ) or (
+                    not installation_id
+                    and named_device_key in seen_named_devices
+                )
+                if is_duplicate:
                     duplicate_credential_ids.append(credential_row["id"])
                 else:
-                    seen_devices.add(device_key)
+                    seen_named_devices.add(named_device_key)
+                    if installation_id:
+                        seen_installations.add(installation_key)
+                    else:
+                        seen_legacy_devices.add(named_device_key)
             if duplicate_credential_ids:
                 await connection.execute(
                     update(DeviceCredential)
@@ -4449,6 +4463,60 @@ class ControlPlaneStore:
             )
             await session.commit()
 
+    async def update_device_access_policy(
+        self,
+        *,
+        organization_id: str,
+        device_access_policy: str,
+        actor_id: str,
+        now: Optional[datetime] = None,
+    ) -> None:
+        if device_access_policy not in {"member_verified", "qr_managed"}:
+            raise ControlPlaneError("Invalid RID2Caltopo device access policy.")
+        updated_at = now or utc_now()
+        async with self.sessions() as session:
+            organization = await session.get(Organization, organization_id)
+            if organization is None:
+                raise ControlPlaneError("Organization not found.")
+            previous_policy = organization.device_access_policy
+            organization.device_access_policy = device_access_policy
+            organization.updated_at = updated_at
+            member_authentication_credential_ids = []
+            if device_access_policy == "member_verified":
+                member_authentication_credential_ids = list((await session.scalars(
+                    select(DeviceCredential.id).where(
+                        DeviceCredential.organization_id == organization_id,
+                        DeviceCredential.state == "active",
+                        DeviceCredential.authorized_user_id.is_(None),
+                    )
+                )).all())
+                if member_authentication_credential_ids:
+                    await session.execute(
+                        update(DeviceCredential)
+                        .where(DeviceCredential.id.in_(
+                            member_authentication_credential_ids
+                        ))
+                        .values(
+                            state="reauth_required",
+                            reauth_requested_at=updated_at,
+                        )
+                    )
+            session.add(ControlPlaneAuditEvent(
+                organization_id=organization_id,
+                actor_type="organization_user",
+                actor_id=actor_id,
+                event_type="organization.device_access_policy_updated",
+                details_json=json.dumps({
+                    "previous_device_access_policy": previous_policy,
+                    "device_access_policy": device_access_policy,
+                    "member_authentication_credential_ids": (
+                        member_authentication_credential_ids
+                    ),
+                }, sort_keys=True),
+                created_at=updated_at,
+            ))
+            await session.commit()
+
     async def append_ledger_entry(
         self,
         *,
@@ -5960,7 +6028,9 @@ class ControlPlaneStore:
             )
             superseded_conditions = [
                 DeviceCredential.organization_id == organization_id,
-                DeviceCredential.state.in_(("active", "expired")),
+                DeviceCredential.state.in_((
+                    "active", "expired", "reauth_required",
+                )),
             ]
             if clean_installation_id:
                 superseded_conditions.append(or_(

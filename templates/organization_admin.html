@@ -295,7 +295,7 @@
     {% endif %}
     {% if can_manage_users %}
     <a href="/{{ organization.designator|lower }}/admin/members"><strong>Members &amp; roles</strong><span>Invite people and manage delegated access</span></a>
-    <a href="/{{ organization.designator|lower }}/admin/enrollments"><strong>Enrollment authorizations</strong><span>Manage tablet access and enrollment QR history</span></a>
+    <a href="/{{ organization.designator|lower }}/admin/enrollments"><strong>Enrollment authorizations</strong><span>Manage tablets and lost-device reauthentication</span></a>
     {% endif %}
     {% if "organization_owner" in organization_user.roles %}
     <a href="/{{ organization.designator|lower }}/admin/audit"><strong>Audit trail</strong><span>Review organization administrative and operational events</span></a>
@@ -338,7 +338,12 @@
   {% elif can_manage_device_credentials and not renewable_device_credentials %}
   <div class="org-banner" role="alert">
     <strong>No renewable R2C tablet authorizations remain.</strong>
+    {% if admin_section == "dashboard" %}
     Create an enrollment QR below and scan it on each team tablet before an operation.
+    {% else %}
+    <a href="/{{ organization.designator|lower }}/admin#enrollment-qr">Create an enrollment QR on Administration home</a>
+    and scan it on each team tablet before an operation.
+    {% endif %}
   </div>
   {% endif %}
   {% endif %}
@@ -484,22 +489,6 @@
               Public
             </option>
           </select>
-        </label>
-        <label>
-          RID2Caltopo device access
-          <select name="device_access_policy">
-            <option value="member_verified" {% if organization.device_access_policy == "member_verified" %}selected{% endif %}>
-              Member verified
-            </option>
-            <option value="qr_managed" {% if organization.device_access_policy == "qr_managed" %}selected{% endif %}>
-              QR managed
-            </option>
-          </select>
-          <small>
-            Member verified requires an authorized member to sign in when a device
-            first enrolls and after an administrator reports it lost. QR managed
-            treats possession of the current QR as authorization.
-          </small>
         </label>
         <label>
           Notification email
@@ -813,9 +802,45 @@
     </section>
     {% endif %}
 
-    {% if admin_section in ["dashboard", "enrollments"] %}
+    {% if admin_section == "dashboard" %}
     <section class="org-panel wide" id="enrollment-qr">
-      <h2>Drone-team enrollment QR codes</h2>
+      <h2>Drone-team enrollment QR</h2>
+      <div class="org-banner" role="status">
+        <strong>Current enrollment access:</strong>
+        {% if organization.device_access_policy == "member_verified" %}
+        Closed — an authorized member must sign in on a newly enrolled device.
+        {% else %}
+        Open — anyone holding the current QR can enroll a device.
+        {% endif %}
+      </div>
+      {% if "organization_owner" in organization_user.roles %}
+      <form class="org-form" method="post"
+            action="/{{ organization.designator|lower }}/device-access-policy">
+        <input type="hidden" name="form_token" value="{{ csrf_token }}">
+        <fieldset>
+          <legend>Enrollment access mode</legend>
+          <label>
+            <input type="radio" name="device_access_policy" value="member_verified"
+                   {% if organization.device_access_policy == "member_verified" %}checked{% endif %}>
+            <strong>Closed — member verified</strong><br>
+            New devices require an authorized member's initial sign-in. Previously
+            approved devices remain authorized when the QR is replaced. If a device
+            is reported lost, its assigned member must sign in again after recovery.
+          </label>
+          <label>
+            <input type="radio" name="device_access_policy" value="qr_managed"
+                   {% if organization.device_access_policy == "qr_managed" %}checked{% endif %}>
+            <strong>Open — QR possession</strong><br>
+            Anyone with the current QR can enroll. Publish a replacement only when
+            the old QR may be compromised; replacement disconnects every enrolled
+            device until it scans the new QR.
+          </label>
+        </fieldset>
+        <div>
+          <button class="primary-button" type="submit">Save enrollment access mode</button>
+        </div>
+      </form>
+      {% endif %}
       <p>
         Each QR contains a signed organization locator and a revocable,
         expiring enrollment capability. It never embeds FAA credentials,
@@ -833,7 +858,7 @@
         disconnected and must scan the new QR before reconnecting.
         {% endif %}
       </p>
-      {% if can_manage_users and admin_section == "enrollments" %}
+      {% if can_manage_users %}
       <form class="org-form two-column" method="post"
             action="/{{ organization.designator|lower }}/enrollments">
         <input type="hidden" name="form_token" value="{{ csrf_token }}">
@@ -860,8 +885,7 @@
       {% endif %}
 
       <div class="campaign-grid">
-      {% set displayed_campaigns = active_enrollment_campaigns if admin_section == "dashboard" else enrollment_campaigns %}
-      {% for campaign in displayed_campaigns %}
+      {% for campaign in active_enrollment_campaigns %}
         <article class="campaign-card">
           <strong>{{ campaign.label }}</strong>
           <p>
@@ -893,7 +917,7 @@
           {% endif %}
         </article>
       {% else %}
-        <p>{% if admin_section == "dashboard" %}No active enrollment QR codes.{% else %}No enrollment campaigns have been created.{% endif %}</p>
+        <p>No active enrollment QR code.</p>
       {% endfor %}
       </div>
     </section>

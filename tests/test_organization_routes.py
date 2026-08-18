@@ -984,6 +984,10 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn('href="/ncssar/admin/audit"', admin_page.text)
         self.assertNotIn("Members &amp; delegated roles", admin_page.text)
         self.assertNotIn('id="device-authorizations"', admin_page.text)
+        self.assertIn("Drone-team enrollment QR", admin_page.text)
+        self.assertIn("Closed — member verified", admin_page.text)
+        self.assertIn('action="/ncssar/device-access-policy"', admin_page.text)
+        self.assertIn("Replace active enrollment QR", admin_page.text)
         configuration_page = self.client.get("/ncssar/admin/configuration")
         members_page = self.client.get("/ncssar/admin/members")
         enrollments_page = self.client.get("/ncssar/admin/enrollments")
@@ -991,15 +995,33 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn("RID2Caltopo organization configuration", configuration_page.text)
         self.assertIn("Members &amp; delegated roles", members_page.text)
         self.assertIn("R2C tablet authorizations", enrollments_page.text)
-        self.assertIn("Only one enrollment QR can be active", enrollments_page.text)
-        self.assertIn("New devices remain blocked until an active member", enrollments_page.text)
-        self.assertIn("Replace active enrollment QR", enrollments_page.text)
-        self.assertIn("RID2Caltopo device access", configuration_page.text)
-        self.assertIn("Member verified", configuration_page.text)
-        self.assertIn("QR managed", configuration_page.text)
+        self.assertNotIn("Drone-team enrollment QR", enrollments_page.text)
+        self.assertNotIn('id="enrollment-qr"', enrollments_page.text)
+        self.assertNotIn("RID2Caltopo device access", configuration_page.text)
         self.assertIn("Organization audit trail", audit_page.text)
         self.assertIn('class="local-datetime"', audit_page.text)
         self.assertNotIn("EXSAR", audit_page.text)
+        open_access = self.client.post(
+            "/ncssar/device-access-policy",
+            data={
+                "form_token": self.form_token(admin_page),
+                "device_access_policy": "qr_managed",
+            },
+            follow_redirects=True,
+        )
+        self.assertEqual(200, open_access.status_code)
+        self.assertIn("Enrollment access is now Open.", open_access.text)
+        self.assertIn("Open — anyone holding the current QR", open_access.text)
+        closed_access = self.client.post(
+            "/ncssar/device-access-policy",
+            data={
+                "form_token": self.form_token(open_access),
+                "device_access_policy": "member_verified",
+            },
+            follow_redirects=True,
+        )
+        self.assertEqual(200, closed_access.status_code)
+        self.assertIn("Enrollment access is now Closed.", closed_access.text)
         public_dashboard = self.client.get("/ncssar")
         self.assertIn("User: Primary Administrator", public_dashboard.text)
         authenticated_directory = self.client.get("/")

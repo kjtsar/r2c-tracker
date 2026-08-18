@@ -1244,13 +1244,9 @@ class ControlPlaneStoreTest(unittest.TestCase):
             "correct horse battery staple",
             self.now,
         ))
-        asyncio.run(self.store.update_settings(
+        asyncio.run(self.store.update_device_access_policy(
             organization_id=organization.id,
-            records_visibility=organization.records_visibility,
             device_access_policy="qr_managed",
-            record_retention_days=organization.record_retention_days,
-            log_retention_days=organization.log_retention_days,
-            notification_email=organization.notification_email,
             actor_id=owner.id,
             now=self.now,
         ))
@@ -1345,6 +1341,54 @@ class ControlPlaneStoreTest(unittest.TestCase):
         ))
         issued_event = asyncio.run(self.store.list_audit_events())[0]
         self.assertEqual([first.id], issued_event.details["superseded_credential_ids"])
+
+    def test_reenrollment_supersedes_pending_member_authentication(self):
+        organization = self.create_organization()
+        owner = asyncio.run(self.store.activate_owner(
+            organization.designator,
+            organization.primary_admin_email,
+            "correct horse battery staple",
+            self.now,
+        ))
+        campaign = asyncio.run(self.store.create_enrollment_campaign(
+            organization_id=organization.id,
+            label="Member verified replacement",
+            created_by_user_id=owner.id,
+            expires_in_hours=24,
+            max_redemptions=2,
+            now=self.now,
+        ))
+        pending = asyncio.run(self.store.issue_device_credential(
+            campaign_id=campaign.id,
+            organization_id=organization.id,
+            device_name="kjt S11U",
+            platform="android",
+            now=self.now,
+        ))
+        replacement = asyncio.run(self.store.issue_device_credential(
+            campaign_id=campaign.id,
+            organization_id=organization.id,
+            device_name="kjt S11U",
+            platform="android",
+            installation_id="11111111-2222-3333-4444-555555555555",
+            now=self.now + timedelta(minutes=1),
+        ))
+
+        self.assertEqual("reauth_required", replacement.state)
+        self.assertEqual("superseded", asyncio.run(
+            self.store.device_token_state(pending.token)
+        ))
+        credentials = asyncio.run(self.store.list_device_credentials(
+            organization.id, now=self.now + timedelta(minutes=2)
+        ))
+        self.assertEqual(1, len([
+            credential for credential in credentials
+            if credential.state in {"active", "expired", "reauth_required"}
+        ]))
+        issued_event = asyncio.run(self.store.list_audit_events())[0]
+        self.assertEqual(
+            [pending.id], issued_event.details["superseded_credential_ids"]
+        )
 
     def test_expired_enrollment_campaign_can_be_renewed_with_uses_remaining(self):
         organization = self.create_organization()
@@ -1518,6 +1562,102 @@ class ControlPlaneStoreTest(unittest.TestCase):
             "uq_enrollment_campaigns_one_active_per_organization",
             asyncio.run(enrollment_indexes()),
         )
+
+    def test_init_supersedes_older_pending_credential_for_same_installation(self):
+        organization = self.create_organization()
+        owner = asyncio.run(self.store.activate_owner(
+            organization.designator,
+            organization.primary_admin_email,
+            "correct horse battery staple",
+            self.now,
+        ))
+        campaign = asyncio.run(self.store.create_enrollment_campaign(
+            organization_id=organization.id,
+            label="Existing QR",
+            created_by_user_id=owner.id,
+            expires_in_hours=24,
+            max_redemptions=2,
+            now=self.now,
+        ))
+        pending = asyncio.run(self.store.issue_device_credential(
+            campaign_id=campaign.id,
+            organization_id=organization.id,
+            device_name="kjt S11U",
+            platform="android",
+            now=self.now,
+        ))
+
+        async def create_newer_active_duplicate():
+            async with self.store.engine.begin() as connection:
+                await connection.execute(DeviceCredential.__table__.insert().values(
+                    id="newer-active-device-credential",
+                    organization_id=organization.id,
+                    campaign_id=campaign.id,
+                    device_name="kjt S11U",
+                    platform="android",
+                    installation_id="11111111-2222-3333-4444-555555555555",
+                    authorized_user_id=owner.id,
+                    functionality_release=148,
+                    token_prefix="r2c_dev_newer",
+                    token_hash="a" * 64,
+                    state="active",
+                    created_at=self.now + timedelta(minutes=1),
+                    expires_at=self.now + timedelta(days=365),
+                ))
+
+        asyncio.run(create_newer_active_duplicate())
+        asyncio.run(self.store.init())
+
+        credentials = asyncio.run(self.store.list_device_credentials(
+            organization.id, now=self.now + timedelta(minutes=2)
+        ))
+        by_id = {credential.id: credential for credential in credentials}
+        self.assertEqual("superseded", by_id[pending.id].state)
+        self.assertEqual(
+            "active", by_id["newer-active-device-credential"].state
+        )
+
+    def test_init_preserves_same_name_with_distinct_installation_ids(self):
+        organization = self.create_organization()
+        owner = asyncio.run(self.store.activate_owner(
+            organization.designator,
+            organization.primary_admin_email,
+            "correct horse battery staple",
+            self.now,
+        ))
+        campaign = asyncio.run(self.store.create_enrollment_campaign(
+            organization_id=organization.id,
+            label="Shared device names",
+            created_by_user_id=owner.id,
+            expires_in_hours=24,
+            max_redemptions=2,
+            now=self.now,
+        ))
+        first = asyncio.run(self.store.issue_device_credential(
+            campaign_id=campaign.id,
+            organization_id=organization.id,
+            device_name="Team tablet",
+            platform="android",
+            installation_id="11111111-2222-3333-4444-555555555555",
+            now=self.now,
+        ))
+        second = asyncio.run(self.store.issue_device_credential(
+            campaign_id=campaign.id,
+            organization_id=organization.id,
+            device_name="Team tablet",
+            platform="android",
+            installation_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            now=self.now + timedelta(minutes=1),
+        ))
+
+        asyncio.run(self.store.init())
+
+        credentials = asyncio.run(self.store.list_device_credentials(
+            organization.id, now=self.now + timedelta(minutes=2)
+        ))
+        by_id = {credential.id: credential for credential in credentials}
+        self.assertEqual("reauth_required", by_id[first.id].state)
+        self.assertEqual("reauth_required", by_id[second.id].state)
 
     def test_video_streams_are_sorted_tenant_isolated_and_require_consent(self):
         organization = self.create_organization()

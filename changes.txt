@@ -1,3 +1,7 @@
+v1.4.69:
+* Keep only the newest authorization for each RID2Caltopo installation, including devices that re-enroll while an earlier credential is still awaiting member authentication, and clean up legacy blank-ID duplicates without merging distinct modern devices that share a name.
+* Put the single active Drone-team enrollment QR at the bottom of Administration home, remove the duplicate QR surface from Enrollment authorizations, and present explicit Closed member-verified and Open QR-possession access modes with their replacement consequences.
+
 v1.4.68: deployed
 * Reorganize organization administration into focused configuration, flight records, members and roles, enrollment authorization, and audit pages while keeping service status and the current enrollment QR on the landing page.
 * Display organization-administration timestamps in each operator's browser time zone, and show only the current authorization for each RID2Caltopo installation instead of duplicate device-name entries.
