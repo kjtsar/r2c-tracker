@@ -1,4 +1,4 @@
-v1.4.61:
+v1.4.61: deployed
 * Add the r2c_device member permission for RID2Caltopo operators and automatically include records_viewer whenever it is assigned; NCSSAR enrollment remains open during verification.
 
 v1.4.60:
