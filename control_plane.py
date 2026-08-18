@@ -64,6 +64,10 @@ ROLE_DESCRIPTIONS = {
     "records_viewer": (
         "View this organization's flight dashboard when its records are restricted."
     ),
+    "r2c_device": (
+        "Enroll and operate RID2Caltopo devices for this organization. This role "
+        "automatically includes flight-record viewing."
+    ),
     "video_requester": (
         "View advertised streams and request organization video; the pilot must "
         "still approve each request."
@@ -333,7 +337,10 @@ class OrganizationUser(Base):
         invalid = set(roles) - ROLE_NAMES
         if invalid:
             raise ValueError(f"Unknown organization roles: {sorted(invalid)}")
-        self.roles_json = json.dumps(sorted(set(roles)))
+        normalized_roles = set(roles)
+        if "r2c_device" in normalized_roles:
+            normalized_roles.add("records_viewer")
+        self.roles_json = json.dumps(sorted(normalized_roles))
 
 
 class OrganizationExternalIdentity(Base):

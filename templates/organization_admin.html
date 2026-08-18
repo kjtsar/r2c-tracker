@@ -640,7 +640,7 @@
             <input type="email" name="email" maxlength="320" required value="{{ member.email }}">
           </label>
           <div class="role-grid span-all">
-            {% for role in ["billing_admin", "config_admin", "user_admin", "records_admin", "records_viewer", "video_requester"] %}
+            {% for role in ["billing_admin", "config_admin", "user_admin", "r2c_device", "records_admin", "records_viewer", "video_requester"] %}
             <label><input type="checkbox" name="roles" value="{{ role }}"{% if role in member.roles %} checked{% endif %}> {{ role }} {{ role_help(role) }}</label>
             {% endfor %}
           </div>
@@ -683,7 +683,7 @@
           <input type="email" name="email" maxlength="320" required>
         </label>
         <div class="role-grid span-all">
-          {% for role in ["billing_admin", "config_admin", "user_admin", "records_admin", "records_viewer", "video_requester"] %}
+          {% for role in ["billing_admin", "config_admin", "user_admin", "r2c_device", "records_admin", "records_viewer", "video_requester"] %}
           <label><input type="checkbox" name="roles" value="{{ role }}"> {{ role }} {{ role_help(role) }}</label>
           {% endfor %}
         </div>

@@ -817,6 +817,24 @@ class ControlPlaneStoreTest(unittest.TestCase):
             [event.event_type for event in audit_events[:3]],
         )
 
+    def test_r2c_device_role_automatically_includes_records_viewer(self):
+        organization = self.create_organization()
+        owner = asyncio.run(self.store.activate_owner(
+            organization.designator,
+            organization.primary_admin_email,
+            "correct horse battery staple",
+            self.now,
+        ))
+        member = asyncio.run(self.store.add_user(
+            organization_id=organization.id,
+            display_name="Tablet operator",
+            email="operator@ncssar.example",
+            roles=("r2c_device",),
+            actor_id=owner.id,
+            now=self.now,
+        ))
+        self.assertEqual({"r2c_device", "records_viewer"}, set(member.roles))
+
     def test_archived_member_can_be_restored_without_losing_roles(self):
         organization = self.create_organization()
         owner = asyncio.run(
