@@ -1,5 +1,8 @@
-v1.4.62:
+v1.4.63:
 * Replace immediate device-configuration wiping with a recoverable reauthentication quarantine: preserve RID and CalTopo settings, let operators retry Google account selection, restore the existing credential for an authorized r2c_device user, and offer explicit erasure only after three unsuccessful identities.
+
+v1.4.62: superseded before deployment
+* Superseded by v1.4.63 to record the normalized secret-scan baseline produced by release qualification.
 
 v1.4.61: deployed
 * Add the r2c_device member permission for RID2Caltopo operators and automatically include records_viewer whenever it is assigned; NCSSAR enrollment remains open during verification.
