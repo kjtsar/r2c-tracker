@@ -1,4 +1,4 @@
-v1.4.57:
+v1.4.57: deployed
 * Make tracker enrollment QR codes launch RID2Caltopo directly on Android and Apple, retain a browser fallback, and publish verified mobile-app association metadata.
 
 v1.4.56: deployed
