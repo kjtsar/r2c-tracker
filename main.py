@@ -10749,8 +10749,9 @@ async def organization_require_device_reauthentication(
             request,
             (
                 f"{credential.device_name} is blocked until it reauthenticates. "
-                "Its managed RID map and credentials remain on the device while "
-                "an authorized user signs in."
+                "Offline RID2Caltopo operation and independent CalTopo credentials "
+                "remain available; Tracker-issued CalTopo credentials are disabled "
+                "while an authorized user signs in."
             ),
             "success",
         )
