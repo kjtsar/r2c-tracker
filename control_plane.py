@@ -748,6 +748,10 @@ class DeviceCredential(Base):
     )
     device_name: Mapped[str] = mapped_column(String(160), nullable=False)
     platform: Mapped[str] = mapped_column(String(24), nullable=False)
+    authorized_user_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("organization_users.id"), index=True, nullable=True
+    )
+    functionality_release: Mapped[int] = mapped_column(Integer, default=0)
     token_prefix: Mapped[str] = mapped_column(String(20), nullable=False)
     token_hash: Mapped[str] = mapped_column(
         String(64), unique=True, index=True, nullable=False
@@ -758,6 +762,9 @@ class DeviceCredential(Base):
     )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     last_used_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True)
+    )
+    reauth_requested_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True)
     )
 
@@ -1195,6 +1202,7 @@ class DeviceCredentialRecord:
     device_name: str
     platform: str
     expires_at: datetime
+    functionality_release: int = 0
 
 
 @dataclass(frozen=True)
@@ -1203,10 +1211,13 @@ class DeviceCredentialAdminRecord:
     organization_id: str
     device_name: str
     platform: str
+    authorized_user_id: Optional[str]
+    functionality_release: int
     state: str
     created_at: datetime
     expires_at: datetime
     last_used_at: Optional[datetime]
+    reauth_requested_at: Optional[datetime]
 
 
 @dataclass(frozen=True)
@@ -1671,6 +1682,39 @@ class ControlPlaneStore:
                     "ALTER TABLE enrollment_campaigns "
                     "ADD COLUMN token_generation VARCHAR(36) DEFAULT '' NOT NULL"
                 ))
+            device_credential_columns = await connection.run_sync(
+                lambda sync_connection: {
+                    item["name"]
+                    for item in inspect(sync_connection).get_columns(
+                        "device_credentials"
+                    )
+                }
+            )
+            if "authorized_user_id" not in device_credential_columns:
+                await connection.execute(text(
+                    "ALTER TABLE device_credentials "
+                    "ADD COLUMN authorized_user_id VARCHAR(36)"
+                ))
+            if "functionality_release" not in device_credential_columns:
+                await connection.execute(text(
+                    "ALTER TABLE device_credentials "
+                    "ADD COLUMN functionality_release INTEGER DEFAULT 0 NOT NULL"
+                ))
+            if "reauth_requested_at" not in device_credential_columns:
+                timestamp_type = (
+                    "TIMESTAMP WITH TIME ZONE"
+                    if self.engine.dialect.name == "postgresql"
+                    else "DATETIME"
+                )
+                await connection.execute(text(
+                    "ALTER TABLE device_credentials "
+                    f"ADD COLUMN reauth_requested_at {timestamp_type}"
+                ))
+            await connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS "
+                "idx_device_credentials_authorized_user_id "
+                "ON device_credentials (authorized_user_id)"
+            ))
             await connection.execute(text(
                 "CREATE INDEX IF NOT EXISTS "
                 "idx_control_plane_audit_events_created_at "
@@ -5566,6 +5610,8 @@ class ControlPlaneStore:
         organization_id: str,
         device_name: str,
         platform: str,
+        functionality_release: int = 0,
+        authorized_user_id: Optional[str] = None,
         now: Optional[datetime] = None,
     ) -> IssuedDeviceCredential:
         issued_at = now or utc_now()
@@ -5575,6 +5621,8 @@ class ControlPlaneStore:
             raise ControlPlaneError("Enter a device name.")
         if clean_platform not in {"android", "ios"}:
             raise ControlPlaneError("Device platform must be Android or iOS.")
+        if functionality_release < 0:
+            raise ControlPlaneError("Functionality release must not be negative.")
         token = "r2c_dev_" + secrets.token_urlsafe(32)
         expires_at = issued_at + timedelta(days=365)
         async with self.sessions() as session:
@@ -5599,12 +5647,24 @@ class ControlPlaneStore:
             organization = await session.get(Organization, organization_id)
             if organization is None:
                 raise ControlPlaneError("Organization not found.")
+            if authorized_user_id is not None:
+                authorized_user = await session.get(
+                    OrganizationUser, authorized_user_id
+                )
+                if (
+                    authorized_user is None
+                    or authorized_user.organization_id != organization_id
+                    or authorized_user.state != "active"
+                ):
+                    raise ControlPlaneError("Authorized R2C user is invalid.")
             credential = DeviceCredential(
                 id=new_id(),
                 organization_id=organization_id,
                 campaign_id=campaign_id,
                 device_name=clean_name,
                 platform=clean_platform,
+                authorized_user_id=authorized_user_id,
+                functionality_release=functionality_release,
                 token_prefix=token[:16],
                 token_hash=device_token_hash(token),
                 state="active",
@@ -5626,6 +5686,8 @@ class ControlPlaneStore:
                             "campaign_id": campaign_id,
                             "platform": clean_platform,
                             "device_name": clean_name,
+                            "authorized_user_id": authorized_user_id,
+                            "functionality_release": functionality_release,
                         }
                     ),
                     created_at=issued_at,
@@ -5680,7 +5742,57 @@ class ControlPlaneStore:
                 designator=designator,
                 device_name=credential.device_name,
                 platform=credential.platform,
+                functionality_release=credential.functionality_release,
                 expires_at=expires_at,
+            )
+
+    async def device_token_state(self, token: str) -> Optional[str]:
+        """Return a recognized credential state without authenticating it."""
+        if not token.startswith("r2c_dev_") or len(token) < 40:
+            return None
+        async with self.sessions() as session:
+            return await session.scalar(
+                select(DeviceCredential.state).where(
+                    DeviceCredential.token_hash == device_token_hash(token)
+                )
+            )
+
+    async def require_device_reauthentication(
+        self,
+        *,
+        credential_id: str,
+        organization_id: str,
+        actor_id: str,
+        now: Optional[datetime] = None,
+    ) -> DeviceCredentialAdminRecord:
+        requested_at = as_utc(now or utc_now())
+        async with self.sessions() as session:
+            credential = await session.get(DeviceCredential, credential_id)
+            if credential is None or credential.organization_id != organization_id:
+                raise ControlPlaneError("Device credential not found.")
+            user = await session.get(OrganizationUser, actor_id)
+            if user is None or user.organization_id != organization_id:
+                raise ControlPlaneError("Device credential administrator is invalid.")
+            credential.state = "reauth_required"
+            credential.reauth_requested_at = requested_at
+            session.add(ControlPlaneAuditEvent(
+                organization_id=organization_id,
+                actor_type="organization_user",
+                actor_id=actor_id,
+                event_type="device.reauthentication_required",
+                details_json=json.dumps({
+                    "credential_id": credential.id,
+                    "device_name": credential.device_name,
+                    "message": (
+                        f"Administrator required {credential.device_name} "
+                        "to reauthenticate before restoring access."
+                    ),
+                }, sort_keys=True),
+                created_at=requested_at,
+            ))
+            await session.commit()
+            return self._device_credential_admin_record(
+                credential, requested_at
             )
 
     async def list_device_credentials(
@@ -5720,6 +5832,10 @@ class ControlPlaneStore:
                 raise ControlPlaneError("Device credential not found.")
             if credential.state == "revoked":
                 raise ControlPlaneError("A revoked device credential cannot be extended.")
+            if credential.state == "reauth_required":
+                raise ControlPlaneError(
+                    "This device must complete reauthentication before its credential can be extended."
+                )
             user = await session.get(OrganizationUser, actor_id)
             if user is None or user.organization_id != organization_id:
                 raise ControlPlaneError("Device credential administrator is invalid.")
@@ -5764,7 +5880,7 @@ class ControlPlaneStore:
                     select(DeviceCredential)
                     .where(
                         DeviceCredential.organization_id == organization_id,
-                        DeviceCredential.state != "revoked",
+                        DeviceCredential.state.not_in(("revoked", "reauth_required")),
                     )
                     .with_for_update()
                 )
@@ -8174,10 +8290,13 @@ class ControlPlaneStore:
             organization_id=credential.organization_id,
             device_name=credential.device_name,
             platform=credential.platform,
+            authorized_user_id=credential.authorized_user_id,
+            functionality_release=credential.functionality_release,
             state=state,
             created_at=as_utc(credential.created_at),
             expires_at=expires_at,
             last_used_at=as_utc(credential.last_used_at),
+            reauth_requested_at=as_utc(credential.reauth_requested_at),
         )
 
     @staticmethod

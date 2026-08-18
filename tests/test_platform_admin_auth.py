@@ -340,6 +340,35 @@ class PlatformAdminAuthHelpersTest(unittest.TestCase):
         self.assertNotIn("administrator", content.lower())
 
     @patch("platform_admin_auth.smtplib.SMTP")
+    def test_user_access_request_email_links_directly_to_org_admin(self, smtp):
+        sender = SmtpPlatformAdminEmailSender(
+            host="smtp.example.org",
+            port=587,
+            username="tracker@example.org",
+            password="secret manager value",
+            from_address="tracker@example.org",
+        )
+
+        sender.send_organization_user_access_request(
+            recipient="admin@ncssar.example",
+            organization_name="Nevada County SAR",
+            designator="NCSSAR",
+            requester_email="pilot@example.org",
+            requested_access="RID2Caltopo device",
+            administration_url="https://r2c-tracker.com/ncssar/admin#access-requests",
+        )
+
+        message = smtp.return_value.__enter__.return_value.send_message.call_args.args[0]
+        content = message.get_content()
+        self.assertIn("pilot@example.org", message["Subject"])
+        self.assertIn("RID2Caltopo device access", content)
+        self.assertIn(
+            "https://r2c-tracker.com/ncssar/admin#access-requests",
+            content,
+        )
+        self.assertIn("does not grant access automatically", content)
+
+    @patch("platform_admin_auth.smtplib.SMTP")
     def test_active_organization_access_email_points_to_google_login(self, smtp):
         sender = SmtpPlatformAdminEmailSender(
             host="smtp.example.org",

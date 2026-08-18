@@ -1974,12 +1974,25 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn("r2cenroll://open?url=", enrollment_landing.text)
         self.assertIn("%2Fncssar%2Fenroll%3Ftoken%3D", enrollment_landing.text)
         with patch.object(main, "DEVICE_CREDENTIAL_ISSUANCE_ENABLED", True):
+            with patch.object(main, "R2C_MIN_TRACKER_FUNCTIONALITY_RELEASE", 148):
+                outdated = self.client.post(
+                    "/api/v1/device-enrollment/redeem",
+                    json={
+                        "token": enrollment_token,
+                        "device_name": "Outdated tablet",
+                        "platform": "android",
+                        "functionality_release": 147,
+                    },
+                )
+            self.assertEqual(426, outdated.status_code)
+            self.assertEqual("upgrade_required", outdated.json()["detail"]["code"])
             redeemed = self.client.post(
                 "/api/v1/device-enrollment/redeem",
                 json={
                     "token": enrollment_token,
                     "device_name": "Android field tablet",
                     "platform": "android",
+                    "functionality_release": 148,
                 },
             )
         self.assertEqual(200, redeemed.status_code)

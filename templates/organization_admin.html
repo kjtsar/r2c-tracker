@@ -717,7 +717,15 @@
               <td>{% if credential.last_used_at %}{{ credential.last_used_at.strftime("%d %b %Y %H:%M UTC") }}{% else %}Never{% endif %}</td>
               <td>{{ credential.expires_at.strftime("%d %b %Y %H:%M UTC") }}</td>
               <td>
-                {% if credential.state != "revoked" %}
+                {% if credential.state == "active" or credential.state == "expired" %}
+                <form method="post"
+                      action="/{{ organization.designator|lower }}/device-credentials/{{ credential.id }}/require-reauthentication">
+                  <input type="hidden" name="form_token" value="{{ csrf_token }}">
+                  <button class="danger-button" type="submit">Require reauthentication</button>
+                </form>
+                {% elif credential.state == "reauth_required" %}
+                Blocked pending reauthentication
+                {% elif credential.state != "revoked" %}
                 <form method="post"
                       action="/{{ organization.designator|lower }}/device-credentials/{{ credential.id }}/extend">
                   <input type="hidden" name="form_token" value="{{ csrf_token }}">

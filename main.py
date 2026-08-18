@@ -29,7 +29,7 @@ from timezonefinder import TimezoneFinder
 from typing import Optional, Annotated, Literal
 from contextlib import asynccontextmanager
 
-from fastapi import Security, Depends, FastAPI, Request, HTTPException, Query, Form
+from fastapi import Security, Depends, FastAPI, Request, HTTPException, Query, Form, Header
 from fastapi import status, Response, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi import BackgroundTasks
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -259,6 +259,7 @@ class DeviceEnrollmentRedeemRequest(BaseModel):
     token: str = Field(min_length=24, max_length=4096)
     device_name: str = Field(min_length=1, max_length=160)
     platform: Literal["android", "ios"]
+    functionality_release: int = Field(default=0, ge=0, le=1_000_000)
 
 
 class BrowserVideoPreflightOffer(BaseModel):
@@ -610,6 +611,13 @@ R2C_IDLE_PARK_SEC = int(os.environ.get("R2C_IDLE_PARK_SEC", "120"))
 R2C_RECOMMENDED_APP_VERSION_CODE = int(os.environ.get("R2C_RECOMMENDED_APP_VERSION_CODE", "0") or "0")
 R2C_ORGANIZATION_CONFIG_MIN_APP_BUILD = int(
     os.environ.get("R2C_ORGANIZATION_CONFIG_MIN_APP_BUILD", "134") or "134"
+)
+R2C_TRACKER_FUNCTIONALITY_RELEASE = 148
+R2C_MIN_TRACKER_FUNCTIONALITY_RELEASE = int(
+    os.environ.get(
+        "R2C_MIN_TRACKER_FUNCTIONALITY_RELEASE",
+        "0",
+    ) or "0"
 )
 R2C_UPDATE_URL = os.environ.get("R2C_UPDATE_URL", "").strip()
 R2C_RECOMMENDED_IOS_APP_BUILD_NUMBER = int(
@@ -2181,6 +2189,31 @@ class R2CCoordinationHub:
             reverse=True,
         )
         return matches
+
+    async def disconnect_device_credential(
+        self,
+        device_credential_id: str,
+        *,
+        reason: str,
+    ) -> None:
+        async with self._lock:
+            connections = list(
+                self._device_connections_locked(device_credential_id)
+            )
+        for connection in connections:
+            try:
+                await connection.websocket.send_json({
+                    "type": "reauthentication_required",
+                    "clearManagedConfiguration": True,
+                    "message": reason,
+                })
+                await connection.websocket.close(code=1008, reason=reason)
+            except Exception as exc:
+                logger.info(
+                    "Could not notify device %s before disconnect: %s",
+                    device_credential_id,
+                    exc,
+                )
 
     async def remote_video_control_enabled(
         self,
@@ -4701,10 +4734,43 @@ async def authenticate_tracker_session(
 
 async def get_api_key(
     header_value: str = Depends(api_key_header),
+    functionality_release: Annotated[
+        Optional[int], Header(alias="X-R2C-Functionality-Release")
+    ] = None,
 ) -> Optional[DeviceCredentialRecord]:
     authenticated, credential = await authenticate_tracker_session(header_value)
     if authenticated:
+        if R2C_MIN_TRACKER_FUNCTIONALITY_RELEASE > 0 and (
+            functionality_release is None
+            or functionality_release < R2C_MIN_TRACKER_FUNCTIONALITY_RELEASE
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_426_UPGRADE_REQUIRED,
+                detail={
+                    "code": "upgrade_required",
+                    "minimum_functionality_release": (
+                        R2C_MIN_TRACKER_FUNCTIONALITY_RELEASE
+                    ),
+                    "message": "Upgrade RID2Caltopo to restore Tracker access.",
+                },
+                headers={"Upgrade": "RID2Caltopo"},
+            )
         return credential
+    normalized = _normalize_tracker_token(header_value)
+    if control_plane_store is not None:
+        credential_state = await control_plane_store.device_token_state(normalized)
+        if credential_state == "reauth_required":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "code": "reauthentication_required",
+                    "clear_managed_configuration": True,
+                    "message": (
+                        "This device must reauthenticate before Tracker access "
+                        "can be restored."
+                    ),
+                },
+            )
     raise HTTPException(
         status_code=HTTP_403_FORBIDDEN,
         detail="Could not validate credentials",
@@ -8214,7 +8280,7 @@ async def organization_admin(request: Request, designator: str):
     )
     renewable_device_credentials = tuple(
         credential for credential in device_credentials
-        if credential.state != "revoked"
+        if credential.state not in {"revoked", "reauth_required"}
     )
     expiring_device_credentials = tuple(
         credential for credential in usable_device_credentials
@@ -10516,6 +10582,44 @@ async def organization_extend_device_credential(
     )
 
 
+@app.post("/{designator}/device-credentials/{credential_id}/require-reauthentication")
+async def organization_require_device_reauthentication(
+        request: Request,
+        designator: str,
+        credential_id: str,
+        form_token: Annotated[str, Form()]):
+    verify_csrf(request, "organization_admin", form_token)
+    organization, user = await require_organization_user(
+        request,
+        designator,
+        ("organization_owner", "user_admin"),
+    )
+    try:
+        credential = await control_plane_store.require_device_reauthentication(
+            credential_id=credential_id,
+            organization_id=organization.id,
+            actor_id=user.id,
+        )
+        await r2c_hub.disconnect_device_credential(
+            credential.id,
+            reason="Reauthentication required",
+        )
+        flash(
+            request,
+            (
+                f"{credential.device_name} is blocked until it reauthenticates. "
+                "Its managed RID map and credentials will be cleared on contact."
+            ),
+            "success",
+        )
+    except ControlPlaneError as exc:
+        flash(request, str(exc), "warning")
+    return RedirectResponse(
+        url=f"/{organization.designator.lower()}/admin#device-authorizations",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
 @app.post("/{designator}/device-credentials/extend")
 async def organization_extend_all_device_credentials(
         request: Request,
@@ -10692,6 +10796,19 @@ async def redeem_device_enrollment(payload: DeviceEnrollmentRedeemRequest):
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Device credential issuance is not enabled.",
         )
+    if (
+        R2C_MIN_TRACKER_FUNCTIONALITY_RELEASE > 0
+        and payload.functionality_release < R2C_MIN_TRACKER_FUNCTIONALITY_RELEASE
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_426_UPGRADE_REQUIRED,
+            detail={
+                "code": "upgrade_required",
+                "minimum_functionality_release": R2C_MIN_TRACKER_FUNCTIONALITY_RELEASE,
+                "message": "Upgrade RID2Caltopo before enrolling this device.",
+            },
+            headers={"Upgrade": "RID2Caltopo"},
+        )
     try:
         claims = control_plane_tokens.decode_enrollment(payload.token)
         organization = await control_plane_store.get_organization(
@@ -10716,6 +10833,7 @@ async def redeem_device_enrollment(payload: DeviceEnrollmentRedeemRequest):
             organization_id=organization.id,
             device_name=payload.device_name,
             platform=payload.platform,
+            functionality_release=payload.functionality_release,
         )
     except (
         ControlPlaneError,
@@ -11690,6 +11808,23 @@ async def serve_r2c_websocket(
         organization_designator: str):
     token = websocket.headers.get(API_KEY_NAME)
     authenticated, device_credential = await authenticate_tracker_session(token)
+    normalized_token = _normalize_tracker_token(token)
+    credential_state = (
+        await control_plane_store.device_token_state(normalized_token)
+        if not authenticated and control_plane_store is not None
+        else None
+    )
+    if credential_state == "reauth_required":
+        await websocket.accept()
+        await websocket.send_json({
+            "type": "reauthentication_required",
+            "clearManagedConfiguration": True,
+            "message": (
+                "This device must reauthenticate before Tracker access can be restored."
+            ),
+        })
+        await websocket.close(code=1008, reason="Reauthentication required")
+        return
     organization_mismatch = (
         device_credential is None
         or device_credential.designator.lower()
@@ -11725,6 +11860,23 @@ async def serve_r2c_websocket(
         while True:
             payload = json.loads(await websocket.receive_text())
             if isinstance(payload, dict):
+                if payload.get("type") == "hello":
+                    functionality_release = R2CCoordinationHub._parse_nonnegative_int(
+                        payload.get("trackerFunctionalityRelease")
+                    )
+                    if (
+                        R2C_MIN_TRACKER_FUNCTIONALITY_RELEASE > 0
+                        and functionality_release < R2C_MIN_TRACKER_FUNCTIONALITY_RELEASE
+                    ):
+                        await websocket.send_json({
+                            "type": "upgrade_required",
+                            "minimumFunctionalityRelease": (
+                                R2C_MIN_TRACKER_FUNCTIONALITY_RELEASE
+                            ),
+                            "message": "Upgrade RID2Caltopo to restore Tracker access.",
+                        })
+                        await websocket.close(code=1008, reason="Upgrade required")
+                        return
                 await r2c_hub.handle_message(websocket, payload)
     except WebSocketDisconnect as e:
         conn_info = await r2c_hub.get_connection_debug_info(websocket)

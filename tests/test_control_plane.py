@@ -1061,6 +1061,61 @@ class ControlPlaneStoreTest(unittest.TestCase):
                 )
             )
 
+    def test_admin_can_require_device_reauthentication(self):
+        organization = self.create_organization()
+        invitation = asyncio.run(self.store.get_invitation(
+            organization.designator, organization.primary_admin_email
+        ))
+        owner = asyncio.run(self.store.activate_owner(
+            organization.designator,
+            organization.primary_admin_email,
+            "correct horse battery staple",
+            self.now,
+            activation_nonce=invitation.activation_nonce,
+        ))
+        campaign = asyncio.run(self.store.create_enrollment_campaign(
+            organization_id=organization.id,
+            label="Field tablets",
+            created_by_user_id=owner.id,
+            expires_in_hours=24,
+            max_redemptions=1,
+            now=self.now,
+        ))
+        issued = asyncio.run(self.store.issue_device_credential(
+            campaign_id=campaign.id,
+            organization_id=organization.id,
+            device_name="Lost tablet",
+            platform="android",
+            functionality_release=148,
+            now=self.now,
+        ))
+
+        record = asyncio.run(self.store.require_device_reauthentication(
+            credential_id=issued.id,
+            organization_id=organization.id,
+            actor_id=owner.id,
+            now=self.now + timedelta(minutes=1),
+        ))
+
+        self.assertEqual("reauth_required", record.state)
+        self.assertEqual(148, record.functionality_release)
+        self.assertEqual("reauth_required", asyncio.run(
+            self.store.device_token_state(issued.token)
+        ))
+        self.assertIsNone(asyncio.run(
+            self.store.authenticate_device_token(issued.token)
+        ))
+        with self.assertRaisesRegex(ControlPlaneError, "must complete reauthentication"):
+            asyncio.run(self.store.extend_device_credential(
+                credential_id=issued.id,
+                organization_id=organization.id,
+                actor_id=owner.id,
+                now=self.now + timedelta(minutes=2),
+            ))
+        event = asyncio.run(self.store.list_audit_events())[0]
+        self.assertEqual("device.reauthentication_required", event.event_type)
+        self.assertIn("Lost tablet", event.details["message"])
+
     def test_expired_enrollment_campaign_can_be_renewed_with_uses_remaining(self):
         organization = self.create_organization()
         owner = asyncio.run(

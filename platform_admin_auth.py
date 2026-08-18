@@ -528,6 +528,30 @@ def _organization_access_message(
     return message
 
 
+def _organization_user_access_request_message(
+    from_address: str,
+    recipient: str,
+    organization_name: str,
+    designator: str,
+    requester_email: str,
+    requested_access: str,
+    administration_url: str,
+) -> EmailMessage:
+    message = EmailMessage()
+    message["Subject"] = f"{requester_email} requested {designator} R2C access"
+    message["From"] = from_address
+    message["To"] = recipient
+    message.set_content(
+        f"{requester_email} authenticated and requested {requested_access} "
+        f"access to {organization_name} ({designator}).\n\n"
+        "Review the request and update the authorized-user lists here:\n"
+        f"{administration_url}\n\n"
+        "The request does not grant access automatically. This notification "
+        "may be deduplicated when the same user retries."
+    )
+    return message
+
+
 def _organization_administrator_changed_message(
     from_address: str,
     recipient: str,
@@ -829,6 +853,18 @@ class GmailApiPlatformAdminEmailSender:
         )
         self._send(message, "Organization access email could not be sent.")
 
+    def send_organization_user_access_request(self, **kwargs) -> None:
+        message = _organization_user_access_request_message(
+            self.from_address,
+            kwargs["recipient"],
+            kwargs["organization_name"],
+            kwargs["designator"],
+            kwargs["requester_email"],
+            kwargs["requested_access"],
+            kwargs["administration_url"],
+        )
+        self._send(message, "Organization access-request email could not be sent.")
+
     def send_organization_administrator_changed(self, **kwargs) -> None:
         message = _organization_administrator_changed_message(
             self.from_address,
@@ -1114,6 +1150,38 @@ class SmtpPlatformAdminEmailSender:
         except Exception as exc:
             raise PlatformAdminAuthError(
                 "Organization access email could not be sent."
+            ) from exc
+
+    def send_organization_user_access_request(
+        self,
+        *,
+        recipient: str,
+        organization_name: str,
+        designator: str,
+        requester_email: str,
+        requested_access: str,
+        administration_url: str,
+    ) -> None:
+        if not self.is_configured:
+            raise PlatformAdminAuthError("Administrator email is not configured.")
+        message = _organization_user_access_request_message(
+            self.from_address,
+            recipient,
+            organization_name,
+            designator,
+            requester_email,
+            requested_access,
+            administration_url,
+        )
+        try:
+            with smtplib.SMTP(self.host, self.port, timeout=15) as smtp:
+                smtp.starttls(context=ssl.create_default_context())
+                if self.username:
+                    smtp.login(self.username, self.password)
+                smtp.send_message(message)
+        except Exception as exc:
+            raise PlatformAdminAuthError(
+                "Organization access-request email could not be sent."
             ) from exc
 
     def send_organization_administrator_changed(
