@@ -1,4 +1,9 @@
-v1.4.67:
+v1.4.68:
+* Reorganize organization administration into focused configuration, flight records, members and roles, enrollment authorization, and audit pages while keeping service status and the current enrollment QR on the landing page.
+* Display organization-administration timestamps in each operator's browser time zone, and show only the current authorization for each RID2Caltopo installation instead of duplicate device-name entries.
+* Allow only one active enrollment QR per organization, bind member-verified installations to an authenticated authorized user, require that same user after a device is reported lost, and make QR-managed replacement revoke prior device access with an explicit compromise warning.
+
+v1.4.67: deployed
 * Keep device reauthentication attached to its Google sign-in callback, return successful operators to RID2Caltopo automatically, and distinguish duplicate tablet enrollments in the administrator inventory.
 
 v1.4.66: deployed

@@ -259,6 +259,7 @@ class DeviceEnrollmentRedeemRequest(BaseModel):
     token: str = Field(min_length=24, max_length=4096)
     device_name: str = Field(min_length=1, max_length=160)
     platform: Literal["android", "ios"]
+    installation_id: str = Field(default="", max_length=128)
     functionality_release: int = Field(default=0, ge=0, le=1_000_000)
 
 
@@ -7822,6 +7823,8 @@ async def organization_login(
     request.session["organization_user_id"] = user.id
     request.session["organization_designator"] = organization.designator
     next_path = organization_safe_login_next(organization.designator, next)
+    if "/device-reauthenticate?token=" in next_path:
+        request.session["device_reauthentication_fresh_path"] = next_path
     return RedirectResponse(
         url=next_path or organization_landing_path(organization, user),
         status_code=status.HTTP_303_SEE_OTHER,
@@ -8161,6 +8164,8 @@ async def organization_google_callback(
     request.session["organization_user_id"] = user.id
     request.session["organization_designator"] = organization.designator
     request.session["organization_google_subject"] = google_identity.subject
+    if "/device-reauthenticate?token=" in next_path:
+        request.session["device_reauthentication_fresh_path"] = next_path
     if flow.get("activation_nonce"):
         flash(request, "Organization account activated.", "success")
     return RedirectResponse(
@@ -8205,6 +8210,16 @@ async def organization_device_reauthenticate(
             status_code=409,
             detail="This device is no longer awaiting reauthentication.",
         )
+    next_path = (
+        f"/{organization.designator.lower()}/device-reauthenticate?"
+        + urlencode({"token": token})
+    )
+    fresh_path = request.session.pop(
+        "device_reauthentication_fresh_path", ""
+    )
+    fresh_authentication = bool(fresh_path) and secrets.compare_digest(
+        str(fresh_path), next_path
+    )
     user_id = request.session.get("organization_user_id")
     session_designator = request.session.get("organization_designator")
     user = (
@@ -8213,13 +8228,21 @@ async def organization_device_reauthenticate(
         and session_designator == organization.designator
         else None
     )
+    if not fresh_authentication:
+        clear_organization_session(request)
+        user = None
     completed = False
     authorized_email = ""
     if (
-        user is not None
+        fresh_authentication
+        and user is not None
         and user.state == "active"
         and user.organization_id == organization.id
         and "r2c_device" in user.roles
+        and (
+            credential.authorized_user_id is None
+            or credential.authorized_user_id == user.id
+        )
     ):
         await control_plane_store.complete_device_reauthentication(
             credential_id=credential.id,
@@ -8231,7 +8254,7 @@ async def organization_device_reauthenticate(
         request.session.pop("device_reauthentication_failures", None)
         request.session.pop("device_reauthentication_last_email", None)
         request.session.pop("device_reauthentication_last_user_id", None)
-    elif user is not None and user.state == "active":
+    elif fresh_authentication and user is not None and user.state == "active":
         if request.session.get("device_reauthentication_last_user_id") != user.id:
             request.session["device_reauthentication_failures"] = min(
                 99,
@@ -8241,10 +8264,6 @@ async def organization_device_reauthenticate(
             request.session["device_reauthentication_last_email"] = user.email
         clear_organization_session(request)
     attempts = int(request.session.get("device_reauthentication_failures", 0))
-    next_path = (
-        f"/{organization.designator.lower()}/device-reauthenticate?"
-        + urlencode({"token": token})
-    )
     google_start_url = (
         f"/{organization.designator.lower()}/google/start?"
         + urlencode({"next": next_path})
@@ -8369,6 +8388,8 @@ async def organization_microsoft_callback(
     next_path = organization_safe_login_next(
         organization.designator, str(flow.get("next", ""))
     )
+    if "/device-reauthenticate?token=" in next_path:
+        request.session["device_reauthentication_fresh_path"] = next_path
     return RedirectResponse(
         url=next_path or organization_landing_path(organization, user),
         status_code=status.HTTP_303_SEE_OTHER,
@@ -8390,16 +8411,59 @@ async def organization_logout(
 
 @app.get("/{designator}/admin", response_class=HTMLResponse)
 async def organization_admin(request: Request, designator: str):
+    """Organization dashboard; require_organization_user is applied by the shared renderer."""
+    return await _organization_admin_page(request, designator, section="dashboard")
+
+
+@app.get("/{designator}/admin/configuration", response_class=HTMLResponse)
+async def organization_admin_configuration(request: Request, designator: str):
+    """Configuration page; require_organization_user is applied by the shared renderer."""
+    return await _organization_admin_page(request, designator, section="configuration")
+
+
+@app.get("/{designator}/admin/members", response_class=HTMLResponse)
+async def organization_admin_members(request: Request, designator: str):
+    """Member page; require_organization_user is applied by the shared renderer."""
+    return await _organization_admin_page(request, designator, section="members")
+
+
+@app.get("/{designator}/admin/enrollments", response_class=HTMLResponse)
+async def organization_admin_enrollments(request: Request, designator: str):
+    """Enrollment page; require_organization_user is applied by the shared renderer."""
+    return await _organization_admin_page(request, designator, section="enrollments")
+
+
+@app.get("/{designator}/admin/audit", response_class=HTMLResponse)
+async def organization_admin_audit(
+        request: Request,
+        designator: str,
+        page: int = Query(1, ge=1)):
+    """Audit page; require_organization_user is applied by the shared renderer."""
+    return await _organization_admin_page(
+        request, designator, section="audit", audit_page_number=page
+    )
+
+
+async def _organization_admin_page(
+        request: Request,
+        designator: str,
+        *,
+        section: str,
+        audit_page_number: int = 1):
+    section_roles = {
+        "dashboard": (
+            "organization_owner", "billing_admin", "config_admin",
+            "user_admin", "records_admin",
+        ),
+        "configuration": ("organization_owner", "config_admin"),
+        "members": ("organization_owner", "user_admin"),
+        "enrollments": ("organization_owner", "user_admin"),
+        "audit": ("organization_owner",),
+    }
     organization, user = await require_organization_user(
         request,
         designator,
-        required_roles=(
-            "organization_owner",
-            "billing_admin",
-            "config_admin",
-            "user_admin",
-            "records_admin",
-        ),
+        required_roles=section_roles[section],
         redirect_to_login=True,
     )
     invitation_url = request.session.pop("_organization_invitation_url", None)
@@ -8416,14 +8480,29 @@ async def organization_admin(request: Request, designator: str):
         if can_manage_device_credentials
         else ()
     )
+    current_device_credentials = []
+    current_device_keys = set()
+    for credential in device_credentials:
+        if credential.state in {"revoked", "superseded"}:
+            continue
+        device_key = (
+            f"installation:{credential.installation_id}"
+            if credential.installation_id
+            else f"legacy:{credential.platform}:{credential.device_name.strip().casefold()}"
+        )
+        if device_key in current_device_keys:
+            continue
+        current_device_keys.add(device_key)
+        current_device_credentials.append(credential)
+    current_device_credentials = tuple(current_device_credentials)
     credential_now = datetime.now(UTC)
     usable_device_credentials = tuple(
-        credential for credential in device_credentials
+        credential for credential in current_device_credentials
         if credential.state == "active" and credential.expires_at >= credential_now
     )
     renewable_device_credentials = tuple(
-        credential for credential in device_credentials
-        if credential.state not in {"revoked", "reauth_required"}
+        credential for credential in current_device_credentials
+        if credential.state in {"active", "expired"}
     )
     expiring_device_credentials = tuple(
         credential for credential in usable_device_credentials
@@ -8479,6 +8558,13 @@ async def organization_admin(request: Request, designator: str):
             allocation_inputs if billing_snapshot.source_status == "ready" else {},
         )
         organization_cost = allocated_costs.get(organization.id)
+    audit_page = None
+    if section == "audit":
+        audit_page = await control_plane_store.search_audit_events(
+            page=audit_page_number,
+            page_size=AUDIT_EVENT_PAGE_SIZE,
+            organization_designator=organization.designator,
+        )
     return templates.TemplateResponse(
         request=request,
         name="organization_admin.html",
@@ -8486,12 +8572,18 @@ async def organization_admin(request: Request, designator: str):
             "request": request,
             "enable_live_refresh": False,
             "include_leaflet": False,
-            "include_datetime_script": False,
+            "include_datetime_script": True,
+            "admin_section": section,
             "organization": organization,
             "organization_user": user,
             "organization_users": users,
+            "organization_user_by_id": {member.id: member for member in users},
             "enrollment_campaigns": campaigns,
+            "active_enrollment_campaigns": tuple(
+                campaign for campaign in campaigns if campaign.state == "active"
+            ),
             "device_credentials": device_credentials,
+            "current_device_credentials": current_device_credentials,
             "usable_device_credentials": usable_device_credentials,
             "renewable_device_credentials": renewable_device_credentials,
             "expiring_device_credentials": expiring_device_credentials,
@@ -8514,6 +8606,8 @@ async def organization_admin(request: Request, designator: str):
             "config_releases": config_releases,
             "current_config_version_ms": current_config_version_ms,
             "config_proposal_wait_error": config_proposal_wait_error,
+            "audit_page": audit_page,
+            "audit_retention_days": AUDIT_EVENT_RETENTION_DAYS,
             "organization_config_min_app_build": (
                 R2C_ORGANIZATION_CONFIG_MIN_APP_BUILD
             ),
@@ -8543,11 +8637,11 @@ async def request_organization_config(
     )
     if selected is None:
         flash(request, "That RID2Caltopo device is no longer connected.", "warning")
-        return RedirectResponse(f"/{organization.designator.lower()}/admin#organization-config", status_code=303)
+        return RedirectResponse(f"/{organization.designator.lower()}/admin/configuration#organization-config", status_code=303)
     if not selected.supports_organization_config:
         flash(request, organization_config_upgrade_message(selected), "warning")
         return RedirectResponse(
-            f"/{organization.designator.lower()}/admin#organization-config",
+            f"/{organization.designator.lower()}/admin/configuration#organization-config",
             status_code=303,
         )
     try:
@@ -8569,7 +8663,7 @@ async def request_organization_config(
         flash(request, f"Requested configuration from {selected.device_name}.", "success")
     except ControlPlaneError as exc:
         flash(request, str(exc), "warning")
-    return RedirectResponse(f"/{organization.designator.lower()}/admin#organization-config", status_code=303)
+    return RedirectResponse(f"/{organization.designator.lower()}/admin/configuration#organization-config", status_code=303)
 
 
 @app.post("/{designator}/admin/organization-config/approve")
@@ -8593,7 +8687,7 @@ async def approve_organization_config(
         flash(request, f"Published organization configuration {release.version_ms}.", "success")
     except ControlPlaneError as exc:
         flash(request, str(exc), "warning")
-    return RedirectResponse(f"/{organization.designator.lower()}/admin#organization-config", status_code=303)
+    return RedirectResponse(f"/{organization.designator.lower()}/admin/configuration#organization-config", status_code=303)
 
 
 @app.post("/{designator}/admin/organization-config/reject")
@@ -8614,7 +8708,7 @@ async def reject_organization_config(
         flash(request, "Discarded the proposed organization configuration.", "success")
     except ControlPlaneError as exc:
         flash(request, str(exc), "warning")
-    return RedirectResponse(f"/{organization.designator.lower()}/admin#organization-config", status_code=303)
+    return RedirectResponse(f"/{organization.designator.lower()}/admin/configuration#organization-config", status_code=303)
 
 
 @app.post("/{designator}/admin/organization-config/restore")
@@ -8638,7 +8732,7 @@ async def restore_organization_config(
         flash(request, f"Restored organization configuration {version_ms}.", "success")
     except ControlPlaneError as exc:
         flash(request, str(exc), "warning")
-    return RedirectResponse(f"/{organization.designator.lower()}/admin#organization-config", status_code=303)
+    return RedirectResponse(f"/{organization.designator.lower()}/admin/configuration#organization-config", status_code=303)
 
 
 async def require_organization_records_admin(
@@ -10323,6 +10417,7 @@ async def organization_update_settings(
         request: Request,
         designator: str,
         records_visibility: Annotated[str, Form()],
+        device_access_policy: Annotated[str, Form()],
         record_retention_days: Annotated[int, Form()],
         log_retention_days: Annotated[int, Form()],
         notification_email: Annotated[str, Form()],
@@ -10337,6 +10432,7 @@ async def organization_update_settings(
         await control_plane_store.update_settings(
             organization_id=organization.id,
             records_visibility=records_visibility,
+            device_access_policy=device_access_policy,
             record_retention_days=record_retention_days,
             log_retention_days=log_retention_days,
             notification_email=notification_email,
@@ -10346,7 +10442,7 @@ async def organization_update_settings(
     except ControlPlaneError as exc:
         flash(request, str(exc), "warning")
     return RedirectResponse(
-        url=f"/{organization.designator.lower()}/admin",
+        url=f"/{organization.designator.lower()}/admin/configuration",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -10423,7 +10519,7 @@ async def organization_add_member(
     ) as exc:
         flash(request, str(exc), "warning")
     return RedirectResponse(
-        url=f"/{organization.designator.lower()}/admin#members",
+        url=f"/{organization.designator.lower()}/admin/members#members",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -10466,7 +10562,7 @@ async def organization_update_member(
     except (ControlPlaneError, InvalidOrganizationError, ValueError) as exc:
         flash(request, str(exc), "warning")
     return RedirectResponse(
-        url=f"/{organization.designator.lower()}/admin#members",
+        url=f"/{organization.designator.lower()}/admin/members#members",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -10506,7 +10602,7 @@ async def organization_delete_member(
     except ControlPlaneError as exc:
         flash(request, str(exc), "warning")
     return RedirectResponse(
-        url=f"/{organization.designator.lower()}/admin#members",
+        url=f"/{organization.designator.lower()}/admin/members#members",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -10553,7 +10649,7 @@ async def organization_restore_member(
     ) as exc:
         flash(request, str(exc), "warning")
     return RedirectResponse(
-        url=f"/{organization.designator.lower()}/admin#members",
+        url=f"/{organization.designator.lower()}/admin/members#members",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -10603,7 +10699,7 @@ async def organization_send_member_invitation(
     ) as exc:
         flash(request, str(exc), "warning")
     return RedirectResponse(
-        url=f"/{organization.designator.lower()}/admin#members",
+        url=f"/{organization.designator.lower()}/admin/members#members",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -10634,7 +10730,7 @@ async def organization_create_enrollment(
     except ControlPlaneError as exc:
         flash(request, str(exc), "warning")
     return RedirectResponse(
-        url=f"/{organization.designator.lower()}/admin",
+        url=f"/{organization.designator.lower()}/admin/enrollments#enrollment-qr",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -10658,7 +10754,7 @@ async def organization_revoke_enrollment(
     )
     flash(request, "Enrollment QR revoked.", "success")
     return RedirectResponse(
-        url=f"/{organization.designator.lower()}/admin",
+        url=f"/{organization.designator.lower()}/admin/enrollments#enrollment-qr",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -10689,7 +10785,7 @@ async def organization_renew_enrollment(
     except ControlPlaneError as exc:
         flash(request, str(exc), "warning")
     return RedirectResponse(
-        url=f"/{organization.designator.lower()}/admin#enrollment-qr",
+        url=f"/{organization.designator.lower()}/admin/enrollments#enrollment-qr",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -10720,7 +10816,7 @@ async def organization_extend_device_credential(
     except ControlPlaneError as exc:
         flash(request, str(exc), "warning")
     return RedirectResponse(
-        url=f"/{organization.designator.lower()}/admin#device-authorizations",
+        url=f"/{organization.designator.lower()}/admin/enrollments#device-authorizations",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -10767,7 +10863,7 @@ async def organization_require_device_reauthentication(
     except ControlPlaneError as exc:
         flash(request, str(exc), "warning")
     return RedirectResponse(
-        url=f"/{organization.designator.lower()}/admin#device-authorizations",
+        url=f"/{organization.designator.lower()}/admin/enrollments#device-authorizations",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -10796,7 +10892,7 @@ async def organization_extend_all_device_credentials(
     except ControlPlaneError as exc:
         flash(request, str(exc), "warning")
     return RedirectResponse(
-        url=f"/{organization.designator.lower()}/admin#device-authorizations",
+        url=f"/{organization.designator.lower()}/admin/enrollments#device-authorizations",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -10985,8 +11081,20 @@ async def redeem_device_enrollment(payload: DeviceEnrollmentRedeemRequest):
             organization_id=organization.id,
             device_name=payload.device_name,
             platform=payload.platform,
+            installation_id=payload.installation_id,
             functionality_release=payload.functionality_release,
         )
+        reauthentication_url = ""
+        if (
+            credential.state == "reauth_required"
+            and credential.reauth_requested_at is not None
+        ):
+            reauthentication_url = control_plane_tokens.device_reauthentication_url(
+                credential_id=credential.id,
+                organization_id=credential.organization_id,
+                designator=organization.designator,
+                requested_at=credential.reauth_requested_at.isoformat(),
+            )
     except (
         ControlPlaneError,
         EnrollmentTokenError,
@@ -11019,6 +11127,8 @@ async def redeem_device_enrollment(payload: DeviceEnrollmentRedeemRequest):
                     "id": credential.id,
                     "expires_at": credential.expires_at.isoformat(),
                     "revocable": True,
+                    "state": credential.state,
+                    "reauthentication_url": reauthentication_url,
                 },
             }
         ),

@@ -248,6 +248,9 @@ class Organization(Base):
     trial_starts_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     trial_ends_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     records_visibility: Mapped[str] = mapped_column(String(24), default="restricted")
+    device_access_policy: Mapped[str] = mapped_column(
+        String(32), default="member_verified", nullable=False
+    )
     record_retention_days: Mapped[int] = mapped_column(Integer, default=730)
     log_retention_days: Mapped[int] = mapped_column(Integer, default=30)
     notification_email: Mapped[str] = mapped_column(String(320), default="")
@@ -761,6 +764,9 @@ class DeviceCredential(Base):
     )
     device_name: Mapped[str] = mapped_column(String(160), nullable=False)
     platform: Mapped[str] = mapped_column(String(24), nullable=False)
+    installation_id: Mapped[str] = mapped_column(
+        String(128), default="", nullable=False, index=True
+    )
     authorized_user_id: Mapped[Optional[str]] = mapped_column(
         ForeignKey("organization_users.id"), index=True, nullable=True
     )
@@ -1014,6 +1020,7 @@ class OrganizationRecord:
     notification_email: str
     primary_admin_name: str
     primary_admin_email: str
+    device_access_policy: str = "member_verified"
     subscription_state: str = "extended_beta"
     credit_balance: Decimal = Decimal("0.00")
     primary_admin_postal_address: str = ""
@@ -1205,6 +1212,8 @@ class IssuedDeviceCredential:
     device_name: str
     platform: str
     expires_at: datetime
+    state: str = "active"
+    reauth_requested_at: Optional[datetime] = None
 
 
 @dataclass(frozen=True)
@@ -1216,6 +1225,7 @@ class DeviceCredentialRecord:
     platform: str
     expires_at: datetime
     functionality_release: int = 0
+    installation_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -1224,6 +1234,7 @@ class DeviceCredentialAdminRecord:
     organization_id: str
     device_name: str
     platform: str
+    installation_id: str
     authorized_user_id: Optional[str]
     functionality_release: int
     state: str
@@ -1627,6 +1638,12 @@ class ControlPlaneStore:
                         "ALTER TABLE organizations "
                         f"ADD COLUMN {column_name} VARCHAR(32) DEFAULT '' NOT NULL"
                     ))
+            if "device_access_policy" not in organization_columns:
+                await connection.execute(text(
+                    "ALTER TABLE organizations "
+                    "ADD COLUMN device_access_policy VARCHAR(32) "
+                    "DEFAULT 'member_verified' NOT NULL"
+                ))
             contact_columns = await connection.run_sync(
                 lambda sync_connection: {
                     item["name"]
@@ -1695,6 +1712,54 @@ class ControlPlaneStore:
                     "ALTER TABLE enrollment_campaigns "
                     "ADD COLUMN token_generation VARCHAR(36) DEFAULT '' NOT NULL"
                 ))
+            campaign_rows = (await connection.execute(text(
+                "SELECT id, organization_id "
+                "FROM enrollment_campaigns "
+                "WHERE state = 'active' "
+                "ORDER BY organization_id, created_at DESC, id DESC"
+            ))).mappings().all()
+            seen_campaign_organizations = set()
+            duplicate_campaign_ids = []
+            for campaign_row in campaign_rows:
+                organization_id = campaign_row["organization_id"]
+                if organization_id in seen_campaign_organizations:
+                    duplicate_campaign_ids.append(campaign_row["id"])
+                else:
+                    seen_campaign_organizations.add(organization_id)
+            if duplicate_campaign_ids:
+                await connection.execute(
+                    update(EnrollmentCampaign)
+                    .where(EnrollmentCampaign.id.in_(duplicate_campaign_ids))
+                    .values(state="superseded")
+                )
+                qr_managed_campaign_ids = (await connection.scalars(
+                    select(EnrollmentCampaign.id)
+                    .join(
+                        Organization,
+                        Organization.id == EnrollmentCampaign.organization_id,
+                    )
+                    .where(
+                        EnrollmentCampaign.id.in_(duplicate_campaign_ids),
+                        Organization.device_access_policy == "qr_managed",
+                    )
+                )).all()
+                if qr_managed_campaign_ids:
+                    await connection.execute(
+                        update(DeviceCredential)
+                        .where(
+                            DeviceCredential.campaign_id.in_(qr_managed_campaign_ids),
+                            DeviceCredential.state.in_((
+                                "active", "expired", "reauth_required",
+                            )),
+                        )
+                        .values(state="superseded")
+                    )
+            await connection.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "uq_enrollment_campaigns_one_active_per_organization "
+                "ON enrollment_campaigns (organization_id) "
+                "WHERE state = 'active'"
+            ))
             device_credential_columns = await connection.run_sync(
                 lambda sync_connection: {
                     item["name"]
@@ -1723,11 +1788,68 @@ class ControlPlaneStore:
                     "ALTER TABLE device_credentials "
                     f"ADD COLUMN reauth_requested_at {timestamp_type}"
                 ))
+            if "installation_id" not in device_credential_columns:
+                await connection.execute(text(
+                    "ALTER TABLE device_credentials "
+                    "ADD COLUMN installation_id VARCHAR(128) DEFAULT '' NOT NULL"
+                ))
+            await connection.execute(
+                update(DeviceCredential)
+                .where(
+                    DeviceCredential.state == "active",
+                    DeviceCredential.authorized_user_id.is_(None),
+                    DeviceCredential.organization_id.in_(
+                        select(Organization.id).where(
+                            Organization.device_access_policy == "member_verified"
+                        )
+                    ),
+                )
+                .values(
+                    state="reauth_required",
+                    reauth_requested_at=utc_now(),
+                )
+            )
             await connection.execute(text(
                 "CREATE INDEX IF NOT EXISTS "
                 "idx_device_credentials_authorized_user_id "
                 "ON device_credentials (authorized_user_id)"
             ))
+            await connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS "
+                "idx_device_credentials_installation_id "
+                "ON device_credentials (installation_id)"
+            ))
+            credential_rows = (await connection.execute(text(
+                "SELECT id, organization_id, installation_id, platform, device_name "
+                "FROM device_credentials "
+                "WHERE state IN ('active', 'expired') "
+                "ORDER BY organization_id, created_at DESC"
+            ))).mappings().all()
+            seen_devices = set()
+            duplicate_credential_ids = []
+            for credential_row in credential_rows:
+                installation_id = (credential_row["installation_id"] or "").strip().lower()
+                device_key = (
+                    credential_row["organization_id"],
+                    f"installation:{installation_id}"
+                    if installation_id
+                    else (
+                        "legacy:"
+                        + (credential_row["platform"] or "").strip().lower()
+                        + ":"
+                        + (credential_row["device_name"] or "").strip().casefold()
+                    ),
+                )
+                if device_key in seen_devices:
+                    duplicate_credential_ids.append(credential_row["id"])
+                else:
+                    seen_devices.add(device_key)
+            if duplicate_credential_ids:
+                await connection.execute(
+                    update(DeviceCredential)
+                    .where(DeviceCredential.id.in_(duplicate_credential_ids))
+                    .values(state="superseded")
+                )
             await connection.execute(text(
                 "CREATE INDEX IF NOT EXISTS "
                 "idx_control_plane_audit_events_created_at "
@@ -2556,6 +2678,7 @@ class ControlPlaneStore:
             billing_mode=organization.billing_mode,
             trial_ends_at=organization.trial_ends_at,
             records_visibility=organization.records_visibility,
+            device_access_policy=organization.device_access_policy,
             record_retention_days=organization.record_retention_days,
             log_retention_days=organization.log_retention_days,
             notification_email=organization.notification_email,
@@ -2736,6 +2859,7 @@ class ControlPlaneStore:
                 billing_mode=organization.billing_mode,
                 trial_ends_at=as_utc(organization.trial_ends_at),
                 records_visibility=organization.records_visibility,
+                device_access_policy=organization.device_access_policy,
                 record_retention_days=organization.record_retention_days,
                 log_retention_days=organization.log_retention_days,
                 notification_email=organization.notification_email,
@@ -4254,6 +4378,7 @@ class ControlPlaneStore:
         *,
         organization_id: str,
         records_visibility: str,
+        device_access_policy: str = "member_verified",
         record_retention_days: int,
         log_retention_days: int,
         notification_email: str,
@@ -4262,6 +4387,8 @@ class ControlPlaneStore:
     ) -> None:
         if records_visibility not in {"public", "restricted"}:
             raise ControlPlaneError("Invalid flight-record visibility.")
+        if device_access_policy not in {"member_verified", "qr_managed"}:
+            raise ControlPlaneError("Invalid RID2Caltopo device access policy.")
         if not 30 <= record_retention_days <= 3650:
             raise ControlPlaneError("Record retention must be 30-3650 days.")
         if not 1 <= log_retention_days <= 730:
@@ -4273,10 +4400,33 @@ class ControlPlaneStore:
             if organization is None:
                 raise ControlPlaneError("Organization not found.")
             organization.records_visibility = records_visibility
+            organization.device_access_policy = device_access_policy
             organization.record_retention_days = record_retention_days
             organization.log_retention_days = log_retention_days
             organization.notification_email = clean_email
             organization.updated_at = updated_at
+            member_authentication_credential_ids = []
+            if device_access_policy == "member_verified":
+                member_authentication_credential_ids = list((await session.scalars(
+                    select(DeviceCredential.id).where(
+                        DeviceCredential.organization_id == organization_id,
+                        DeviceCredential.state == "active",
+                        DeviceCredential.authorized_user_id.is_(None),
+                    )
+                )).all())
+                if member_authentication_credential_ids:
+                    await session.execute(
+                        update(DeviceCredential)
+                        .where(
+                            DeviceCredential.id.in_(
+                                member_authentication_credential_ids
+                            )
+                        )
+                        .values(
+                            state="reauth_required",
+                            reauth_requested_at=updated_at,
+                        )
+                    )
             session.add(
                 ControlPlaneAuditEvent(
                     organization_id=organization_id,
@@ -4286,8 +4436,12 @@ class ControlPlaneStore:
                     details_json=json.dumps(
                         {
                             "records_visibility": records_visibility,
+                            "device_access_policy": device_access_policy,
                             "record_retention_days": record_retention_days,
                             "log_retention_days": log_retention_days,
+                            "member_authentication_credential_ids": (
+                                member_authentication_credential_ids
+                            ),
                         }
                     ),
                     created_at=updated_at,
@@ -5468,6 +5622,46 @@ class ControlPlaneStore:
             user = await session.get(OrganizationUser, created_by_user_id)
             if user is None or user.organization_id != organization_id:
                 raise ControlPlaneError("Enrollment campaign owner is invalid.")
+            organization = await session.scalar(
+                select(Organization)
+                .where(Organization.id == organization_id)
+                .with_for_update()
+            )
+            if organization is None:
+                raise ControlPlaneError("Enrollment campaign organization is invalid.")
+            superseded_campaigns = (
+                await session.scalars(
+                    select(EnrollmentCampaign)
+                    .where(
+                        EnrollmentCampaign.organization_id == organization_id,
+                        EnrollmentCampaign.state == "active",
+                    )
+                    .with_for_update()
+                )
+            ).all()
+            superseded_campaign_ids = [item.id for item in superseded_campaigns]
+            for superseded_campaign in superseded_campaigns:
+                superseded_campaign.state = "superseded"
+                superseded_campaign.revoked_at = created_at
+            superseded_credential_ids = []
+            if (
+                organization.device_access_policy == "qr_managed"
+            ):
+                superseded_credential_ids = list((await session.scalars(
+                    select(DeviceCredential.id).where(
+                        DeviceCredential.organization_id == organization_id,
+                        DeviceCredential.state.in_((
+                            "active", "expired", "reauth_required",
+                        )),
+                    )
+                )).all())
+                if superseded_credential_ids:
+                    await session.execute(
+                        update(DeviceCredential)
+                        .where(DeviceCredential.id.in_(superseded_credential_ids))
+                        .values(state="superseded")
+                    )
+            await session.flush()
             session.add(campaign)
             session.add(
                 ControlPlaneAuditEvent(
@@ -5480,6 +5674,10 @@ class ControlPlaneStore:
                             "campaign_id": campaign.id,
                             "max_redemptions": max_redemptions,
                             "expires_in_hours": expires_in_hours,
+                            "superseded_campaign_ids": superseded_campaign_ids,
+                            "superseded_device_credential_ids": (
+                                superseded_credential_ids
+                            ),
                         }
                     ),
                     created_at=created_at,
@@ -5524,9 +5722,20 @@ class ControlPlaneStore:
     ) -> None:
         revoked_at = now or utc_now()
         async with self.sessions() as session:
-            campaign = await session.get(EnrollmentCampaign, campaign_id)
+            organization = await session.scalar(
+                select(Organization)
+                .where(Organization.id == organization_id)
+                .with_for_update()
+            )
+            campaign = await session.scalar(
+                select(EnrollmentCampaign)
+                .where(EnrollmentCampaign.id == campaign_id)
+                .with_for_update()
+            )
             if campaign is None or campaign.organization_id != organization_id:
                 raise ControlPlaneError("Enrollment campaign not found.")
+            if organization is None:
+                raise ControlPlaneError("Enrollment campaign organization is invalid.")
             user = await session.get(OrganizationUser, actor_id)
             if user is None or user.organization_id != organization_id:
                 raise ControlPlaneError("Enrollment campaign administrator is invalid.")
@@ -5557,9 +5766,20 @@ class ControlPlaneStore:
         if not 1 <= expires_in_hours <= 24 * 30:
             raise ControlPlaneError("Enrollment validity must be 1-720 hours.")
         async with self.sessions() as session:
-            campaign = await session.get(EnrollmentCampaign, campaign_id)
+            organization = await session.scalar(
+                select(Organization)
+                .where(Organization.id == organization_id)
+                .with_for_update()
+            )
+            campaign = await session.scalar(
+                select(EnrollmentCampaign)
+                .where(EnrollmentCampaign.id == campaign_id)
+                .with_for_update()
+            )
             if campaign is None or campaign.organization_id != organization_id:
                 raise ControlPlaneError("Enrollment campaign not found.")
+            if organization is None:
+                raise ControlPlaneError("Enrollment campaign organization is invalid.")
             user = await session.get(OrganizationUser, actor_id)
             if user is None or user.organization_id != organization_id:
                 raise ControlPlaneError("Enrollment campaign administrator is invalid.")
@@ -5567,6 +5787,40 @@ class ControlPlaneStore:
                 raise ControlPlaneError("A revoked enrollment QR cannot be renewed.")
             if campaign.redemption_count >= campaign.max_redemptions:
                 raise ControlPlaneError("Enrollment campaign has no uses remaining.")
+            superseded_campaigns = (
+                await session.scalars(
+                    select(EnrollmentCampaign)
+                    .where(
+                        EnrollmentCampaign.organization_id == organization_id,
+                        EnrollmentCampaign.state == "active",
+                        EnrollmentCampaign.id != campaign_id,
+                    )
+                    .with_for_update()
+                )
+            ).all()
+            superseded_campaign_ids = [item.id for item in superseded_campaigns]
+            for superseded_campaign in superseded_campaigns:
+                superseded_campaign.state = "superseded"
+                superseded_campaign.revoked_at = renewed_at
+            superseded_credential_ids = []
+            if (
+                organization.device_access_policy == "qr_managed"
+            ):
+                superseded_credential_ids = list((await session.scalars(
+                    select(DeviceCredential.id).where(
+                        DeviceCredential.organization_id == organization_id,
+                        DeviceCredential.state.in_((
+                            "active", "expired", "reauth_required",
+                        )),
+                    )
+                )).all())
+                if superseded_credential_ids:
+                    await session.execute(
+                        update(DeviceCredential)
+                        .where(DeviceCredential.id.in_(superseded_credential_ids))
+                        .values(state="superseded")
+                    )
+            await session.flush()
             previous_expiry = as_utc(campaign.expires_at)
             campaign.state = "active"
             campaign.expires_at = renewed_at + timedelta(hours=expires_in_hours)
@@ -5581,6 +5835,8 @@ class ControlPlaneStore:
                     "campaign_id": campaign.id,
                     "previous_expires_at": previous_expiry.isoformat(),
                     "expires_in_hours": expires_in_hours,
+                    "superseded_campaign_ids": superseded_campaign_ids,
+                    "superseded_device_credential_ids": superseded_credential_ids,
                 }, sort_keys=True),
                 created_at=renewed_at,
             ))
@@ -5623,6 +5879,7 @@ class ControlPlaneStore:
         organization_id: str,
         device_name: str,
         platform: str,
+        installation_id: str = "",
         functionality_release: int = 0,
         authorized_user_id: Optional[str] = None,
         now: Optional[datetime] = None,
@@ -5630,10 +5887,15 @@ class ControlPlaneStore:
         issued_at = now or utc_now()
         clean_name = device_name.strip()
         clean_platform = platform.strip().lower()
+        clean_installation_id = installation_id.strip().lower()
         if not clean_name or len(clean_name) > 160:
             raise ControlPlaneError("Enter a device name.")
         if clean_platform not in {"android", "ios"}:
             raise ControlPlaneError("Device platform must be Android or iOS.")
+        if clean_installation_id and not re.fullmatch(
+            r"[a-z0-9][a-z0-9._:-]{7,127}", clean_installation_id
+        ):
+            raise ControlPlaneError("Device installation identifier is invalid.")
         if functionality_release < 0:
             raise ControlPlaneError("Functionality release must not be negative.")
         token = "r2c_dev_" + secrets.token_urlsafe(32)
@@ -5670,20 +5932,59 @@ class ControlPlaneStore:
                     or authorized_user.state != "active"
                 ):
                     raise ControlPlaneError("Authorized R2C user is invalid.")
+            requires_member_authentication = (
+                organization.device_access_policy == "member_verified"
+                and authorized_user_id is None
+            )
             credential = DeviceCredential(
                 id=new_id(),
                 organization_id=organization_id,
                 campaign_id=campaign_id,
                 device_name=clean_name,
                 platform=clean_platform,
+                installation_id=clean_installation_id,
                 authorized_user_id=authorized_user_id,
                 functionality_release=functionality_release,
                 token_prefix=token[:16],
                 token_hash=device_token_hash(token),
-                state="active",
+                state=(
+                    "reauth_required"
+                    if requires_member_authentication
+                    else "active"
+                ),
                 created_at=issued_at,
                 expires_at=expires_at,
+                reauth_requested_at=(
+                    issued_at if requires_member_authentication else None
+                ),
             )
+            superseded_conditions = [
+                DeviceCredential.organization_id == organization_id,
+                DeviceCredential.state.in_(("active", "expired")),
+            ]
+            if clean_installation_id:
+                superseded_conditions.append(or_(
+                    DeviceCredential.installation_id == clean_installation_id,
+                    (
+                        (DeviceCredential.installation_id == "")
+                        & (func.lower(DeviceCredential.device_name) == clean_name.lower())
+                        & (DeviceCredential.platform == clean_platform)
+                    ),
+                ))
+            else:
+                superseded_conditions.extend((
+                    func.lower(DeviceCredential.device_name) == clean_name.lower(),
+                    DeviceCredential.platform == clean_platform,
+                ))
+            superseded_ids = tuple((await session.scalars(
+                select(DeviceCredential.id).where(*superseded_conditions)
+            )).all())
+            if superseded_ids:
+                await session.execute(
+                    update(DeviceCredential)
+                    .where(DeviceCredential.id.in_(superseded_ids))
+                    .values(state="superseded")
+                )
             campaign.redemption_count += 1
             if campaign.redemption_count >= campaign.max_redemptions:
                 campaign.state = "exhausted"
@@ -5699,8 +6000,13 @@ class ControlPlaneStore:
                             "campaign_id": campaign_id,
                             "platform": clean_platform,
                             "device_name": clean_name,
+                            "installation_id": clean_installation_id,
+                            "superseded_credential_ids": superseded_ids,
                             "authorized_user_id": authorized_user_id,
                             "functionality_release": functionality_release,
+                            "member_authentication_required": (
+                                requires_member_authentication
+                            ),
                         }
                     ),
                     created_at=issued_at,
@@ -5715,6 +6021,8 @@ class ControlPlaneStore:
                 device_name=clean_name,
                 platform=clean_platform,
                 expires_at=expires_at,
+                state=credential.state,
+                reauth_requested_at=as_utc(credential.reauth_requested_at),
             )
 
     async def authenticate_device_token(
@@ -5755,6 +6063,7 @@ class ControlPlaneStore:
                 designator=designator,
                 device_name=credential.device_name,
                 platform=credential.platform,
+                installation_id=credential.installation_id or "",
                 functionality_release=credential.functionality_release,
                 expires_at=expires_at,
             )
@@ -5878,6 +6187,13 @@ class ControlPlaneStore:
                 raise ControlPlaneError(
                     "This user is not authorized to operate RID2Caltopo devices."
                 )
+            if (
+                credential.authorized_user_id is not None
+                and credential.authorized_user_id != user.id
+            ):
+                raise ControlPlaneError(
+                    "This device must be reauthenticated by its assigned user."
+                )
             credential.state = "active"
             credential.authorized_user_id = user.id
             credential.reauth_requested_at = None
@@ -5942,6 +6258,10 @@ class ControlPlaneStore:
                 raise ControlPlaneError(
                     "This device must complete reauthentication before its credential can be extended."
                 )
+            if credential.state == "superseded":
+                raise ControlPlaneError(
+                    "A superseded device credential cannot be extended. Re-enroll the device if needed."
+                )
             user = await session.get(OrganizationUser, actor_id)
             if user is None or user.organization_id != organization_id:
                 raise ControlPlaneError("Device credential administrator is invalid.")
@@ -5986,7 +6306,7 @@ class ControlPlaneStore:
                     select(DeviceCredential)
                     .where(
                         DeviceCredential.organization_id == organization_id,
-                        DeviceCredential.state.not_in(("revoked", "reauth_required")),
+                        DeviceCredential.state.in_(("active", "expired")),
                     )
                     .with_for_update()
                 )
@@ -8396,6 +8716,7 @@ class ControlPlaneStore:
             organization_id=credential.organization_id,
             device_name=credential.device_name,
             platform=credential.platform,
+            installation_id=credential.installation_id or "",
             authorized_user_id=credential.authorized_user_id,
             functionality_release=credential.functionality_release,
             state=state,

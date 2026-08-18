@@ -6,6 +6,8 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+from sqlalchemy import text
+
 from control_plane import (
     AUDIT_EVENT_HOT_DAYS,
     AUDIT_EVENT_RETENTION_DAYS,
@@ -15,6 +17,7 @@ from control_plane import (
     ControlPlaneStore,
     DeviceCredential,
     DuplicateOrganizationError,
+    EnrollmentCampaign,
     InvalidOrganizationError,
     MANAGED_ACCESS_TERMS_VERSION,
     OrganizationUser,
@@ -1008,6 +1011,7 @@ class ControlPlaneStoreTest(unittest.TestCase):
                 organization_id=organization.id,
                 device_name="Jerry's iPad",
                 platform="ios",
+                authorized_user_id=owner.id,
                 now=self.now,
             )
         )
@@ -1105,6 +1109,7 @@ class ControlPlaneStoreTest(unittest.TestCase):
             device_name="Lost tablet",
             platform="android",
             functionality_release=148,
+            authorized_user_id=owner.id,
             now=self.now,
         ))
 
@@ -1148,6 +1153,198 @@ class ControlPlaneStoreTest(unittest.TestCase):
         event = asyncio.run(self.store.list_audit_events())[0]
         self.assertEqual("device.reauthentication_completed", event.event_type)
         self.assertIn(owner.email, event.details["message"])
+
+    def test_member_verified_device_requires_initial_and_same_user_reauthentication(self):
+        organization = self.create_organization()
+        owner = asyncio.run(self.store.activate_owner(
+            organization.designator,
+            organization.primary_admin_email,
+            "correct horse battery staple",
+            self.now,
+        ))
+        other = asyncio.run(self.store.add_user(
+            organization_id=organization.id,
+            display_name="Other Pilot",
+            email="other@ncssar.example",
+            roles=("r2c_device",),
+            actor_id=owner.id,
+            now=self.now,
+        ))
+
+        async def activate_other_user():
+            async with self.store.sessions() as session:
+                stored = await session.get(OrganizationUser, other.id)
+                stored.state = "active"
+                await session.commit()
+
+        asyncio.run(activate_other_user())
+        campaign = asyncio.run(self.store.create_enrollment_campaign(
+            organization_id=organization.id,
+            label="Member verified",
+            created_by_user_id=owner.id,
+            expires_in_hours=24,
+            max_redemptions=2,
+            now=self.now,
+        ))
+        issued = asyncio.run(self.store.issue_device_credential(
+            campaign_id=campaign.id,
+            organization_id=organization.id,
+            device_name="Member tablet",
+            platform="android",
+            installation_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            now=self.now,
+        ))
+
+        self.assertEqual("reauth_required", issued.state)
+        self.assertIsNotNone(issued.reauth_requested_at)
+        self.assertIsNone(asyncio.run(
+            self.store.authenticate_device_token(issued.token, self.now)
+        ))
+        initially_authenticated = asyncio.run(
+            self.store.complete_device_reauthentication(
+                credential_id=issued.id,
+                organization_id=organization.id,
+                user_id=owner.id,
+                now=self.now + timedelta(minutes=1),
+            )
+        )
+        self.assertEqual(owner.id, initially_authenticated.authorized_user_id)
+        self.assertIsNotNone(asyncio.run(
+            self.store.authenticate_device_token(
+                issued.token, self.now + timedelta(minutes=2)
+            )
+        ))
+
+        asyncio.run(self.store.require_device_reauthentication(
+            credential_id=issued.id,
+            organization_id=organization.id,
+            actor_id=owner.id,
+            now=self.now + timedelta(minutes=3),
+        ))
+        with self.assertRaisesRegex(ControlPlaneError, "assigned user"):
+            asyncio.run(self.store.complete_device_reauthentication(
+                credential_id=issued.id,
+                organization_id=organization.id,
+                user_id=other.id,
+                now=self.now + timedelta(minutes=4),
+            ))
+        recovered = asyncio.run(self.store.complete_device_reauthentication(
+            credential_id=issued.id,
+            organization_id=organization.id,
+            user_id=owner.id,
+            now=self.now + timedelta(minutes=5),
+        ))
+        self.assertEqual(owner.id, recovered.authorized_user_id)
+
+    def test_qr_managed_replacement_requires_every_device_to_reenroll(self):
+        organization = self.create_organization()
+        owner = asyncio.run(self.store.activate_owner(
+            organization.designator,
+            organization.primary_admin_email,
+            "correct horse battery staple",
+            self.now,
+        ))
+        asyncio.run(self.store.update_settings(
+            organization_id=organization.id,
+            records_visibility=organization.records_visibility,
+            device_access_policy="qr_managed",
+            record_retention_days=organization.record_retention_days,
+            log_retention_days=organization.log_retention_days,
+            notification_email=organization.notification_email,
+            actor_id=owner.id,
+            now=self.now,
+        ))
+        campaign = asyncio.run(self.store.create_enrollment_campaign(
+            organization_id=organization.id,
+            label="QR managed",
+            created_by_user_id=owner.id,
+            expires_in_hours=24,
+            max_redemptions=2,
+            now=self.now,
+        ))
+        issued = asyncio.run(self.store.issue_device_credential(
+            campaign_id=campaign.id,
+            organization_id=organization.id,
+            device_name="Open enrollment tablet",
+            platform="ios",
+            now=self.now,
+        ))
+        self.assertEqual("active", issued.state)
+
+        replacement = asyncio.run(self.store.create_enrollment_campaign(
+            organization_id=organization.id,
+            label="Compromise replacement",
+            created_by_user_id=owner.id,
+            expires_in_hours=24,
+            max_redemptions=2,
+            now=self.now + timedelta(minutes=1),
+        ))
+
+        self.assertEqual("active", replacement.state)
+        self.assertIsNone(asyncio.run(self.store.authenticate_device_token(
+            issued.token, self.now + timedelta(minutes=2)
+        )))
+        credentials = asyncio.run(self.store.list_device_credentials(
+            organization.id, now=self.now + timedelta(minutes=2)
+        ))
+        self.assertEqual("superseded", credentials[0].state)
+        event = asyncio.run(self.store.list_audit_events())[0]
+        self.assertEqual(
+            [issued.id], event.details["superseded_device_credential_ids"]
+        )
+
+    def test_reenrollment_supersedes_prior_credential_for_same_installation(self):
+        organization = self.create_organization()
+        owner = asyncio.run(self.store.activate_owner(
+            organization.designator,
+            organization.primary_admin_email,
+            "correct horse battery staple",
+            self.now,
+        ))
+        campaign = asyncio.run(self.store.create_enrollment_campaign(
+            organization_id=organization.id,
+            label="Replacement credentials",
+            created_by_user_id=owner.id,
+            expires_in_hours=24,
+            max_redemptions=3,
+            now=self.now,
+        ))
+        first = asyncio.run(self.store.issue_device_credential(
+            campaign_id=campaign.id,
+            organization_id=organization.id,
+            device_name="A5 Pro",
+            platform="android",
+            installation_id="11111111-2222-3333-4444-555555555555",
+            authorized_user_id=owner.id,
+            now=self.now,
+        ))
+        replacement = asyncio.run(self.store.issue_device_credential(
+            campaign_id=campaign.id,
+            organization_id=organization.id,
+            device_name="Renamed A5 Pro",
+            platform="android",
+            installation_id="11111111-2222-3333-4444-555555555555",
+            authorized_user_id=owner.id,
+            now=self.now + timedelta(minutes=5),
+        ))
+
+        self.assertIsNone(asyncio.run(
+            self.store.authenticate_device_token(first.token, self.now + timedelta(minutes=6))
+        ))
+        self.assertIsNotNone(asyncio.run(
+            self.store.authenticate_device_token(
+                replacement.token, self.now + timedelta(minutes=6)
+            )
+        ))
+        credentials = asyncio.run(self.store.list_device_credentials(
+            organization.id, now=self.now + timedelta(minutes=6)
+        ))
+        self.assertEqual(["active", "superseded"], sorted(
+            (credential.state for credential in credentials),
+            key=lambda state: state != "active",
+        ))
+        issued_event = asyncio.run(self.store.list_audit_events())[0]
+        self.assertEqual([first.id], issued_event.details["superseded_credential_ids"])
 
     def test_expired_enrollment_campaign_can_be_renewed_with_uses_remaining(self):
         organization = self.create_organization()
@@ -1200,6 +1397,128 @@ class ControlPlaneStoreTest(unittest.TestCase):
                 now=self.now + timedelta(days=4),
             ))
 
+    def test_only_one_enrollment_campaign_is_active_per_organization(self):
+        organization = self.create_organization()
+        owner = asyncio.run(self.store.activate_owner(
+            organization.designator,
+            organization.primary_admin_email,
+            "correct horse battery staple",
+            self.now,
+        ))
+        first = asyncio.run(self.store.create_enrollment_campaign(
+            organization_id=organization.id,
+            label="First QR",
+            created_by_user_id=owner.id,
+            expires_in_hours=720,
+            max_redemptions=5,
+            now=self.now,
+        ))
+        second = asyncio.run(self.store.create_enrollment_campaign(
+            organization_id=organization.id,
+            label="Replacement QR",
+            created_by_user_id=owner.id,
+            expires_in_hours=720,
+            max_redemptions=10,
+            now=self.now + timedelta(minutes=1),
+        ))
+
+        campaigns = {
+            campaign.id: campaign
+            for campaign in asyncio.run(
+                self.store.list_enrollment_campaigns(organization.id)
+            )
+        }
+        self.assertEqual("superseded", campaigns[first.id].state)
+        self.assertEqual("active", campaigns[second.id].state)
+        with self.assertRaisesRegex(ControlPlaneError, "not active"):
+            asyncio.run(self.store.redeem_enrollment_campaign(
+                campaign_id=first.id,
+                organization_id=organization.id,
+                now=self.now + timedelta(minutes=2),
+            ))
+        created_event = asyncio.run(self.store.list_audit_events())[0]
+        self.assertEqual([first.id], created_event.details["superseded_campaign_ids"])
+
+        renewed = asyncio.run(self.store.renew_enrollment_campaign(
+            campaign_id=first.id,
+            organization_id=organization.id,
+            actor_id=owner.id,
+            expires_in_hours=720,
+            now=self.now + timedelta(minutes=3),
+        ))
+        campaigns = {
+            campaign.id: campaign
+            for campaign in asyncio.run(
+                self.store.list_enrollment_campaigns(organization.id)
+            )
+        }
+        self.assertEqual("active", renewed.state)
+        self.assertEqual("active", campaigns[first.id].state)
+        self.assertEqual("superseded", campaigns[second.id].state)
+        renewed_event = asyncio.run(self.store.list_audit_events())[0]
+        self.assertEqual([second.id], renewed_event.details["superseded_campaign_ids"])
+
+    def test_init_normalizes_multiple_active_enrollment_campaigns(self):
+        organization = self.create_organization()
+        owner = asyncio.run(self.store.activate_owner(
+            organization.designator,
+            organization.primary_admin_email,
+            "correct horse battery staple",
+            self.now,
+        ))
+        first = asyncio.run(self.store.create_enrollment_campaign(
+            organization_id=organization.id,
+            label="Existing QR",
+            created_by_user_id=owner.id,
+            expires_in_hours=24,
+            max_redemptions=5,
+            now=self.now,
+        ))
+
+        async def create_legacy_duplicate():
+            async with self.store.engine.begin() as connection:
+                await connection.execute(text(
+                    "DROP INDEX uq_enrollment_campaigns_one_active_per_organization"
+                ))
+                await connection.execute(EnrollmentCampaign.__table__.insert().values(
+                    id="legacy-newer-campaign",
+                    organization_id=organization.id,
+                    label="Newer QR",
+                    created_by_user_id=owner.id,
+                    state="active",
+                    max_redemptions=5,
+                    redemption_count=0,
+                    token_generation="legacy-generation",
+                    expires_at=self.now + timedelta(days=30),
+                    created_at=self.now + timedelta(minutes=1),
+                ))
+
+        asyncio.run(create_legacy_duplicate())
+        asyncio.run(self.store.init())
+
+        campaigns = {
+            campaign.id: campaign
+            for campaign in asyncio.run(
+                self.store.list_enrollment_campaigns(organization.id)
+            )
+        }
+        self.assertEqual("superseded", campaigns[first.id].state)
+        self.assertEqual("active", campaigns["legacy-newer-campaign"].state)
+        async def enrollment_indexes():
+            async with self.store.engine.connect() as connection:
+                return {
+                    row[1]
+                    for row in (
+                        await connection.execute(text(
+                            "PRAGMA index_list(enrollment_campaigns)"
+                        ))
+                    ).all()
+                }
+        self.assertIn(
+            "uq_enrollment_campaigns_one_active_per_organization",
+            asyncio.run(enrollment_indexes()),
+        )
+
     def test_video_streams_are_sorted_tenant_isolated_and_require_consent(self):
         organization = self.create_organization()
         invitation = asyncio.run(
@@ -1233,6 +1552,7 @@ class ControlPlaneStoreTest(unittest.TestCase):
                 organization_id=organization.id,
                 device_name="Android field tablet",
                 platform="android",
+                authorized_user_id=owner.id,
                 now=self.now,
             )
         )
@@ -1766,6 +2086,7 @@ class ControlPlaneStoreTest(unittest.TestCase):
             organization_id=organization.id,
             device_name="Ken's iPad",
             platform="ios",
+            authorized_user_id=owner.id,
             now=self.now,
         ))
         stream = asyncio.run(self.store.advertise_video_stream(
@@ -1898,6 +2219,7 @@ class ControlPlaneStoreTest(unittest.TestCase):
             organization_id=organization.id,
             device_name="Pilot tablet",
             platform="android",
+            authorized_user_id=owner.id,
             now=self.now,
         ))
         session_ids = (
@@ -2070,6 +2392,7 @@ class ControlPlaneStoreTest(unittest.TestCase):
                 organization_id=organization.id,
                 device_name="Ken's iPad",
                 platform="ios",
+                authorized_user_id=owner.id,
                 now=self.now,
             )
         )
@@ -2480,6 +2803,7 @@ class ControlPlaneStoreTest(unittest.TestCase):
             organization_id=organization.id,
             device_name="Field tablet",
             platform="android",
+            authorized_user_id=owner.id,
             now=self.now,
         ))
         stream = asyncio.run(self.store.advertise_video_stream(

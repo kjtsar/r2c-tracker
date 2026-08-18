@@ -45,6 +45,7 @@ async def create_credential(database_url: str, designator: str) -> str:
             organization_id=organization.id,
             device_name="Release Check",
             platform="android",
+            authorized_user_id=owner.id,
         )
         return credential.token
     finally:

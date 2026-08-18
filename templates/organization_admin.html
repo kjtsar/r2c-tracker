@@ -227,6 +227,29 @@
   .config-diff h3 { margin: 10px 0 5px; color: var(--org-navy); }
   .config-diff ul { margin-top: 5px; }
   .inline-form { display: inline-block; margin-right: 8px; }
+  .admin-menu {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 14px;
+  }
+  .admin-menu a {
+      display: grid;
+      gap: 6px;
+      min-height: 92px;
+      padding: 18px;
+      border: 1px solid var(--org-line);
+      border-radius: 11px;
+      background: white;
+      color: var(--org-navy);
+      text-decoration: none;
+      box-shadow: 0 5px 16px rgba(24, 52, 70, 0.05);
+  }
+  .admin-menu a:hover, .admin-menu a:focus { border-color: var(--org-teal); }
+  .admin-menu strong { font-size: 1.05rem; }
+  .admin-menu span { color: var(--org-muted); line-height: 1.4; }
+  .admin-breadcrumb { margin: -4px 0 0; }
+  .admin-breadcrumb a { color: var(--org-teal); font-weight: 750; }
+  .audit-details { max-width: 440px; overflow-wrap: anywhere; }
   @media (max-width: 760px) {
       .org-header { flex-direction: column; }
       .org-grid { grid-template-columns: 1fr; }
@@ -258,6 +281,29 @@
     </form>
   </header>
 
+  {% if admin_section != "dashboard" %}
+  <p class="admin-breadcrumb"><a href="/{{ organization.designator|lower }}/admin">← Administration home</a></p>
+  {% endif %}
+
+  {% if admin_section == "dashboard" %}
+  <nav class="admin-menu" aria-label="Organization administration">
+    {% if "organization_owner" in organization_user.roles or "config_admin" in organization_user.roles %}
+    <a href="/{{ organization.designator|lower }}/admin/configuration"><strong>Organization Configuration</strong><span>Policies, retention, CalTopo credentials, and drone lists</span></a>
+    {% endif %}
+    {% if "organization_owner" in organization_user.roles or "records_admin" in organization_user.roles %}
+    <a href="/{{ organization.designator|lower }}/admin/flights"><strong>Flight Records</strong><span>Review, export, import, archive, and restore records</span></a>
+    {% endif %}
+    {% if can_manage_users %}
+    <a href="/{{ organization.designator|lower }}/admin/members"><strong>Members &amp; roles</strong><span>Invite people and manage delegated access</span></a>
+    <a href="/{{ organization.designator|lower }}/admin/enrollments"><strong>Enrollment authorizations</strong><span>Manage tablet access and enrollment QR history</span></a>
+    {% endif %}
+    {% if "organization_owner" in organization_user.roles %}
+    <a href="/{{ organization.designator|lower }}/admin/audit"><strong>Audit trail</strong><span>Review organization administrative and operational events</span></a>
+    {% endif %}
+  </nav>
+  {% endif %}
+
+  {% if admin_section in ["dashboard", "enrollments"] %}
   {% if simulation %}
   <div class="org-banner" role="status">
     <strong>Simulation mode:</strong>
@@ -295,9 +341,10 @@
     Create an enrollment QR below and scan it on each team tablet before an operation.
   </div>
   {% endif %}
+  {% endif %}
 
   <div class="org-grid">
-    {% if "organization_owner" in organization_user.roles or "config_admin" in organization_user.roles %}
+    {% if admin_section == "configuration" and ("organization_owner" in organization_user.roles or "config_admin" in organization_user.roles) %}
     <section class="org-panel wide" id="organization-config"
              data-config-proposal-state="{{ config_proposal.state if config_proposal else 'none' }}">
       <h2>RID2Caltopo organization configuration</h2>
@@ -416,21 +463,7 @@
       <script src="/static/organization_config_admin.js?v=20260816-1" defer></script>
     </section>
     {% endif %}
-    {% if "organization_owner" in organization_user.roles or "records_admin" in organization_user.roles %}
-    <section class="org-panel wide" id="members">
-      <h2>Flight records &amp; migration</h2>
-      <p>
-        Review this organization's flight records, import a legacy archive,
-        and backfill its weather and metadata from a full administrator CSV.
-      </p>
-      <p>
-        <a class="primary-button"
-           href="/{{ organization.designator|lower }}/admin/flights">
-          Manage flight records
-        </a>
-      </p>
-    </section>
-    {% endif %}
+    {% if admin_section == "configuration" %}
     <section class="org-panel">
       <h2>Privacy &amp; retention</h2>
       <p>
@@ -451,6 +484,22 @@
               Public
             </option>
           </select>
+        </label>
+        <label>
+          RID2Caltopo device access
+          <select name="device_access_policy">
+            <option value="member_verified" {% if organization.device_access_policy == "member_verified" %}selected{% endif %}>
+              Member verified
+            </option>
+            <option value="qr_managed" {% if organization.device_access_policy == "qr_managed" %}selected{% endif %}>
+              QR managed
+            </option>
+          </select>
+          <small>
+            Member verified requires an authorized member to sign in when a device
+            first enrolls and after an administrator reports it lost. QR managed
+            treats possession of the current QR as authorization.
+          </small>
         </label>
         <label>
           Notification email
@@ -475,7 +524,9 @@
       <p>Only the organization owner can change these policies.</p>
       {% endif %}
     </section>
+    {% endif %}
 
+    {% if admin_section == "dashboard" %}
     <section class="org-panel" id="service-status">
       <h2>Service status</h2>
       <p><strong>Account:</strong> {{ organization.lifecycle_state|replace('_', ' ') }}</p>
@@ -536,7 +587,7 @@
       </div>
       <p>
         Google Cloud billing data through
-        {{ billing_snapshot.billing_data_through.strftime("%d %b %Y %H:%M UTC") }}.
+        <time class="local-datetime" data-utc="{{ billing_snapshot.billing_data_through.isoformat() }}">{{ billing_snapshot.billing_data_through.strftime("%d %b %Y %H:%M UTC") }}</time>.
         This allocation measures consumption of the extended-beta allowance;
         it is not a bill or charge.
       </p>
@@ -549,7 +600,7 @@
       <h3>Historical account activity</h3>
       {% for entry in ledger_entries %}
       <p>
-        {{ entry.created_at.strftime("%d %b %Y") }} · {{ entry.entry_type }} ·
+        <time class="local-datetime" data-utc="{{ entry.created_at.isoformat() }}">{{ entry.created_at.strftime("%d %b %Y %H:%M UTC") }}</time> · {{ entry.entry_type }} ·
         ${{ "%.2f"|format(entry.amount) }}<br>
         {{ entry.description }}
       </p>
@@ -558,8 +609,10 @@
       {% endfor %}
       {% endif %}
     </section>
+    {% endif %}
 
-    <section class="org-panel wide">
+    {% if admin_section == "members" %}
+    <section class="org-panel wide" id="members">
       <h2>Members &amp; delegated roles</h2>
       <p>
         A pending member can activate access by using the current invitation link
@@ -693,8 +746,9 @@
       </form>
       {% endif %}
     </section>
+    {% endif %}
 
-    {% if can_manage_device_credentials %}
+    {% if admin_section == "enrollments" and can_manage_device_credentials %}
     <section class="org-panel wide" id="device-authorizations">
       <h2>R2C tablet authorizations</h2>
       <p>
@@ -702,23 +756,27 @@
         the same credential on the tablet, so no rescan is required. Renew before
         the listed date to avoid interrupting Tracker coordination.
       </p>
-      {% if device_credentials %}
+      {% if current_device_credentials %}
       <div style="overflow-x:auto">
         <table class="org-table">
           <thead>
-            <tr><th>Tablet</th><th>Platform</th><th>Status</th><th>Last connected</th><th>Authorization expires</th><th>Action</th></tr>
+            <tr><th>Tablet</th><th>Platform</th><th>Assigned member</th><th>Status</th><th>Last connected</th><th>Authorization expires</th><th>Action</th></tr>
           </thead>
           <tbody>
-          {% for credential in device_credentials %}
+          {% for credential in current_device_credentials %}
             <tr>
               <td>
                 <strong>{{ credential.device_name }}</strong><br>
                 <small>Enrollment {{ credential.id[:8] }} · Tracker compatibility {{ credential.functionality_release }}</small>
               </td>
               <td>{{ credential.platform|capitalize }}</td>
+              <td>
+                {% set assigned_member = organization_user_by_id.get(credential.authorized_user_id) %}
+                {% if assigned_member %}{{ assigned_member.display_name }}<br><small>{{ assigned_member.email }}</small>{% else %}Awaiting initial authentication{% endif %}
+              </td>
               <td>{{ credential.state }}</td>
-              <td>{% if credential.last_used_at %}{{ credential.last_used_at.strftime("%d %b %Y %H:%M UTC") }}{% else %}Never{% endif %}</td>
-              <td>{{ credential.expires_at.strftime("%d %b %Y %H:%M UTC") }}</td>
+              <td>{% if credential.last_used_at %}<time class="local-datetime" data-utc="{{ credential.last_used_at.isoformat() }}">{{ credential.last_used_at.strftime("%d %b %Y %H:%M UTC") }}</time>{% else %}Never{% endif %}</td>
+              <td><time class="local-datetime" data-utc="{{ credential.expires_at.isoformat() }}">{{ credential.expires_at.strftime("%d %b %Y %H:%M UTC") }}</time></td>
               <td>
                 {% if credential.state == "active" or credential.state == "expired" %}
                 <form method="post"
@@ -755,14 +813,27 @@
     </section>
     {% endif %}
 
+    {% if admin_section in ["dashboard", "enrollments"] %}
     <section class="org-panel wide" id="enrollment-qr">
       <h2>Drone-team enrollment QR codes</h2>
       <p>
         Each QR contains a signed organization locator and a revocable,
         expiring enrollment capability. It never embeds FAA credentials,
         administrator passwords, or an unrestricted tracker upload secret.
+        Only one enrollment QR can be active for this organization. Creating
+        or renewing one immediately supersedes every earlier active QR, including
+        downloaded or printed copies.
+        {% if organization.device_access_policy == "member_verified" %}
+        New devices remain blocked until an active member with the R2C device role
+        signs in. Replacing the QR does not disconnect devices whose users already
+        authenticated.
+        {% else %}
+        This organization uses QR-managed access. Publishing a replacement means
+        the prior QR may be compromised, so every currently authorized device is
+        disconnected and must scan the new QR before reconnecting.
+        {% endif %}
       </p>
-      {% if can_manage_users %}
+      {% if can_manage_users and admin_section == "enrollments" %}
       <form class="org-form two-column" method="post"
             action="/{{ organization.designator|lower }}/enrollments">
         <input type="hidden" name="form_token" value="{{ csrf_token }}">
@@ -781,18 +852,21 @@
                  value="25" required>
         </label>
         <div style="align-self:end">
-          <button class="primary-button" type="submit">Create enrollment QR</button>
+          <button class="primary-button" type="submit">
+            {% if organization.device_access_policy == "qr_managed" %}Replace QR and disconnect enrolled devices{% else %}Replace active enrollment QR{% endif %}
+          </button>
         </div>
       </form>
       {% endif %}
 
       <div class="campaign-grid">
-      {% for campaign in enrollment_campaigns %}
+      {% set displayed_campaigns = active_enrollment_campaigns if admin_section == "dashboard" else enrollment_campaigns %}
+      {% for campaign in displayed_campaigns %}
         <article class="campaign-card">
           <strong>{{ campaign.label }}</strong>
           <p>
             {{ campaign.state }} · {{ campaign.redemption_count }}/{{ campaign.max_redemptions }}
-            uses · expires {{ campaign.expires_at.strftime("%d %b %Y %H:%M UTC") }}
+            uses · expires <time class="local-datetime" data-utc="{{ campaign.expires_at.isoformat() }}">{{ campaign.expires_at.strftime("%d %b %Y %H:%M UTC") }}</time>
           </p>
           {% if campaign.state == "active" %}
           <img src="/{{ organization.designator|lower }}/enrollments/{{ campaign.id }}/qr.svg"
@@ -819,10 +893,47 @@
           {% endif %}
         </article>
       {% else %}
-        <p>No enrollment campaigns have been created.</p>
+        <p>{% if admin_section == "dashboard" %}No active enrollment QR codes.{% else %}No enrollment campaigns have been created.{% endif %}</p>
       {% endfor %}
       </div>
     </section>
+    {% endif %}
+
+    {% if admin_section == "audit" %}
+    <section class="org-panel wide" id="audit-trail">
+      <h2>Organization audit trail</h2>
+      <p>
+        Administrative and operational accountability events for {{ organization.designator }}
+        are retained for {{ audit_retention_days }} days. Secrets, raw media, and flight-log
+        contents are not stored in this trail.
+      </p>
+      <div style="overflow-x:auto">
+        <table class="org-table">
+          <thead><tr><th>Time</th><th>Event</th><th>Actor</th><th>Details</th></tr></thead>
+          <tbody>
+          {% for event in audit_page.events %}
+            <tr>
+              <td><time class="local-datetime" data-utc="{{ event.created_at.isoformat() }}">{{ event.created_at.strftime("%d %b %Y %H:%M UTC") }}</time></td>
+              <td><strong>{{ event.event_type }}</strong><br><small>{{ event.id }}</small></td>
+              <td>{{ event.actor_type|replace("_", " ") }}<br><small>{{ event.actor_id }}</small></td>
+              <td class="audit-details"><code>{{ event.details|tojson }}</code></td>
+            </tr>
+          {% else %}
+            <tr><td colspan="4">No organization audit events have been recorded.</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Page {{ audit_page.page }} of {{ audit_page.total_pages }} ·
+        {{ audit_page.total }} event{% if audit_page.total != 1 %}s{% endif %}
+      </p>
+      <p>
+        {% if audit_page.page > 1 %}<a class="primary-button" href="?page={{ audit_page.page - 1 }}">Previous</a>{% endif %}
+        {% if audit_page.page < audit_page.total_pages %}<a class="primary-button" href="?page={{ audit_page.page + 1 }}">Next</a>{% endif %}
+      </p>
+    </section>
+    {% endif %}
   </div>
 </div>
 {% endblock %}

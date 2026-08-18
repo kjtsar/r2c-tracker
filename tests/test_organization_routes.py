@@ -637,6 +637,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 organization_id=organization.id,
                 device_name="iPad 1",
                 platform="ios",
+                authorized_user_id=owner.id,
             )
         )
         empty = self.client.get(
@@ -732,6 +733,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         device = asyncio.run(self.store.issue_device_credential(
             campaign_id=campaign.id, organization_id=organization.id,
             device_name="Ken's A5 Pro", platform="android",
+            authorized_user_id=owner.id,
         ))
         config_admin = asyncio.run(self.store.add_user(
             organization_id=organization.id,
@@ -774,7 +776,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             live_connection.app_version = "2.0.3"
             live_connection.app_version_code = 133
 
-            old_admin_page = self.client.get("/ncssar/admin")
+            old_admin_page = self.client.get("/ncssar/admin/configuration")
             self.assertIn("build 133", old_admin_page.text)
             self.assertIn("upgrade required", old_admin_page.text)
 
@@ -784,7 +786,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 requested_by_user_id=config_admin.id,
                 source_device_name=device.device_name,
             ))
-            stale_request_page = self.client.get("/ncssar/admin")
+            stale_request_page = self.client.get("/ncssar/admin/configuration")
             self.assertIn(
                 "cannot return its organization configuration",
                 stale_request_page.text,
@@ -797,7 +799,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             )
             self.assertEqual(303, discarded_stale_request.status_code)
 
-            old_admin_page = self.client.get("/ncssar/admin")
+            old_admin_page = self.client.get("/ncssar/admin/configuration")
             rejected_old_client = self.client.post(
                 "/ncssar/admin/organization-config/request",
                 data={"form_token": self.form_token(old_admin_page),
@@ -813,7 +815,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             ))
 
             live_connection.app_version_code = 134
-            admin_page = self.client.get("/ncssar/admin")
+            admin_page = self.client.get("/ncssar/admin/configuration")
             self.assertIn("Ken's A5 Pro", html.unescape(admin_page.text))
             self.assertIn("build 134", admin_page.text)
             self.assertNotIn("Save member", admin_page.text)
@@ -826,7 +828,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 follow_redirects=False,
             )
             self.assertEqual(303, requested.status_code)
-            waiting = self.client.get("/ncssar/admin")
+            waiting = self.client.get("/ncssar/admin/configuration")
             self.assertIn('data-config-proposal-state="awaiting_device"', waiting.text)
             self.assertIn("Cancel request", waiting.text)
             self.assertIn(
@@ -842,7 +844,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             })
             self.assertTrue(websocket.receive_json()["accepted"])
 
-            review = self.client.get("/ncssar/admin")
+            review = self.client.get("/ncssar/admin/configuration")
             self.assertIn("Approve and publish", review.text)
             self.assertIn("RID-1", review.text)
             self.assertIn('data-config-proposal-state="ready"', review.text)
@@ -869,7 +871,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertEqual("Verified initial aircraft", release.comment)
         self.assertEqual(snapshot["droneSpecs"], current.json()["config"]["droneSpecs"])
 
-        history = self.client.get("/ncssar/admin")
+        history = self.client.get("/ncssar/admin/configuration")
         discarded = self.client.post(
             "/ncssar/admin/organization-config/reject",
             data={"form_token": self.form_token(history)},
@@ -976,6 +978,28 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn('class="site-home" href="/"', admin_page.text)
         self.assertIn('href="/ncssar/admin"', admin_page.text)
         self.assertIn('href="/ncssar/admin/flights"', admin_page.text)
+        self.assertIn('href="/ncssar/admin/configuration"', admin_page.text)
+        self.assertIn('href="/ncssar/admin/members"', admin_page.text)
+        self.assertIn('href="/ncssar/admin/enrollments"', admin_page.text)
+        self.assertIn('href="/ncssar/admin/audit"', admin_page.text)
+        self.assertNotIn("Members &amp; delegated roles", admin_page.text)
+        self.assertNotIn('id="device-authorizations"', admin_page.text)
+        configuration_page = self.client.get("/ncssar/admin/configuration")
+        members_page = self.client.get("/ncssar/admin/members")
+        enrollments_page = self.client.get("/ncssar/admin/enrollments")
+        audit_page = self.client.get("/ncssar/admin/audit")
+        self.assertIn("RID2Caltopo organization configuration", configuration_page.text)
+        self.assertIn("Members &amp; delegated roles", members_page.text)
+        self.assertIn("R2C tablet authorizations", enrollments_page.text)
+        self.assertIn("Only one enrollment QR can be active", enrollments_page.text)
+        self.assertIn("New devices remain blocked until an active member", enrollments_page.text)
+        self.assertIn("Replace active enrollment QR", enrollments_page.text)
+        self.assertIn("RID2Caltopo device access", configuration_page.text)
+        self.assertIn("Member verified", configuration_page.text)
+        self.assertIn("QR managed", configuration_page.text)
+        self.assertIn("Organization audit trail", audit_page.text)
+        self.assertIn('class="local-datetime"', audit_page.text)
+        self.assertNotIn("EXSAR", audit_page.text)
         public_dashboard = self.client.get("/ncssar")
         self.assertIn("User: Primary Administrator", public_dashboard.text)
         authenticated_directory = self.client.get("/")
@@ -1019,6 +1043,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn("not a bill or charge", billing_report.text)
         self.assertIn("does not accept payments", billing_report.text)
         self.assertNotIn("Continue to Stripe", billing_report.text)
+        self.assertIn("timeZoneName: 'short'", billing_report.text)
         checkout = self.client.post(
             "/ncssar/billing/checkout",
             data={"form_token": self.form_token(billing_report), "amount": "25.00"},
@@ -1238,7 +1263,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         )
         self.assertEqual(303, login.status_code)
 
-        page = self.client.get("/ncssar/admin")
+        page = self.client.get("/ncssar/admin/members")
         self.assertIn(
             f'class="member-link" href="#member-{member.id}"',
             page.text,
@@ -1247,10 +1272,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn('aria-label="config_admin:', page.text)
         self.assertIn("top: calc(100% + 8px)", page.text)
         self.assertIn("role-help-wrap:focus-within", page.text)
-        self.assertIn(
-            "Pull configuration from a connected RID2Caltopo device",
-            page.text,
-        )
+        self.assertNotIn("RID2Caltopo organization configuration", page.text)
         updated = self.client.post(
             f"/ncssar/members/{member.id}",
             data={
@@ -1339,7 +1361,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         )
         self.assertEqual(303, login.status_code)
 
-        page = self.client.get("/ncssar/admin")
+        page = self.client.get("/ncssar/admin/members")
         self.assertIn("Archived (inactive)", page.text)
         self.assertIn("Restore archived member", page.text)
         sender = FakeOrganizationEmailSender()
@@ -2007,10 +2029,47 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         )
         installed_token = redeemed.json()["tracker"]["api_key"]
         self.assertTrue(installed_token.startswith("r2c_dev_"))
+        self.assertEqual("reauth_required", redeemed.json()["credential"]["state"])
+        self.assertFalse(
+            asyncio.run(main.authenticate_tracker_token(installed_token))
+        )
+        initial_authentication_url = redeemed.json()["credential"][
+            "reauthentication_url"
+        ]
+        self.assertTrue(initial_authentication_url)
+        parsed_initial_authentication_url = urlparse(initial_authentication_url)
+        initial_authentication_path = (
+            parsed_initial_authentication_url.path
+            + "?"
+            + parsed_initial_authentication_url.query
+        )
+        with patch.object(
+            main,
+            "google_oidc_client",
+            FakeGoogleOidcClient(organization.primary_admin_email),
+        ):
+            initial_authentication_start = self.client.get(
+                initial_authentication_path,
+                follow_redirects=False,
+            )
+            self.assertEqual(303, initial_authentication_start.status_code)
+            google_start = self.client.get(
+                initial_authentication_start.headers["location"],
+                follow_redirects=False,
+            )
+            self.assertEqual(303, google_start.status_code)
+            callback = self.client.get(
+                "/google/callback?code=test-code&state=organization-state",
+                follow_redirects=False,
+            )
+            self.assertEqual(initial_authentication_path, callback.headers["location"])
+            initial_authentication = self.client.get(initial_authentication_path)
+        self.assertEqual(200, initial_authentication.status_code)
+        self.assertIn("Access restored", initial_authentication.text)
         self.assertTrue(
             asyncio.run(main.authenticate_tracker_token(installed_token))
         )
-        authorization_page = self.client.get("/ncssar/admin")
+        authorization_page = self.client.get("/ncssar/admin/enrollments")
         self.assertIn("R2C tablet authorizations", authorization_page.text)
         self.assertIn("Android field tablet", authorization_page.text)
         self.assertIn(redeemed.json()["credential"]["id"][:8], authorization_page.text)
@@ -2578,6 +2637,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 organization_id=organization.id,
                 device_name="Android video tablet",
                 platform="android",
+                authorized_user_id=owner.id,
             )
         )
         with self.client.websocket_connect(
@@ -3237,6 +3297,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 organization_id=organization.id,
                 device_name="A5 Pro",
                 platform="android",
+                authorized_user_id=owner.id,
             )
         )
         login_page = self.client.get("/ncssar/login")
@@ -3363,6 +3424,7 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 device_name="S11U",
                 platform="android",
                 functionality_release=148,
+                authorized_user_id=owner.id,
             )
         )
         blocked = asyncio.run(
