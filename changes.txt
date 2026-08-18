@@ -1,4 +1,7 @@
-v1.4.69:
+v1.4.70:
+* Let delegated enrollment administrators see and change the Closed or Open enrollment access mode alongside the QR controls they already manage.
+
+v1.4.69: deployed
 * Keep only the newest authorization for each RID2Caltopo installation, including devices that re-enroll while an earlier credential is still awaiting member authentication, and clean up legacy blank-ID duplicates without merging distinct modern devices that share a name.
 * Put the single active Drone-team enrollment QR at the bottom of Administration home, remove the duplicate QR surface from Enrollment authorizations, and present explicit Closed member-verified and Open QR-possession access modes with their replacement consequences.
 

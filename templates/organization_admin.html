@@ -813,7 +813,7 @@
         Open — anyone holding the current QR can enroll a device.
         {% endif %}
       </div>
-      {% if "organization_owner" in organization_user.roles %}
+      {% if can_manage_users %}
       <form class="org-form" method="post"
             action="/{{ organization.designator|lower }}/device-access-policy">
         <input type="hidden" name="form_token" value="{{ csrf_token }}">

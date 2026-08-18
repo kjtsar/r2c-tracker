@@ -10456,7 +10456,7 @@ async def organization_update_device_access_policy(
     organization, user = await require_organization_user(
         request,
         designator,
-        ("organization_owner",),
+        ("organization_owner", "user_admin"),
     )
     try:
         await control_plane_store.update_device_access_policy(
