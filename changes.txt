@@ -1,4 +1,4 @@
-v1.4.64:
+v1.4.64: deployed
 * Correct the public release history so the superseded v1.4.62 note remains separate from the deployed reauthentication repair.
 
 v1.4.63: deployed
