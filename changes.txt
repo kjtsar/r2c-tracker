@@ -1,4 +1,4 @@
-v1.4.72:
+v1.4.72: deployed
 * Distinguish historical QR uses from the current tablet inventory and link the current-device count directly to Enrollment authorizations.
 
 v1.4.71: deployed
