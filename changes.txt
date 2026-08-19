@@ -1,3 +1,6 @@
+v1.4.73:
+* Give every delegated organization administrator read-only access to their organization's audit trail from Administration home, and identify organization-user actions by member name and email instead of only an internal identifier.
+
 v1.4.72: deployed
 * Distinguish historical QR uses from the current tablet inventory and link the current-device count directly to Enrollment authorizations.
 

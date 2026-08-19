@@ -8458,7 +8458,10 @@ async def _organization_admin_page(
         "configuration": ("organization_owner", "config_admin"),
         "members": ("organization_owner", "user_admin"),
         "enrollments": ("organization_owner", "user_admin"),
-        "audit": ("organization_owner",),
+        "audit": (
+            "organization_owner", "billing_admin", "config_admin",
+            "user_admin", "records_admin",
+        ),
     }
     organization, user = await require_organization_user(
         request,

@@ -861,6 +861,14 @@ class OrganizationRouteFlowTest(unittest.TestCase):
                 follow_redirects=False,
             )
             self.assertEqual(303, approved.status_code)
+            delegated_dashboard = self.client.get("/ncssar/admin")
+            self.assertIn('href="/ncssar/admin/audit"', delegated_dashboard.text)
+            delegated_audit = self.client.get("/ncssar/admin/audit")
+            self.assertEqual(200, delegated_audit.status_code)
+            self.assertIn("Organization audit trail", delegated_audit.text)
+            self.assertIn("organization.config_approved", delegated_audit.text)
+            self.assertIn("Configuration Administrator", delegated_audit.text)
+            self.assertIn("config@ncssar.example", delegated_audit.text)
         current = self.client.get(
             "/ncssar/api/v1/organization-config/current",
             headers={"X-SAR-Token": device.token},

@@ -297,9 +297,7 @@
     <a href="/{{ organization.designator|lower }}/admin/members"><strong>Members &amp; roles</strong><span>Invite people and manage delegated access</span></a>
     <a href="/{{ organization.designator|lower }}/admin/enrollments"><strong>Enrollment authorizations</strong><span>Manage tablets and lost-device reauthentication</span></a>
     {% endif %}
-    {% if "organization_owner" in organization_user.roles %}
     <a href="/{{ organization.designator|lower }}/admin/audit"><strong>Audit trail</strong><span>Review organization administrative and operational events</span></a>
-    {% endif %}
   </nav>
   {% endif %}
 
@@ -943,7 +941,18 @@
             <tr>
               <td><time class="local-datetime" data-utc="{{ event.created_at.isoformat() }}">{{ event.created_at.strftime("%d %b %Y %H:%M UTC") }}</time></td>
               <td><strong>{{ event.event_type }}</strong><br><small>{{ event.id }}</small></td>
-              <td>{{ event.actor_type|replace("_", " ") }}<br><small>{{ event.actor_id }}</small></td>
+              <td>
+                {% if event.actor_type == "organization_user" %}
+                  {% set actor_user = organization_user_by_id.get(event.actor_id) %}
+                  {% if actor_user %}
+                    {{ actor_user.display_name }}<br><small>{{ actor_user.email }}</small>
+                  {% else %}
+                    Organization user<br><small>{{ event.actor_id }}</small>
+                  {% endif %}
+                {% else %}
+                  {{ event.actor_type|replace("_", " ")|capitalize }}<br><small>{{ event.actor_id }}</small>
+                {% endif %}
+              </td>
               <td class="audit-details"><code>{{ event.details|tojson }}</code></td>
             </tr>
           {% else %}
