@@ -890,7 +890,11 @@
           <strong>{{ campaign.label }}</strong>
           <p>
             {{ campaign.state }} · {{ campaign.redemption_count }}/{{ campaign.max_redemptions }}
-            uses · expires <time class="local-datetime" data-utc="{{ campaign.expires_at.isoformat() }}">{{ campaign.expires_at.strftime("%d %b %Y %H:%M UTC") }}</time>
+            QR uses ·
+            <a href="/{{ organization.designator|lower }}/admin/enrollments">
+              {{ current_device_credentials|length }} current device{% if current_device_credentials|length != 1 %}s{% endif %}
+            </a>
+            · expires <time class="local-datetime" data-utc="{{ campaign.expires_at.isoformat() }}">{{ campaign.expires_at.strftime("%d %b %Y %H:%M UTC") }}</time>
           </p>
           {% if campaign.state == "active" %}
           <img src="/{{ organization.designator|lower }}/enrollments/{{ campaign.id }}/qr.svg"

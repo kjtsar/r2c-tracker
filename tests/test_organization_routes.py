@@ -1986,6 +1986,10 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         )
         self.assertEqual(200, campaign_created.status_code)
         self.assertIn("Drone team training", campaign_created.text)
+        self.assertIn("0/25", campaign_created.text)
+        self.assertIn("QR uses", campaign_created.text)
+        self.assertIn('href="/ncssar/admin/enrollments"', campaign_created.text)
+        self.assertIn("0 current devices", campaign_created.text)
         qr_match = QR_SRC_RE.search(campaign_created.text)
         self.assertIsNotNone(qr_match)
 
