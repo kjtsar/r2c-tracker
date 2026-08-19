@@ -1,3 +1,6 @@
+v1.4.71:
+* Restore the current RID2Caltopo distribution recommendations to Android build 137 and Apple build 143; tracker functionality release 148 remains a separate protocol capability and must not trigger an app-update warning.
+
 v1.4.70: deployed
 * Let delegated enrollment administrators see and change the Closed or Open enrollment access mode alongside the QR controls they already manage.
 
