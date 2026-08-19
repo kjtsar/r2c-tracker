@@ -1,4 +1,4 @@
-v1.4.71:
+v1.4.71: deployed
 * Restore the current RID2Caltopo distribution recommendations to Android build 137 and Apple build 143; tracker functionality release 148 remains a separate protocol capability and must not trigger an app-update warning.
 
 v1.4.70: deployed
