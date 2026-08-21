@@ -1,4 +1,4 @@
-v1.4.75:
+v1.4.75: deployed
 * Describe device reauthentication as an authorized-user sign-in requirement instead of saying the user or device is blocked from Tracker.
 
 v1.4.74: deployed
