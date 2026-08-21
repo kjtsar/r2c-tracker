@@ -75,9 +75,14 @@ class ControlPlaneTokenServiceTest(unittest.TestCase):
         self.assertEqual(self.campaign.id, claims.campaign_id)
         self.assertEqual(self.organization.id, claims.organization_id)
         self.assertEqual(self.campaign.token_generation, claims.token_generation)
-        self.assertNotIn("admin@example.org", url)
-        self.assertNotIn("FAA", url)
-        self.assertNotIn("password", url.lower())
+        self.assertEqual(
+            {"campaign_id", "organization_id", "designator", "token_generation"},
+            set(vars(claims)),
+        )
+        claim_values = " ".join(str(value) for value in vars(claims).values())
+        self.assertNotIn("admin@example.org", claim_values)
+        self.assertNotIn("FAA", claim_values)
+        self.assertNotIn("password", claim_values.lower())
 
     def test_device_reauthentication_url_is_signed_and_device_bound(self):
         url = self.service.device_reauthentication_url(
