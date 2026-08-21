@@ -243,6 +243,14 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertIn("stopped = true", script)
         self.assertLess(script.index(submit_listener), script.index("connect();"))
 
+    def test_device_reauthentication_copy_requests_authentication_without_blocked_language(self):
+        template = Path("templates/device_reauthenticate.html").read_text()
+
+        self.assertIn("An authorized user needs to authenticate", template)
+        self.assertIn("before this device can access Tracker", template)
+        self.assertIn("Sign in with Google", template)
+        self.assertNotIn("temporarily blocked from Tracker", template)
+
     def test_stream_event_socket_stops_without_focus(self):
         script = Path("static/organization_streams_live.js").read_text()
 

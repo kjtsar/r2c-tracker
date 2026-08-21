@@ -1,3 +1,6 @@
+v1.4.75:
+* Describe device reauthentication as an authorized-user sign-in requirement instead of saying the user or device is blocked from Tracker.
+
 v1.4.74: deployed
 * Keep device reauthentication attached to its signed Tracker destination when a browser or identity-provider handoff drops the return query, so successful organization sign-in can restore the existing tablet authorization instead of landing on the team home page.
 

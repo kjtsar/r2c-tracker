@@ -1,8 +1,8 @@
 {% extends "base.html" %}
-{% block title %}Reauthenticate {{ device_name }}{% endblock %}
+{% block title %}Sign in to Tracker - {{ device_name }}{% endblock %}
 {% block content %}
 <section class="card" style="max-width: 620px; margin: 48px auto; padding: 28px;">
-  <h1>Reauthenticate {{ device_name }}</h1>
+  <h1>Sign in to Tracker</h1>
   {% if completed %}
   <p><strong>Access restored.</strong> {{ authorized_email }} is authorized to operate RID2Caltopo devices for {{ organization.legal_name }}.</p>
   <p>The device configuration was preserved.</p>
@@ -11,12 +11,12 @@
         data-r2c-reauth-complete="r2creauth://complete">Return to RID2Caltopo</a></p>
   <script src="/static/device_reauthenticate.js" defer></script>
   {% else %}
-  <p>This device is temporarily blocked from Tracker. RID2Caltopo remains usable offline while you verify an authorized account. Independently supplied CalTopo credentials remain available; credentials issued through Tracker are disabled until access is restored.</p>
+  <p>An authorized user needs to authenticate before this device can access Tracker. RID2Caltopo remains usable offline while you sign in. Independently supplied CalTopo credentials remain available; credentials issued through Tracker are disabled until authentication is complete.</p>
   {% if last_email %}
   <p><strong>{{ last_email }}</strong> is not authorized for RID2Caltopo device access.</p>
   {% endif %}
   <p>You may choose another Google account. Attempt {{ attempts + 1 }}; selecting the wrong account does not erase the device.</p>
-  <p><a class="primary-button" href="{{ google_start_url }}">Try a Google account</a></p>
+  <p><a class="primary-button" href="{{ google_start_url }}">Sign in with Google</a></p>
   {% if attempts >= 3 %}
   <hr>
   <p>If no authorized account is available, you may explicitly erase the managed RID map, Tracker credential, and CalTopo credentials.</p>
