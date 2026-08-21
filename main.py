@@ -8048,11 +8048,17 @@ async def organization_google_start(
             url=f"/{organization.designator.lower()}/login",
             status_code=status.HTTP_303_SEE_OTHER,
         )
+    next_path = organization_safe_login_next(organization.designator, next)
+    if not next_path:
+        next_path = organization_safe_login_next(
+            organization.designator,
+            str(request.session.get("device_reauthentication_pending_path", "")),
+        )
     request.session["organization_google_flow"] = {
         **flow,
         "organization_id": organization.id,
         "designator": organization.designator,
-        "next": organization_safe_login_next(organization.designator, next),
+        "next": next_path,
     }
     return RedirectResponse(
         url=authorization_url,
@@ -8135,6 +8141,11 @@ async def organization_google_callback(
         organization.designator,
         str(flow.get("next", "")),
     )
+    if not next_path:
+        next_path = organization_safe_login_next(
+            organization.designator,
+            str(request.session.get("device_reauthentication_pending_path", "")),
+        )
     if user is None:
         logging.warning(
             "Google organization login rejected for unauthorized email"
@@ -8214,6 +8225,7 @@ async def organization_device_reauthenticate(
         f"/{organization.designator.lower()}/device-reauthenticate?"
         + urlencode({"token": token})
     )
+    request.session["device_reauthentication_pending_path"] = next_path
     fresh_path = request.session.pop(
         "device_reauthentication_fresh_path", ""
     )
@@ -8254,6 +8266,7 @@ async def organization_device_reauthenticate(
         request.session.pop("device_reauthentication_failures", None)
         request.session.pop("device_reauthentication_last_email", None)
         request.session.pop("device_reauthentication_last_user_id", None)
+        request.session.pop("device_reauthentication_pending_path", None)
     elif fresh_authentication and user is not None and user.state == "active":
         if request.session.get("device_reauthentication_last_user_id") != user.id:
             request.session["device_reauthentication_failures"] = min(

@@ -1,3 +1,6 @@
+v1.4.74:
+* Keep device reauthentication attached to its signed Tracker destination when a browser or identity-provider handoff drops the return query, so successful organization sign-in can restore the existing tablet authorization instead of landing on the team home page.
+
 v1.4.73: deployed
 * Give every delegated organization administrator read-only access to their organization's audit trail from Administration home, and identify organization-user actions by member name and email instead of only an internal identifier.
 

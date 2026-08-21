@@ -3516,6 +3516,95 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         )
         self.assertIsNotNone(restored)
 
+    def test_device_reauthentication_recovers_when_google_start_loses_next_query(self):
+        organization = asyncio.run(
+            self.store.create_organization(
+                legal_name="North County Search and Rescue",
+                designator="NCSSAR",
+                admin_name="Primary Administrator",
+                admin_email="admin@ncssar.example",
+                postal_address="100 Rescue Way",
+                actor_id="platform-admin",
+                simulation=True,
+            )
+        )
+        owner = asyncio.run(
+            self.store.activate_owner(
+                organization.designator,
+                organization.primary_admin_email,
+                "correct horse battery staple",
+            )
+        )
+        campaign = asyncio.run(
+            self.store.create_enrollment_campaign(
+                organization_id=organization.id,
+                label="Dropped return test",
+                created_by_user_id=owner.id,
+                expires_in_hours=24,
+                max_redemptions=1,
+            )
+        )
+        device = asyncio.run(
+            self.store.issue_device_credential(
+                campaign_id=campaign.id,
+                organization_id=organization.id,
+                device_name="S25 Ultra",
+                platform="android",
+                functionality_release=148,
+                authorized_user_id=owner.id,
+            )
+        )
+        blocked = asyncio.run(
+            self.store.require_device_reauthentication(
+                credential_id=device.id,
+                organization_id=organization.id,
+                actor_id=owner.id,
+            )
+        )
+        reauthentication_url = self.tokens.device_reauthentication_url(
+            credential_id=blocked.id,
+            organization_id=blocked.organization_id,
+            designator=organization.designator,
+            requested_at=blocked.reauth_requested_at.isoformat(),
+        )
+        reauthentication_path = (
+            urlparse(reauthentication_url).path
+            + "?"
+            + urlparse(reauthentication_url).query
+        )
+
+        with patch.object(
+            main,
+            "google_oidc_client",
+            FakeGoogleOidcClient(organization.primary_admin_email),
+        ):
+            first_visit = self.client.get(
+                reauthentication_path,
+                follow_redirects=False,
+            )
+            self.assertEqual(303, first_visit.status_code)
+
+            # Simulate a browser or intermediary dropping the signed return query.
+            google_start = self.client.get(
+                "/ncssar/google/start",
+                follow_redirects=False,
+            )
+            self.assertEqual(303, google_start.status_code)
+            callback = self.client.get(
+                "/google/callback?code=test-code&state=organization-state",
+                follow_redirects=False,
+            )
+            self.assertEqual(303, callback.status_code)
+            self.assertEqual(reauthentication_path, callback.headers["location"])
+
+            completed = self.client.get(reauthentication_path)
+
+        self.assertEqual(200, completed.status_code)
+        self.assertIn("Access restored", completed.text)
+        self.assertIsNotNone(asyncio.run(
+            self.store.authenticate_device_token(device.token)
+        ))
+
     def test_matching_google_email_activates_pending_member(self):
         organization = asyncio.run(
             self.store.create_organization(
