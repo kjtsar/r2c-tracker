@@ -9464,6 +9464,7 @@ async def organization_streams(
             stream for stream in streams
             if stream.device_credential_id == tablet_device.id
         )
+        streams = sort_streams_newest_first(streams)
         requests = tuple(
             stream_request for stream_request in requests
             if stream_request.device_credential_id == tablet_device.id
@@ -9686,6 +9687,18 @@ def organization_stream_status(streams, requests) -> dict:
         ),
         "next_expiry": min(expiry_boundaries) if expiry_boundaries else None,
     }
+
+
+def sort_streams_newest_first(streams) -> tuple:
+    """Order one tablet's videos newest-first with stable ties."""
+    return tuple(sorted(
+        streams,
+        key=lambda stream: (
+            stream.recorded_at or stream.last_seen_at,
+            stream.session_id,
+        ),
+        reverse=True,
+    ))
 
 
 def stream_membership_revision(streams) -> str:

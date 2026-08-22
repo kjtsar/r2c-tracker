@@ -513,6 +513,54 @@ class OrganizationRouteFlowTest(unittest.TestCase):
             main.thumbnail_preview_device_ids(streams, "tablet-missing"),
         )
 
+    def test_tablet_stream_page_sorts_videos_newest_first(self):
+        streams = [
+            SimpleNamespace(
+                session_id="older-recording",
+                recorded_at=datetime(2026, 8, 20, 17, 0, tzinfo=UTC),
+                last_seen_at=datetime(2026, 8, 21, 20, 0, tzinfo=UTC),
+            ),
+            SimpleNamespace(
+                session_id="live-video",
+                recorded_at=None,
+                last_seen_at=datetime(2026, 8, 21, 19, 0, tzinfo=UTC),
+            ),
+            SimpleNamespace(
+                session_id="newer-recording",
+                recorded_at=datetime(2026, 8, 21, 18, 0, tzinfo=UTC),
+                last_seen_at=datetime(2026, 8, 21, 20, 0, tzinfo=UTC),
+            ),
+        ]
+
+        sorted_streams = main.sort_streams_newest_first(streams)
+
+        self.assertEqual(
+            ("live-video", "newer-recording", "older-recording"),
+            tuple(stream.session_id for stream in sorted_streams),
+        )
+
+    def test_tablet_stream_page_sort_has_stable_ties(self):
+        recorded_at = datetime(2026, 8, 21, 18, 0, tzinfo=UTC)
+        streams = [
+            SimpleNamespace(
+                session_id="recording-a",
+                recorded_at=recorded_at,
+                last_seen_at=recorded_at,
+            ),
+            SimpleNamespace(
+                session_id="recording-b",
+                recorded_at=recorded_at,
+                last_seen_at=recorded_at,
+            ),
+        ]
+
+        sorted_streams = main.sort_streams_newest_first(streams)
+
+        self.assertEqual(
+            ("recording-b", "recording-a"),
+            tuple(stream.session_id for stream in sorted_streams),
+        )
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         database_path = Path(self.temp_dir.name) / "control-plane.db"
