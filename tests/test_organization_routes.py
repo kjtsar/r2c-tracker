@@ -169,6 +169,10 @@ class OrganizationRouteFlowTest(unittest.TestCase):
         self.assertEqual(200, created.status_code)
         self.assertEqual("releasecheck", created.json()["designator"])
         self.assertTrue(created.json()["device_token"].startswith("r2c_dev_"))
+        credential = asyncio.run(
+            self.store.authenticate_device_token(created.json()["device_token"])
+        )
+        self.assertIsNotNone(credential)
         self.assertEqual("no-store", created.headers["cache-control"])
         self.assertEqual(409, duplicate.status_code)
 

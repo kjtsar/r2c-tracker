@@ -6247,6 +6247,7 @@ async def deployment_test_fixture(request: Request, response: Response):
         organization_id=organization.id,
         device_name="Staging Release Check",
         platform="android",
+        authorized_user_id=owner.id,
     )
     return {
         "designator": organization.designator.lower(),

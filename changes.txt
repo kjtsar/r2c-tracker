@@ -1,4 +1,9 @@
+v1.4.77:
+* List videos on each tablet's Streams page in chronological order from newest to oldest instead of inheriting the organization catalog's incident-and-drone ordering.
+* Keep guarded staging validation compatible with member-verified enrollment by authorizing its isolated synthetic device before testing Tracker coordination.
+
 v1.4.76:
+* Superseded before deployment after guarded staging correctly rejected its unauthenticated synthetic device.
 * List videos on each tablet's Streams page in chronological order from newest to oldest instead of inheriting the organization catalog's incident-and-drone ordering.
 
 v1.4.75: deployed
